@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# Builds (deploy artifacts live on the server, not in git)
+frontend/dist/
+
+# Runtime state (round/quota json files are deployment-local)
+backend/state/
+
+# Misc
+*.log
+.DS_Store

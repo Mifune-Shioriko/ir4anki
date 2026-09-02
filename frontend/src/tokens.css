@@ -1,0 +1,111 @@
+/**
+ * Material 3 baseline color scheme — generated verbatim from the token tables
+ * shipped in @material/web/tokens/versions/v0_192 (the exact scheme the
+ * compiled components were built against). Do not hand-edit palette values.
+ * Primary: #6750a4 (MD3 baseline purple).
+ */
+:root {
+  color-scheme: light;
+  --md-sys-color-background: #fef7ff; /* neutral98 */
+  --md-sys-color-error: #b3261e; /* error40 */
+  --md-sys-color-error-container: #f9dedc; /* error90 */
+  --md-sys-color-inverse-on-surface: #f5eff7; /* neutral95 */
+  --md-sys-color-inverse-primary: #d0bcff; /* primary80 */
+  --md-sys-color-inverse-surface: #322f35; /* neutral20 */
+  --md-sys-color-on-background: #1d1b20; /* neutral10 */
+  --md-sys-color-on-error: #fff; /* error100 */
+  --md-sys-color-on-error-container: #410e0b; /* error10 */
+  --md-sys-color-on-primary: #fff; /* primary100 */
+  --md-sys-color-on-primary-container: #21005d; /* primary10 */
+  --md-sys-color-on-primary-fixed: #21005d; /* primary10 */
+  --md-sys-color-on-primary-fixed-variant: #4f378b; /* primary30 */
+  --md-sys-color-on-secondary: #fff; /* secondary100 */
+  --md-sys-color-on-secondary-container: #1d192b; /* secondary10 */
+  --md-sys-color-on-secondary-fixed: #1d192b; /* secondary10 */
+  --md-sys-color-on-secondary-fixed-variant: #4a4458; /* secondary30 */
+  --md-sys-color-on-surface: #1d1b20; /* neutral10 */
+  --md-sys-color-on-surface-variant: #49454f; /* neutral-variant30 */
+  --md-sys-color-on-tertiary: #fff; /* tertiary100 */
+  --md-sys-color-on-tertiary-container: #31111d; /* tertiary10 */
+  --md-sys-color-on-tertiary-fixed: #31111d; /* tertiary10 */
+  --md-sys-color-on-tertiary-fixed-variant: #633b48; /* tertiary30 */
+  --md-sys-color-outline: #79747e; /* neutral-variant50 */
+  --md-sys-color-outline-variant: #cac4d0; /* neutral-variant80 */
+  --md-sys-color-primary: #6750a4; /* primary40 */
+  --md-sys-color-primary-container: #eaddff; /* primary90 */
+  --md-sys-color-primary-fixed: #eaddff; /* primary90 */
+  --md-sys-color-primary-fixed-dim: #d0bcff; /* primary80 */
+  --md-sys-color-scrim: #000; /* neutral0 */
+  --md-sys-color-secondary: #625b71; /* secondary40 */
+  --md-sys-color-secondary-container: #e8def8; /* secondary90 */
+  --md-sys-color-secondary-fixed: #e8def8; /* secondary90 */
+  --md-sys-color-secondary-fixed-dim: #ccc2dc; /* secondary80 */
+  --md-sys-color-shadow: #000; /* neutral0 */
+  --md-sys-color-surface: #fef7ff; /* neutral98 */
+  --md-sys-color-surface-bright: #fef7ff; /* neutral98 */
+  --md-sys-color-surface-container: #f3edf7; /* neutral94 */
+  --md-sys-color-surface-container-high: #ece6f0; /* neutral92 */
+  --md-sys-color-surface-container-highest: #e6e0e9; /* neutral90 */
+  --md-sys-color-surface-container-low: #f7f2fa; /* neutral96 */
+  --md-sys-color-surface-container-lowest: #fff; /* neutral100 */
+  --md-sys-color-surface-dim: #ded8e1; /* neutral87 */
+  --md-sys-color-surface-tint: #6750a4; /* primary40 */
+  --md-sys-color-surface-variant: #e7e0ec; /* neutral-variant90 */
+  --md-sys-color-tertiary: #7d5260; /* tertiary40 */
+  --md-sys-color-tertiary-container: #ffd8e4; /* tertiary90 */
+  --md-sys-color-tertiary-fixed: #ffd8e4; /* tertiary90 */
+  --md-sys-color-tertiary-fixed-dim: #efb8c8; /* tertiary80 */
+}
+
+.dark {
+  color-scheme: dark;
+  --md-sys-color-background: #141218; /* neutral6 */
+  --md-sys-color-error: #f2b8b5; /* error80 */
+  --md-sys-color-error-container: #8c1d18; /* error30 */
+  --md-sys-color-inverse-on-surface: #322f35; /* neutral20 */
+  --md-sys-color-inverse-primary: #6750a4; /* primary40 */
+  --md-sys-color-inverse-surface: #e6e0e9; /* neutral90 */
+  --md-sys-color-on-background: #e6e0e9; /* neutral90 */
+  --md-sys-color-on-error: #601410; /* error20 */
+  --md-sys-color-on-error-container: #f9dedc; /* error90 */
+  --md-sys-color-on-primary: #381e72; /* primary20 */
+  --md-sys-color-on-primary-container: #eaddff; /* primary90 */
+  --md-sys-color-on-primary-fixed: #21005d; /* primary10 */
+  --md-sys-color-on-primary-fixed-variant: #4f378b; /* primary30 */
+  --md-sys-color-on-secondary: #332d41; /* secondary20 */
+  --md-sys-color-on-secondary-container: #e8def8; /* secondary90 */
+  --md-sys-color-on-secondary-fixed: #1d192b; /* secondary10 */
+  --md-sys-color-on-secondary-fixed-variant: #4a4458; /* secondary30 */
+  --md-sys-color-on-surface: #e6e0e9; /* neutral90 */
+  --md-sys-color-on-surface-variant: #cac4d0; /* neutral-variant80 */
+  --md-sys-color-on-tertiary: #492532; /* tertiary20 */
+  --md-sys-color-on-tertiary-container: #ffd8e4; /* tertiary90 */
+  --md-sys-color-on-tertiary-fixed: #31111d; /* tertiary10 */
+  --md-sys-color-on-tertiary-fixed-variant: #633b48; /* tertiary30 */
+  --md-sys-color-outline: #938f99; /* neutral-variant60 */
+  --md-sys-color-outline-variant: #49454f; /* neutral-variant30 */
+  --md-sys-color-primary: #d0bcff; /* primary80 */
+  --md-sys-color-primary-container: #4f378b; /* primary30 */
+  --md-sys-color-primary-fixed: #eaddff; /* primary90 */
+  --md-sys-color-primary-fixed-dim: #d0bcff; /* primary80 */
+  --md-sys-color-scrim: #000; /* neutral0 */
+  --md-sys-color-secondary: #ccc2dc; /* secondary80 */
+  --md-sys-color-secondary-container: #4a4458; /* secondary30 */
+  --md-sys-color-secondary-fixed: #e8def8; /* secondary90 */
+  --md-sys-color-secondary-fixed-dim: #ccc2dc; /* secondary80 */
+  --md-sys-color-shadow: #000; /* neutral0 */
+  --md-sys-color-surface: #141218; /* neutral6 */
+  --md-sys-color-surface-bright: #3b383e; /* neutral24 */
+  --md-sys-color-surface-container: #211f26; /* neutral12 */
+  --md-sys-color-surface-container-high: #2b2930; /* neutral17 */
+  --md-sys-color-surface-container-highest: #36343b; /* neutral22 */
+  --md-sys-color-surface-container-low: #1d1b20; /* neutral10 */
+  --md-sys-color-surface-container-lowest: #0f0d13; /* neutral4 */
+  --md-sys-color-surface-dim: #141218; /* neutral6 */
+  --md-sys-color-surface-tint: #d0bcff; /* primary80 */
+  --md-sys-color-surface-variant: #49454f; /* neutral-variant30 */
+  --md-sys-color-tertiary: #efb8c8; /* tertiary80 */
+  --md-sys-color-tertiary-container: #633b48; /* tertiary30 */
+  --md-sys-color-tertiary-fixed: #ffd8e4; /* tertiary90 */
+  --md-sys-color-tertiary-fixed-dim: #efb8c8; /* tertiary80 */
+}
