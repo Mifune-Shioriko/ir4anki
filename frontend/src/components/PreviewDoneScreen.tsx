@@ -43,16 +43,16 @@ export const PreviewDoneScreen: Component<Props> = (props) => {
           </div>
 
           <div class="screen-actions">
-            <Show when={(props.available ?? 0) > 0}>
-              <md-outlined-button onClick={() => props.onMore()} disabled={props.busy}>
-                继续预览
-              </md-outlined-button>
-            </Show>
             <md-filled-button onClick={() => props.onToReview()} disabled={props.busy}>
-              去复习
+              开始复习（含刚放行的 {props.approved} 张）
             </md-filled-button>
           </div>
           <div class="screen-actions">
+            <Show when={(props.available ?? 0) > 0}>
+              <md-text-button onClick={() => props.onMore()} disabled={props.busy}>
+                再预览 5 张
+              </md-text-button>
+            </Show>
             <md-text-button onClick={() => props.onFinish()} disabled={props.busy}>
               结束
             </md-text-button>

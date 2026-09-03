@@ -331,7 +331,10 @@ export const App: Component = () => {
     }
   }
 
-  const pvToReview = () => setPhase('start')
+  // "跳过，直接复习" / "开始复习" — one tap straight into a review round.
+  // The backend start consumes the preview-approved tombstone, so cards
+  // just previewed+released are dealt as this round's new material.
+  const pvToReview = () => startNewRound()
 
   // re-enter the preview funnel from the regular start/done screens.
   // Pool/available signals come from the last resync; pvStart re-fetches
