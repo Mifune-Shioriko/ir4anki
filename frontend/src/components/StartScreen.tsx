@@ -7,6 +7,9 @@ interface Props {
   newTotal: number | null
   busy: boolean
   onBegin: () => void
+  /** preview pool size; button hidden when null or 0 */
+  previewPool?: number | null
+  onToPreview?: () => void
 }
 
 export const StartScreen: Component<Props> = (props) => {
@@ -34,6 +37,11 @@ export const StartScreen: Component<Props> = (props) => {
           <md-filled-button onClick={() => props.onBegin()} disabled={props.busy}>
             开始
           </md-filled-button>
+          {props.previewPool != null && props.previewPool > 0 && (
+            <md-text-button onClick={() => props.onToPreview?.()} disabled={props.busy}>
+              去预览新卡（{props.previewPool} 张）
+            </md-text-button>
+          )}
         </div>
       </md-elevated-card>
     </div>

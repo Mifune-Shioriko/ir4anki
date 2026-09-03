@@ -16,6 +16,9 @@ interface Props {
   onUndo: () => void
   onContinue: () => void
   onFinish: () => void
+  /** preview pool size; button hidden when null or 0 */
+  previewPool?: number | null
+  onToPreview?: () => void
 }
 
 export const DoneScreen: Component<Props> = (props) => {
@@ -60,6 +63,13 @@ export const DoneScreen: Component<Props> = (props) => {
               结束学习
             </md-filled-button>
           </div>
+          {props.previewPool != null && props.previewPool > 0 && (
+            <div class="screen-actions">
+              <md-text-button onClick={() => props.onToPreview?.()} disabled={props.finishing}>
+                去预览新卡（{props.previewPool} 张）
+              </md-text-button>
+            </div>
+          )}
 
           {/* last-answer undo — the card header button is gone on this screen */}
           <Show when={props.canUndo}>

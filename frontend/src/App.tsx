@@ -333,6 +333,11 @@ export const App: Component = () => {
 
   const pvToReview = () => setPhase('start')
 
+  // re-enter the preview funnel from the regular start/done screens.
+  // Pool/available signals come from the last resync; pvStart re-fetches
+  // fresh pool numbers from the backend when the round actually begins.
+  const pvToPreview = () => setPhase('previewStart')
+
   const pvFinish = async () => {
     setPhase('loading')
     setLoadText('正在同步…')
@@ -444,6 +449,8 @@ export const App: Component = () => {
             newTotal={newTotal()}
             busy={false}
             onBegin={startNewRound}
+            previewPool={previewMode() ? previewPool() : null}
+            onToPreview={pvToPreview}
           />
         </Show>
 
@@ -488,6 +495,8 @@ export const App: Component = () => {
             onUndo={undo}
             onContinue={continueRound}
             onFinish={finish}
+            previewPool={previewMode() ? previewPool() : null}
+            onToPreview={pvToPreview}
           />
         </Show>
 
