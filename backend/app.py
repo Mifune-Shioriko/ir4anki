@@ -891,6 +891,11 @@ async def preview_act(card_id: int, action: str):
     if action == "approve":
         await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
         await anki("unsuspend", {"cards": [card_id]})
+        # provenance tag: marks this note as having passed through the
+        # preview flow. The pool sweeper (anki_pool_sweep.py) uses it to
+        # tell legitimately-released cards apart from leaks that bypassed
+        # the pool (e.g. added on the desktop client straight into 2026).
+        await anki("addTags", {"notes": [infos[0]["note"]], "tags": "previewed"})
         rd.setdefault("approved", []).append(card_id)
     else:
         tag = "deferred-" + datetime.now().strftime("%Y%m%d")
