@@ -10,6 +10,9 @@ interface Props {
   available: number | null
   due: number | null
   busy: boolean
+  onUndo: () => void
+  canUndo: boolean
+  undoBusy: boolean
   onMore: () => void
   onToReview: () => void
   onFinish: () => void
@@ -48,6 +51,11 @@ export const PreviewDoneScreen: Component<Props> = (props) => {
             </md-filled-button>
           </div>
           <div class="screen-actions">
+            <Show when={props.canUndo}>
+              <md-text-button onClick={() => props.onUndo()} disabled={props.undoBusy}>
+                撤销上一步
+              </md-text-button>
+            </Show>
             <Show when={(props.available ?? 0) > 0}>
               <md-text-button onClick={() => props.onMore()} disabled={props.busy}>
                 再预览 5 张

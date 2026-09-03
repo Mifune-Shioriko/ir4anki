@@ -5,6 +5,7 @@ import type {
   NoteUpdateResponse,
   PreviewActResponse,
   PreviewStartResponse,
+  PreviewUndoResponse,
   SessionStateResponse,
   StartResponse,
   UndoResponse,
@@ -45,6 +46,7 @@ export const api = {
   previewStart: () => post<PreviewStartResponse>('/api/preview/start'),
   previewAct: (cardId: number, action: 'approve' | 'defer') =>
     post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
+  previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),
   previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
   upload: (file: File): Promise<{ filename: string }> => {
     const fd = new FormData()

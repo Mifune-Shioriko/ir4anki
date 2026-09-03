@@ -37,6 +37,18 @@ export interface PreviewRoundResume {
   cards: Card[]
   done: number
   total: number
+  /** single-level undo slot survives page refreshes, like the review round */
+  can_undo?: boolean
+}
+
+/** Exact reverse of a preview act: approve→card back in the pool suspended,
+ * defer→today's deferred tag removed. 409 when there is nothing to undo or
+ * the card moved on (e.g. already answered in a review round). */
+export interface PreviewUndoResponse {
+  restored: boolean
+  card: Card
+  index: number
+  action?: 'approve' | 'defer'
 }
 
 export interface PreviewExtras {

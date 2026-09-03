@@ -482,6 +482,7 @@ async def session_state():
                         "cards": await fetch_cards(pending),
                         "done": prd.get("done", 0),
                         "total": prd.get("total", len(pending)),
+                        "can_undo": bool(prd.get("last")),
                     }
                 else:
                     # round drained — keep the approved tombstone (if any)
@@ -813,6 +814,7 @@ async def preview_state():
                 "total": rd.get("total", rd.get("done", 0) + len(pending)),
                 "pool": len(await preview_pool_ids()),
                 "due_remaining": due_left,
+                "can_undo": bool(rd.get("last")),
             }
         # round drained — keep the approved tombstone (if any)
         approved = rd.get("approved") or []
@@ -875,17 +877,22 @@ async def preview_act(card_id: int, action: str):
     if not rd or card_id not in rd.get("pending", []):
         return {"ok": False, "reason": "stale"}
 
+    infos = await anki("cardsInfo", {"cards": [card_id]})
+    if not infos:
+        raise HTTPException(status_code=404, detail="card vanished")
+    # single-level undo slot (mirrors the review round's "last"): enough to
+    # reverse this exact act — deck+suspend for approve, note+tag for defer
+    rd["last"] = {
+        "cardId": card_id,
+        "index": rd["pending"].index(card_id),
+        "action": action,
+        "note": infos[0]["note"],
+    }
     if action == "approve":
-        infos = await anki("cardsInfo", {"cards": [card_id]})
-        if not infos:
-            raise HTTPException(status_code=404, detail="card vanished")
         await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
         await anki("unsuspend", {"cards": [card_id]})
         rd.setdefault("approved", []).append(card_id)
     else:
-        infos = await anki("cardsInfo", {"cards": [card_id]})
-        if not infos:
-            raise HTTPException(status_code=404, detail="card vanished")
         tag = "deferred-" + datetime.now().strftime("%Y%m%d")
         await anki("addTags", {"notes": [infos[0]["note"]], "tags": tag})
 
@@ -893,12 +900,27 @@ async def preview_act(card_id: int, action: str):
     # user's phone + desktop) — same coalesced sync the answer path uses
     fire_and_forget_sync()
 
+    # pending BEFORE this act — needed for the tombstone so undo can
+    # rehydrate the round exactly as it stood (返回上一张)
+    pending_before = rd.get("pending", [])
     rd["pending"] = [c for c in rd["pending"] if c != card_id]
     rd["done"] = rd.get("done", 0) + 1
     if not rd["pending"]:
         # tombstone: keep the approved list so the next /api/session/start
-        # deals those cards first; _consume_preview_approved() pops it
-        _preview_write({"status": "complete", "approved": rd.get("approved", [])})
+        # deals those cards first; _consume_preview_approved() pops it.
+        # ALSO keep pending_before (= [card_id] here, the final card) plus
+        # done/total: the undo slot indexes into this round's deal order,
+        # and undoing the final act must restore the round's progress.
+        _preview_write(
+            {
+                "status": "complete",
+                "approved": rd.get("approved", []),
+                "pending": pending_before,
+                "done": rd.get("done", 0),
+                "total": rd.get("total", rd.get("done", 0)),
+                "last": rd.get("last"),
+            }
+        )
         remaining = await preview_pool_ids()
         deferred = await _deferred_today_cards(remaining)
         return {
@@ -926,6 +948,60 @@ async def preview_finish():
     else:
         _preview_write(None)
     return {"ok": True, "pool": await preview_pool_count()}
+
+
+@app.post("/api/preview/undo")
+async def preview_undo():
+    """Undo the last preview act (预览环节的"返回上一张").
+
+    Exact reverse of /api/preview/act: an approved card goes back into the
+    pool suspended at its original position (and leaves the approved list);
+    a deferred card loses today's deferred tag. Single slot, same shape as
+    the review-round undo. Refuses when the card moved on since (e.g. an
+    approved card already answered in a review round) — reversing then
+    would corrupt real scheduling state.
+    """
+    _preview_guard()
+    rd = _preview_read()
+    last = (rd or {}).get("last")
+    if not rd or not last:
+        raise HTTPException(status_code=409, detail="nothing to undo")
+    cid = last["cardId"]
+    infos = await anki("cardsInfo", {"cards": [cid]})
+    info = (infos or [None])[0]
+    if info is None or not info.get("cardId"):
+        raise HTTPException(status_code=409, detail="card vanished")
+    if last.get("action") == "approve":
+        # only still-untouched new cards can be pulled back into the pool
+        if info["type"] != 0 or info["deckName"] != RELEASE_DECK:
+            raise HTTPException(status_code=409, detail="card moved on")
+        await anki("changeDeck", {"cards": [cid], "deck": PREVIEW_DECK})
+        await anki("suspend", {"cards": [cid]})
+        rd["approved"] = [c for c in rd.get("approved", []) if c != cid]
+    else:
+        if info["type"] != 0 or PREVIEW_DECK not in info.get("deckName", ""):
+            raise HTTPException(status_code=409, detail="card moved on")
+        tag = "deferred-" + datetime.now().strftime("%Y%m%d")
+        await anki(
+            "removeTags", {"notes": [last.get("note") or info["note"]], "tags": tag}
+        )
+
+    pending = rd.get("pending") or []
+    pos = min(last.get("index", 0), len(pending))
+    if cid not in pending:
+        pending.insert(pos, cid)
+    rd["pending"] = pending
+    rd["done"] = max(0, rd.get("done", 0) - 1)
+    rd["total"] = rd["done"] + len(pending)
+    rd["status"] = "active"
+    rd.pop("last", None)  # single-level slot, consumed
+    _preview_write(rd)
+    # deck move / suspend / tag change must reach the sync server
+    fire_and_forget_sync()
+    cards = await fetch_cards([cid])
+    if not cards:
+        raise HTTPException(status_code=404, detail="card vanished after restore")
+    return {"restored": True, "card": cards[0], "index": pos, "action": last.get("action")}
 
 
 @app.get("/api/note")

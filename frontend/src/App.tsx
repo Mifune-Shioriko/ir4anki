@@ -86,6 +86,10 @@ export const App: Component = () => {
   const [pvApproved, setPvApproved] = createSignal(0)
   const [pvDeferred, setPvDeferred] = createSignal(0)
   const [pvBusy, setPvBusy] = createSignal(false)
+  // undo + edit inside preview rounds — same UX as the review round
+  const [pvCanUndo, setPvCanUndo] = createSignal(false)
+  const [pvUndoBusy, setPvUndoBusy] = createSignal(false)
+  const [pvEditOpen, setPvEditOpen] = createSignal(false)
 
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
@@ -140,6 +144,7 @@ export const App: Component = () => {
         setPvTotal(d.preview_round.total)
         setPvApproved(0)
         setPvDeferred(0)
+        setPvCanUndo(!!d.preview_round.can_undo)
         setPhase('preview')
       } else if (d.preview_mode && (d.preview_available ?? 0) > 0) {
         // top of the funnel: read new cards before they enter testing
@@ -294,6 +299,7 @@ export const App: Component = () => {
       setPvTotal(d.cards.length)
       setPvApproved(0)
       setPvDeferred(0)
+      setPvCanUndo(false) // a fresh preview round has no undo slot
       setPreviewPool(d.pool)
       setPreviewAvailable(d.available)
       setPhase('preview')
@@ -319,6 +325,8 @@ export const App: Component = () => {
       setPvDone(v => v + 1)
       if (action === 'approve') setPvApproved(v => v + 1)
       else setPvDeferred(v => v + 1)
+      // the backend recorded a single-level undo slot for this act
+      setPvCanUndo(true)
       if (d.round_complete) {
         setPreviewPool(d.pool ?? null)
         setPreviewAvailable(d.available ?? null)
@@ -328,6 +336,37 @@ export const App: Component = () => {
       alert('操作失败：' + (e as Error).message)
     } finally {
       setPvBusy(false)
+    }
+  }
+
+  // Undo the last preview act (approve→card back in the pool suspended,
+  // defer→today's deferred tag removed). Works in-round AND from the
+  // previewDone screen (the backend keeps the slot in the tombstone).
+  const pvUndo = async () => {
+    if (pvUndoBusy()) return
+    setPvUndoBusy(true)
+    try {
+      const d = await api.previewUndo()
+      if (phase() === 'preview') {
+        // re-insert the restored card at its original position
+        setPvCards(prev => {
+          const next = [...prev]
+          next.splice(Math.min(d.index, next.length), 0, d.card)
+          return next
+        })
+        setPvDone(v => Math.max(0, v - 1))
+        if (d.action === 'approve') setPvApproved(v => Math.max(0, v - 1))
+        else setPvDeferred(v => Math.max(0, v - 1))
+      } else {
+        // undo from previewDone reactivates the round — resync to rebuild
+        await resync()
+      }
+      setPvCanUndo(false) // single-level slot consumed
+    } catch {
+      // nothing to undo / card moved on — resync to the server's view
+      await resync()
+    } finally {
+      setPvUndoBusy(false)
     }
   }
 
@@ -352,9 +391,14 @@ export const App: Component = () => {
 
   // ---- keyboard shortcuts ----
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (editOpen()) return
+    if (editOpen() || pvEditOpen()) return
     if (phase() === 'preview') {
       if (pvBusy()) return
+      if (e.key === 'z' && (e.ctrlKey || e.metaKey) && pvCanUndo() && !pvUndoBusy()) {
+        e.preventDefault()
+        pvUndo()
+        return
+      }
       if (e.key === 'Enter') {
         e.preventDefault()
         pvAct('approve')
@@ -427,6 +471,10 @@ export const App: Component = () => {
             busy={pvBusy()}
             onApprove={() => pvAct('approve')}
             onDefer={() => pvAct('defer')}
+            onUndo={pvUndo}
+            onEdit={() => setPvEditOpen(true)}
+            undoEnabled={pvCanUndo()}
+            undoBusy={pvUndoBusy()}
           />
         </Show>
 
@@ -441,6 +489,9 @@ export const App: Component = () => {
             onMore={pvStart}
             onToReview={pvToReview}
             onFinish={pvFinish}
+            onUndo={pvUndo}
+            canUndo={pvCanUndo()}
+            undoBusy={pvUndoBusy()}
           />
         </Show>
 
@@ -523,6 +574,19 @@ export const App: Component = () => {
               )
             )
             setRevealed(false)
+          }}
+        />
+      </Show>
+
+      <Show when={pvEditOpen() && previewCard()}>
+        <EditDialog
+          cardId={previewCard()!.cardId}
+          onClose={() => setPvEditOpen(false)}
+          onSaved={(q, a) => {
+            const cid = previewCard()!.cardId
+            setPvCards(prev =>
+              prev.map(c => (c.cardId === cid ? { ...c, question: q, answer: a } : c)),
+            )
           }}
         />
       </Show>
