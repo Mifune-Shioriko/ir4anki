@@ -1,9 +1,9 @@
 import { Component, createEffect } from 'solid-js'
-import katex from 'katex'
 import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
+import { KATEX_OPTS, textWithMath } from '../lib/math'
 
 // The study card. Uses <md-elevated-card> (labs/card) — the REAL card
 // component. The previous version misused <md-elevation> (a decorative
@@ -27,41 +27,6 @@ interface Props {
   onUndo: () => void
   undoEnabled: boolean
   undoBusy: boolean
-}
-
-const KATEX_OPTS = {
-  throwOnError: false,
-  delimiters: [
-    { left: '$$', right: '$$', display: true },
-    { left: '\\(', right: '\\)', display: false },
-    { left: '\\[', right: '\\]', display: true },
-  ],
-}
-
-const escapeHtml = (s: string) =>
-  s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!)
-
-/** Escape plain text but render embedded \(…\)/$$…$$ math with KaTeX. */
-function textWithMath(text: string): string {
-  if (!text) return ''
-  const re = /(\\\(([\s\S]*?)\\\)|\$\$([\s\S]*?)\$\$)/g
-  const parts: string[] = []
-  let last = 0
-  let m: RegExpExecArray | null
-  while ((m = re.exec(text))) {
-    parts.push(escapeHtml(text.slice(last, m.index)))
-    const math = m[2] ?? m[3] ?? ''
-    try {
-      parts.push(
-        katex.renderToString(math, { throwOnError: false, displayMode: m[3] !== undefined })
-      )
-    } catch {
-      parts.push(escapeHtml(m[0]))
-    }
-    last = m.index + m[0].length
-  }
-  parts.push(escapeHtml(text.slice(last)))
-  return parts.join('')
 }
 
 export const Flashcard: Component<Props> = (props) => {

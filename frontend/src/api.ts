@@ -3,6 +3,8 @@ import type {
   MoreResponse,
   NoteResponse,
   NoteUpdateResponse,
+  PreviewActResponse,
+  PreviewStartResponse,
   SessionStateResponse,
   StartResponse,
   UndoResponse,
@@ -39,6 +41,11 @@ export const api = {
   tags: () => get<{ tags: string[] }>('/api/tags'),
   updateNote: (cardId: number, fields: Record<string, string>, tags: string[]) =>
     post<NoteUpdateResponse>('/api/note/update', { card_id: cardId, fields, tags }),
+  previewState: () => get<SessionStateResponse>('/api/preview/state'),
+  previewStart: () => post<PreviewStartResponse>('/api/preview/start'),
+  previewAct: (cardId: number, action: 'approve' | 'defer') =>
+    post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
+  previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
   upload: (file: File): Promise<{ filename: string }> => {
     const fd = new FormData()
     fd.append('file', file)

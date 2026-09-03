@@ -7,6 +7,8 @@ import { Component, Show } from 'solid-js'
 interface Props {
   due: number | null
   newTotal: number | null
+  /** preview pool size; null when preview mode is off (chip hidden) */
+  previewPool?: number | null
 }
 
 export const TopAppBar: Component<Props> = (props) => {
@@ -22,6 +24,12 @@ export const TopAppBar: Component<Props> = (props) => {
           label={props.newTotal != null ? `新卡池 ${props.newTotal}` : '新卡池 —'}
           disabled={props.newTotal == null}
         />
+        <Show when={props.previewPool != null}>
+          <md-assist-chip
+            label={props.previewPool != null ? `预览池 ${props.previewPool}` : '预览池 —'}
+            disabled={props.previewPool == null}
+          />
+        </Show>
       </md-chip-set>
     </header>
   )

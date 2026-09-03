@@ -46,6 +46,25 @@ REVIEW_PER_ROUND = 15
 NEW_PER_HOUR = 5
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
+# ---- preview mode (先看后考: read new cards before they enter testing) ----
+# Newly injected cards land in PREVIEW_DECK SUSPENDED, so they are invisible
+# to the scheduler and to normal rounds. A preview round shows them
+# question+answer together with NO grading; per card the user either
+# approves (放行: move to RELEASE_DECK + unsuspend → joins the regular
+# hourly new-card quota pool) or defers (tagged deferred-YYYYMMDD, hidden
+# from today's preview rounds, resurfaces tomorrow).
+#
+# The whole feature is gated on ANKI_PREVIEW_MODE. With it unset, preview
+# endpoints return 404 and status reports preview_mode=false — the frontend
+# then renders the exact legacy UI (system-level rollback).
+# Data-level rollback: preview cards are untouched NEW cards; unsuspend them
+# and move them back into 2026 and the collection is exactly as before.
+PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes", "on")
+PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
+RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
+PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "20"))
+PREVIEW_FILE = STATE_DIR / "preview.json"
+
 # card fields snapshotted before answering (for /api/undo) and the Anki
 # attribute names used to restore them via setSpecificValueOfCard
 SNAPSHOT_FIELDS = ("interval", "factor", "due", "reps", "lapses", "left", "type", "queue")
@@ -122,6 +141,16 @@ def quota_add(n: int) -> dict:
 
 def new_quota_left() -> int:
     return max(0, NEW_PER_HOUR - quota_state()["served"])
+
+
+def new_card_query() -> str:
+    """Search for dealable new cards.
+
+    In preview mode, new cards in the preview pool sit SUSPENDED and must
+    not leak into the regular new-card queue, so exclude suspended cards.
+    Preview mode off: the historical query, unchanged.
+    """
+    return "is:new -is:suspended" if PREVIEW_MODE else "is:new"
 
 
 # ---- round persistence (survives page refresh) ---------------------------
@@ -322,7 +351,7 @@ async def build_batch(review_count: int, allow_new: bool):
     # new cards within the hourly quota, spread evenly through the batch
     new_left = new_quota_left() if allow_new else 0
     if new_left > 0:
-        new_ids = await anki("findCards", {"query": "is:new"}) or []
+        new_ids = await anki("findCards", {"query": new_card_query()}) or []
         take = min(new_left, len(new_ids))
         if take > 0:
             new_cards = await fetch_cards(new_ids[:take])
@@ -337,7 +366,7 @@ async def build_batch(review_count: int, allow_new: bool):
             quota_add(take)
 
     due_remaining = len(await anki("findCards", {"query": "is:due -is:new"}) or [])
-    new_total = len(await anki("findCards", {"query": "is:new"}) or [])
+    new_total = len(await anki("findCards", {"query": new_card_query()}) or [])
     return cards, due_remaining, new_left if allow_new else 0, new_total
 
 
@@ -347,14 +376,18 @@ async def build_batch(review_count: int, allow_new: bool):
 async def status():
     try:
         due = await anki("findCards", {"query": "is:due -is:new"})
-        new = await anki("findCards", {"query": "is:new"})
-        return {
+        new = await anki("findCards", {"query": new_card_query()})
+        out = {
             "anki": "ok",
             "due_review": len(due or []),
             "new_total": len(new or []),
             "new_quota_left": new_quota_left(),
             "new_quota_total": NEW_PER_HOUR,
+            "preview_mode": PREVIEW_MODE,
         }
+        if PREVIEW_MODE:
+            out["preview_pool"] = len(await preview_pool_ids() or [])
+        return out
     except Exception as e:
         return {"anki": "error", "detail": str(e)}
 
@@ -395,10 +428,43 @@ async def session_state():
     except Exception:
         due_left = None
     try:
-        new_ids = await anki("findCards", {"query": "is:new"})
+        new_ids = await anki("findCards", {"query": new_card_query()})
         new_total = len(new_ids or [])
     except Exception:
         new_total = None
+
+    # preview-mode extras (the frontend decides from preview_mode whether to
+    # render the preview UI at all — feature flag off ⇒ exact legacy shape)
+    preview: dict = {"preview_mode": PREVIEW_MODE}
+    if PREVIEW_MODE:
+        try:
+            pool = await preview_pool_ids()
+            deferred = await _deferred_today_cards(pool)
+            preview["preview_pool"] = len(pool)
+            preview["preview_available"] = len(pool) - len(deferred)
+            prd = _preview_read()
+            if prd is not None:
+                infos = await anki("cardsInfo", {"cards": prd["pending"]})
+                still = [
+                    i["cardId"]
+                    for i in infos or []
+                    if i.get("cardId")
+                    and PREVIEW_DECK in i.get("deckName", "")
+                    and i.get("type") == 0
+                ]
+                pending = [c for c in prd["pending"] if c in still]
+                if pending:
+                    prd["pending"] = pending
+                    _preview_write(prd)
+                    preview["preview_round"] = {
+                        "cards": await fetch_cards(pending),
+                        "done": prd.get("done", 0),
+                        "total": prd.get("total", len(pending)),
+                    }
+                else:
+                    _preview_write(None)
+        except Exception:
+            preview["preview_pool"] = None
 
     rd = current_round()
     if rd is None:
@@ -409,6 +475,7 @@ async def session_state():
             "new_quota_total": NEW_PER_HOUR,
             "new_total": new_total,
             "can_undo": False,
+            **preview,
         }
 
     if rd.get("status") == "complete" or not rd.get("pending"):
@@ -422,6 +489,7 @@ async def session_state():
             "new_quota_total": NEW_PER_HOUR,
             "new_total": new_total,
             "can_undo": bool((rd.get("last") or {}).get("snap")),
+            **preview,
         }
 
     cards = await restore_round_cards(rd)
@@ -434,6 +502,7 @@ async def session_state():
             "due_remaining": due_left,
             "new_total": new_total,
             "can_undo": bool((rd.get("last") or {}).get("snap")),
+            **preview,
         }
     return {
         "state": "active",
@@ -446,6 +515,7 @@ async def session_state():
         "new_quota_total": NEW_PER_HOUR,
         "new_total": new_total,
         "can_undo": bool((rd.get("last") or {}).get("snap")),
+        **preview,
     }
 
 
@@ -536,7 +606,7 @@ async def answer(card_id: int, ease: int):
             try:
                 due_ids = await anki("findCards", {"query": "is:due -is:new"})
                 round_info["due_remaining"] = len(due_ids or [])
-                new_ids = await anki("findCards", {"query": "is:new"})
+                new_ids = await anki("findCards", {"query": new_card_query()})
                 round_info["new_total"] = len(new_ids or [])
             except Exception:
                 pass
@@ -602,6 +672,199 @@ async def undo():
     # propagate the corrected scheduling to the sync server
     fire_and_forget_sync()
     return {"restored": True, "card": cards[0], "index": pos}
+
+
+# ---- preview mode: pool, rounds, endpoints --------------------------------
+
+def _preview_guard():
+    """Preview endpoints only exist when the feature flag is on."""
+    if not PREVIEW_MODE:
+        raise HTTPException(status_code=404, detail="preview mode disabled")
+
+
+async def preview_pool_ids() -> list[int]:
+    """Suspended new cards sitting in the preview deck, oldest first.
+
+    Sorted by card id (a creation-timestamp ms epoch) rather than relying
+    on Anki's current browser sort order.
+    """
+    ids = (
+        await anki(
+            "findCards",
+            {"query": f'deck:"{PREVIEW_DECK}" is:new is:suspended'},
+        )
+        or []
+    )
+    return sorted(ids)
+
+
+async def _deferred_today_cards(pool_ids: list[int]) -> set[int]:
+    """Cards deferred TODAY (tag deferred-YYYYMMDD) — hidden from preview."""
+    if not pool_ids:
+        return set()
+    tag = "deferred-" + datetime.now().strftime("%Y%m%d")
+    ids = await anki(
+        "findCards", {"query": f'deck:"{PREVIEW_DECK}" tag:{tag} is:new'}
+    )
+    return set(ids or [])
+
+
+def _preview_read() -> dict | None:
+    STATE_DIR.mkdir(exist_ok=True)
+    if not PREVIEW_FILE.exists():
+        return None
+    try:
+        rd = json.loads(PREVIEW_FILE.read_text())
+        return rd if rd.get("status") == "active" else None
+    except Exception:
+        return None
+
+
+def _preview_write(rd: dict | None):
+    STATE_DIR.mkdir(exist_ok=True)
+    if rd is None:
+        PREVIEW_FILE.unlink(missing_ok=True)
+    else:
+        tmp = PREVIEW_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rd))
+        tmp.replace(PREVIEW_FILE)
+
+
+async def preview_pool_count() -> int:
+    return len(await preview_pool_ids())
+
+
+@app.get("/api/preview/state")
+async def preview_state():
+    """Entry point for the preview UI: pool size + in-progress round resume."""
+    _preview_guard()
+    try:
+        due_left = len(
+            await anki("findCards", {"query": "is:due -is:new"}) or []
+        )
+    except Exception:
+        due_left = None
+
+    rd = _preview_read()
+    if rd is not None:
+        infos = await anki("cardsInfo", {"cards": rd["pending"]})
+        # drop cards that left the pool since (released/deferred/moved)
+        still = {
+            i["cardId"]: i
+            for i in infos or []
+            if i.get("cardId")
+            and PREVIEW_DECK in i.get("deckName", "")
+            and i.get("type") == 0
+        }
+        pending = [c for c in rd["pending"] if c in still]
+        dropped = len(rd["pending"]) - len(pending)
+        rd["pending"] = pending
+        rd["done"] = rd.get("done", 0) + dropped
+        _preview_write(rd if pending else None)
+        if pending:
+            cards = await fetch_cards(pending)
+            return {
+                "round": "active",
+                "cards": cards,
+                "done": rd.get("done", 0),
+                "total": rd.get("total", rd.get("done", 0) + len(pending)),
+                "pool": len(await preview_pool_ids()),
+                "due_remaining": due_left,
+            }
+
+    pool = await preview_pool_ids()
+    deferred = await _deferred_today_cards(pool)
+    available = len(pool) - len(deferred)
+    return {
+        "round": "none",
+        "pool": len(pool),
+        "available": available,
+        "due_remaining": due_left,
+    }
+
+
+@app.post("/api/preview/start")
+async def preview_start():
+    """Deal one preview batch: oldest pool cards not deferred today."""
+    _preview_guard()
+    await do_sync()  # pull anything injected elsewhere
+    pool = await preview_pool_ids()
+    deferred = await _deferred_today_cards(pool)
+    pending = [c for c in pool if c not in deferred][:PREVIEW_PER_ROUND]
+    if not pending:
+        return {"cards": [], "pool": len(pool), "available": 0}
+    _preview_write(
+        {
+            "status": "active",
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "total": len(pending),
+            "done": 0,
+            "pending": pending,
+        }
+    )
+    return {
+        "cards": await fetch_cards(pending),
+        "pool": len(pool),
+        "available": len(pool) - len(deferred) - len(pending),
+    }
+
+
+@app.post("/api/preview/act")
+async def preview_act(card_id: int, action: str):
+    """Per-card decision inside a preview round.
+
+    approve (放行): move card to RELEASE_DECK and unsuspend — it becomes a
+        regular new card subject to the hourly quota, first seen tomorrow.
+    defer (明天再看): tag deferred-YYYYMMDD so today's preview skips it.
+    Both are idempotent-ish; both verify the card is still in the round.
+    """
+    _preview_guard()
+    if action not in ("approve", "defer"):
+        raise HTTPException(status_code=400, detail="action must be approve|defer")
+    rd = _preview_read()
+    if not rd or card_id not in rd.get("pending", []):
+        return {"ok": False, "reason": "stale"}
+
+    if action == "approve":
+        infos = await anki("cardsInfo", {"cards": [card_id]})
+        if not infos:
+            raise HTTPException(status_code=404, detail="card vanished")
+        await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
+        await anki("unsuspend", {"cards": [card_id]})
+    else:
+        infos = await anki("cardsInfo", {"cards": [card_id]})
+        if not infos:
+            raise HTTPException(status_code=404, detail="card vanished")
+        tag = "deferred-" + datetime.now().strftime("%Y%m%d")
+        await anki("addTags", {"notes": [infos[0]["note"]], "tags": tag})
+
+    # deck move / tag change must reach the sync server (and thus the
+    # user's phone + desktop) — same coalesced sync the answer path uses
+    fire_and_forget_sync()
+
+    rd["pending"] = [c for c in rd["pending"] if c != card_id]
+    rd["done"] = rd.get("done", 0) + 1
+    if not rd["pending"]:
+        rd["status"] = "complete"
+        _preview_write(None)
+        remaining = await preview_pool_ids()
+        deferred = await _deferred_today_cards(remaining)
+        return {
+            "ok": True,
+            "round_complete": True,
+            "pool": len(remaining),
+            "available": len(remaining) - len(deferred),
+        }
+    _preview_write(rd)
+    return {"ok": True, "round_complete": False}
+
+
+@app.post("/api/preview/finish")
+async def preview_finish():
+    """End the preview round; untouched cards stay suspended in the pool."""
+    _preview_guard()
+    _preview_write(None)
+    return {"ok": True, "pool": await preview_pool_count()}
 
 
 @app.get("/api/note")

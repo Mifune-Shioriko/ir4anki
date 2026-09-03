@@ -13,8 +13,21 @@ import { EmptyScreen } from './components/EmptyScreen'
 import { FinishedScreen } from './components/FinishedScreen'
 import { EditDialog } from './components/EditDialog'
 import { Loading } from './components/Loading'
+import { PreviewCard } from './components/PreviewCard'
+import { PreviewScreen } from './components/PreviewScreen'
+import { PreviewDoneScreen } from './components/PreviewDoneScreen'
 
-type Phase = 'loading' | 'start' | 'review' | 'done' | 'empty' | 'finished'
+type Phase =
+  | 'loading'
+  | 'start'
+  | 'review'
+  | 'done'
+  | 'empty'
+  | 'finished'
+  // preview mode (先看后考) — rendered only when the backend flag is on
+  | 'previewStart'
+  | 'preview'
+  | 'previewDone'
 
 export const App: Component = () => {
   createEffect(() => syncThemeColor())
@@ -61,6 +74,19 @@ export const App: Component = () => {
   // ---- edit dialog ----
   const [editOpen, setEditOpen] = createSignal(false)
 
+  // ---- preview mode (先看后考) ----
+  // Gated entirely by the backend flag (resync reads it). Preview mode off:
+  // every preview signal stays null/false and the UI is the legacy one.
+  const [previewMode, setPreviewMode] = createSignal(false)
+  const [previewPool, setPreviewPool] = createSignal<number | null>(null)
+  const [previewAvailable, setPreviewAvailable] = createSignal<number | null>(null)
+  const [pvCards, setPvCards] = createSignal<Card[]>([])
+  const [pvDone, setPvDone] = createSignal(0)
+  const [pvTotal, setPvTotal] = createSignal(0)
+  const [pvApproved, setPvApproved] = createSignal(0)
+  const [pvDeferred, setPvDeferred] = createSignal(0)
+  const [pvBusy, setPvBusy] = createSignal(false)
+
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
 
@@ -98,8 +124,26 @@ export const App: Component = () => {
       const d = await api.sessionState()
       adoptGlobal(d)
       setCanUndo(d.can_undo)
+      // preview-mode signals (absent when the backend flag is off)
+      setPreviewMode(!!d.preview_mode)
+      if (d.preview_mode) {
+        setPreviewPool(d.preview_pool ?? null)
+        setPreviewAvailable(d.preview_available ?? null)
+      }
       if (d.state === 'active') {
+        // a normal review round in progress always wins — finish it first
         loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
+      } else if (d.preview_mode && d.preview_round) {
+        // resume an unfinished preview round
+        setPvCards(d.preview_round.cards)
+        setPvDone(d.preview_round.done)
+        setPvTotal(d.preview_round.total)
+        setPvApproved(0)
+        setPvDeferred(0)
+        setPhase('preview')
+      } else if (d.preview_mode && (d.preview_available ?? 0) > 0) {
+        // top of the funnel: read new cards before they enter testing
+        setPhase('previewStart')
       } else if (d.state === 'complete') {
         setTotalDone(d.done || d.total || 0)
         if (d.new_in_batch != null) {
@@ -231,9 +275,87 @@ export const App: Component = () => {
     setPhase('finished')
   }
 
+  // ---- preview actions (先看后考) ----
+  const previewCard = () => pvCards()[0]
+
+  const pvStart = async () => {
+    setPhase('loading')
+    setLoadText('正在加载预览卡…')
+    setPvBusy(true)
+    try {
+      const d = await api.previewStart()
+      if (!d.cards.length) {
+        // pool drained (deferred today) — back to whatever resync decides
+        await resync()
+        return
+      }
+      setPvCards(d.cards)
+      setPvDone(0)
+      setPvTotal(d.cards.length)
+      setPvApproved(0)
+      setPvDeferred(0)
+      setPreviewPool(d.pool)
+      setPreviewAvailable(d.available)
+      setPhase('preview')
+    } catch (e) {
+      setLoadText('加载失败：' + (e as Error).message)
+    } finally {
+      setPvBusy(false)
+    }
+  }
+
+  const pvAct = async (action: 'approve' | 'defer') => {
+    const card = previewCard()
+    if (!card || pvBusy()) return
+    setPvBusy(true)
+    try {
+      const d = await api.previewAct(card.cardId, action)
+      if (!d.ok) {
+        // stale (card left the pool elsewhere) — resync to the server's view
+        await resync()
+        return
+      }
+      setPvCards(prev => prev.slice(1))
+      setPvDone(v => v + 1)
+      if (action === 'approve') setPvApproved(v => v + 1)
+      else setPvDeferred(v => v + 1)
+      if (d.round_complete) {
+        setPreviewPool(d.pool ?? null)
+        setPreviewAvailable(d.available ?? null)
+        setPhase('previewDone')
+      }
+    } catch (e) {
+      alert('操作失败：' + (e as Error).message)
+    } finally {
+      setPvBusy(false)
+    }
+  }
+
+  const pvToReview = () => setPhase('start')
+
+  const pvFinish = async () => {
+    setPhase('loading')
+    setLoadText('正在同步…')
+    try {
+      await api.previewFinish()
+    } catch { /* not critical */ }
+    setPhase('finished')
+  }
+
   // ---- keyboard shortcuts ----
   const handleKeyDown = (e: KeyboardEvent) => {
     if (editOpen()) return
+    if (phase() === 'preview') {
+      if (pvBusy()) return
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        pvAct('approve')
+      } else if (e.key === 'd' || e.key === 'D') {
+        e.preventDefault()
+        pvAct('defer')
+      }
+      return
+    }
     if (phase() !== 'review') return
     if (e.key === ' ' && !revealed()) {
       e.preventDefault()
@@ -254,11 +376,64 @@ export const App: Component = () => {
 
   return (
     <div class="app" onKeyDown={handleKeyDown}>
-      <TopAppBar due={due()} newTotal={newTotal()} />
+      <TopAppBar
+        due={due()}
+        newTotal={newTotal()}
+        previewPool={previewMode() ? previewPool() : null}
+      />
 
       <div class="content">
         <Show when={phase() === 'loading'}>
           <Loading text={loadText()} />
+        </Show>
+
+        <Show when={phase() === 'previewStart'}>
+          <PreviewScreen
+            pool={previewPool()}
+            available={previewAvailable()}
+            due={due()}
+            busy={pvBusy()}
+            onStart={pvStart}
+            onSkipToReview={pvToReview}
+          />
+        </Show>
+
+        <Show when={phase() === 'preview' && previewCard()}>
+          <div class="progress-area">
+            <div class="progress-row">
+              <md-linear-progress
+                class="progress-bar"
+                value={pvTotal() > 0 ? Math.min(pvDone() / pvTotal(), 1) : 0}
+              />
+              <span class="progress-text md-typescale-label-large">
+                {pvDone()}/{pvTotal()}
+              </span>
+            </div>
+            <div class="progress-split md-typescale-label-medium">
+              <span>已放行 {pvApproved()}</span>
+              <span>明天再看 {pvDeferred()}</span>
+            </div>
+          </div>
+          <PreviewCard
+            card={previewCard()!}
+            busy={pvBusy()}
+            onApprove={() => pvAct('approve')}
+            onDefer={() => pvAct('defer')}
+          />
+        </Show>
+
+        <Show when={phase() === 'previewDone'}>
+          <PreviewDoneScreen
+            approved={pvApproved()}
+            deferred={pvDeferred()}
+            pool={previewPool()}
+            available={previewAvailable()}
+            due={due()}
+            busy={pvBusy()}
+            onMore={pvStart}
+            onToReview={pvToReview}
+            onFinish={pvFinish}
+          />
         </Show>
 
         <Show when={phase() === 'start'}>

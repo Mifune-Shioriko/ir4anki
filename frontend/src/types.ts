@@ -31,10 +31,26 @@ export interface RoundInfo {
   new_total?: number
 }
 
-export type SessionStateResponse =
+/** Preview-mode fields ride on every session/state response. When
+ * preview_mode is false/absent the frontend renders the exact legacy UI. */
+export interface PreviewRoundResume {
+  cards: Card[]
+  done: number
+  total: number
+}
+
+export interface PreviewExtras {
+  preview_mode?: boolean
+  preview_pool?: number | null
+  preview_available?: number
+  preview_round?: PreviewRoundResume
+}
+
+export type SessionStateResponse = PreviewExtras & (
   | { state: 'none'; due_remaining: number | null; new_quota_left: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
   | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_quota_left?: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
   | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_quota_left?: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
+)
 
 export interface StartResponse {
   synced: boolean
@@ -51,6 +67,20 @@ export interface MoreResponse {
   new_quota_left: number
   new_quota_total: number
   new_total: number
+}
+
+export interface PreviewStartResponse {
+  cards: Card[]
+  pool: number
+  available: number
+}
+
+export interface PreviewActResponse {
+  ok: boolean
+  reason?: string
+  round_complete?: boolean
+  pool?: number
+  available?: number
 }
 
 export interface AnswerResponse {
