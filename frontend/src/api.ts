@@ -12,8 +12,19 @@ import type {
 } from './types'
 
 async function parse<T>(r: Response): Promise<T> {
-  const data = (await r.json().catch(() => null)) as (T & { detail?: string }) | null
+  // Read as text first: unknown API paths against an OLD backend process
+  // fall through the SPA catch-all and return index.html with HTTP 200 —
+  // silently accepting that would let callers treat a failed call as
+  // success (e.g. a delete that never happened).
+  const text = await r.text()
+  let data: (T & { detail?: string }) | null = null
+  try {
+    data = JSON.parse(text)
+  } catch {
+    /* non-JSON body (SPA fallback HTML, gateway error page…) */
+  }
   if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+  if (data === null) throw new Error('后端响应异常（页面刷新或重启服务后再试）')
   return data as T
 }
 
