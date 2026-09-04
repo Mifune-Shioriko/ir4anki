@@ -48,6 +48,13 @@ export const api = {
     post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
   previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),
   previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
+  addInfo: () => get<{ model_name: string; fields: string[] }>('/api/card/add/info'),
+  addCard: (fields: Record<string, string>, tags: string[]) =>
+    post<{ noteId: number; cardIds: number[]; pool: number | null }>('/api/card/add', { fields, tags }),
+  deleteCard: (cardId: number) =>
+    post<{ deleted: boolean }>(`/api/card/delete?card_id=${cardId}`),
+  toPreview: (cardId: number) =>
+    post<{ moved: boolean; pool: number }>(`/api/card/to-preview?card_id=${cardId}`),
   upload: (file: File): Promise<{ filename: string }> => {
     const fd = new FormData()
     fd.append('file', file)

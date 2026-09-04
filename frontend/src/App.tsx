@@ -2,6 +2,7 @@ import { Component, Show, createEffect, createSignal } from 'solid-js'
 import { api } from './api'
 import type { Card } from './types'
 import { syncThemeColor } from './theme'
+import { stripTemplateBlocks } from './lib/clean'
 
 import { TopAppBar } from './components/TopAppBar'
 import { ProgressBar } from './components/ProgressBar'
@@ -12,6 +13,7 @@ import { DoneScreen } from './components/DoneScreen'
 import { EmptyScreen } from './components/EmptyScreen'
 import { FinishedScreen } from './components/FinishedScreen'
 import { EditDialog } from './components/EditDialog'
+import { ConfirmDialog } from './components/ConfirmDialog'
 import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
 import { PreviewScreen } from './components/PreviewScreen'
@@ -49,8 +51,7 @@ export const App: Component = () => {
 
   // ---- global stats (top bar chips) ----
   const [due, setDue] = createSignal<number | null>(null)
-  const [newQuotaLeft, setNewQuotaLeft] = createSignal<number | null>(null)
-  const [newQuotaTotal, setNewQuotaTotal] = createSignal<number | null>(null)
+  const [newPerRound, setNewPerRound] = createSignal<number | null>(null)
   const [newTotal, setNewTotal] = createSignal<number | null>(null)
 
   // ---- review/new split for the current batch (front-end only) ----
@@ -74,6 +75,16 @@ export const App: Component = () => {
   // ---- edit dialog ----
   const [editOpen, setEditOpen] = createSignal(false)
 
+  // ---- add card + delete + back-to-preview (user spec 2026-09-04) ----
+  // The add dialog reuses EditDialog in mode='add' (same rich editor, same
+  // bottom-sheet style); the new card lands in the preview pool suspended.
+  // Delete and to-preview both ask for confirmation first (防呆).
+  const [addOpen, setAddOpen] = createSignal(false)
+  const [deleteTarget, setDeleteTarget] = createSignal<{ cardId: number; preview: string } | null>(null)
+  const [deleteBusy, setDeleteBusy] = createSignal(false)
+  const [toPreviewTarget, setToPreviewTarget] = createSignal<{ cardId: number; preview: string } | null>(null)
+  const [toPreviewBusy, setToPreviewBusy] = createSignal(false)
+
   // ---- preview mode (先看后考) ----
   // Gated entirely by the backend flag (resync reads it). Preview mode off:
   // every preview signal stays null/false and the UI is the legacy one.
@@ -96,13 +107,11 @@ export const App: Component = () => {
 
   const adoptGlobal = (d: {
     due_remaining?: number | null
-    new_quota_left?: number | null
-    new_quota_total?: number | null
+    new_per_round?: number | null
     new_total?: number | null
   }) => {
     if (d.due_remaining != null) setDue(d.due_remaining)
-    if (d.new_quota_left != null) setNewQuotaLeft(d.new_quota_left)
-    if (d.new_quota_total != null) setNewQuotaTotal(d.new_quota_total)
+    if (d.new_per_round != null) setNewPerRound(d.new_per_round)
     if (d.new_total != null) setNewTotal(d.new_total)
   }
 
@@ -280,6 +289,94 @@ export const App: Component = () => {
     setPhase('finished')
   }
 
+  // ---- card lifecycle: add / delete / back to preview pool (user spec
+  // 2026-09-04). Add reuses EditDialog in mode='add'; delete and to-preview
+  // go through a confirmation dialog first (防呆). The backend already keeps
+  // round.json/preview.json consistent (card counts as handled), so the
+  // frontend just mirrors that locally — same splice pattern as answer().
+
+  const openAdd = () => setAddOpen(true)
+
+  const onCardAdded = () => {
+    // the new card lands suspended in the preview pool — reflect in chips
+    if (previewMode()) {
+      setPreviewPool(p => (p == null ? p : p + 1))
+      setPreviewAvailable(p => (p == null ? p : p + 1))
+    }
+  }
+
+  const confirmDelete = async () => {
+    const t = deleteTarget()
+    if (!t || deleteBusy()) return
+    setDeleteBusy(true)
+    try {
+      await api.deleteCard(t.cardId)
+      setDeleteTarget(null)
+      if (phase() === 'preview') {
+        setPvCards(prev => prev.slice(1))
+        setPvDone(v => v + 1)
+        setPreviewPool(p => (p == null ? p : Math.max(0, p - 1)))
+        if (pvCards().length === 0) {
+          // backend tombstone keeps earlier approvals for the done-screen
+          // undo; without any approval just fall back to the pool screen
+          setPhase(pvApproved() > 0 ? 'previewDone' : 'previewStart')
+        }
+      } else if (phase() === 'review') {
+        const wasNew = cards()[idx()]?.isNew
+        setCards(prev => prev.filter((_, i) => i !== idx()))
+        setTotalDone(v => v + 1)
+        if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
+        else setBatchReviewTotal(v => Math.max(0, v - 1))
+        if (cards().length === 0) setPhase('done')
+        else setRevealed(false)
+      }
+    } catch (e) {
+      alert('删除失败：' + (e as Error).message)
+    } finally {
+      setDeleteBusy(false)
+    }
+  }
+
+  const confirmToPreview = async () => {
+    const t = toPreviewTarget()
+    if (!t || toPreviewBusy()) return
+    setToPreviewBusy(true)
+    try {
+      const d = await api.toPreview(t.cardId)
+      setToPreviewTarget(null)
+      if (previewMode()) {
+        setPreviewPool(d.pool)
+        setPreviewAvailable(p => (p == null ? p : p + 1))
+      }
+      if (phase() === 'review') {
+        const wasNew = cards()[idx()]?.isNew
+        setCards(prev => prev.filter((_, i) => i !== idx()))
+        setTotalDone(v => v + 1)
+        if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
+        else setBatchReviewTotal(v => Math.max(0, v - 1))
+        if (cards().length === 0) setPhase('done')
+        else setRevealed(false)
+      }
+    } catch (e) {
+      alert('移动失败：' + (e as Error).message)
+    } finally {
+      setToPreviewBusy(false)
+    }
+  }
+
+  // short plain-text preview of a card's front, for confirmation dialogs.
+  // Template blocks (<style>/<script>) are stripped FIRST — otherwise the
+  // note type's card CSS shows up as the "preview" text (found via UI test).
+  const plainPreview = (html: string, max = 40) => {
+    const text = stripTemplateBlocks(html)
+      .replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()
+    return text.length > max ? text.slice(0, max) + '…' : text
+  }
+  const askDelete = (card: Card) =>
+    setDeleteTarget({ cardId: card.cardId, preview: plainPreview(card.question) })
+  const askToPreview = (card: Card) =>
+    setToPreviewTarget({ cardId: card.cardId, preview: plainPreview(card.question) })
+
   // ---- preview actions (先看后考) ----
   const previewCard = () => pvCards()[0]
 
@@ -391,7 +488,7 @@ export const App: Component = () => {
 
   // ---- keyboard shortcuts ----
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (editOpen() || pvEditOpen()) return
+    if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
     if (phase() === 'preview') {
       if (pvBusy()) return
       if (e.key === 'z' && (e.ctrlKey || e.metaKey) && pvCanUndo() && !pvUndoBusy()) {
@@ -473,6 +570,8 @@ export const App: Component = () => {
             onDefer={() => pvAct('defer')}
             onUndo={pvUndo}
             onEdit={() => setPvEditOpen(true)}
+            onAdd={openAdd}
+            onDelete={() => askDelete(previewCard()!)}
             undoEnabled={pvCanUndo()}
             undoBusy={pvUndoBusy()}
           />
@@ -498,8 +597,7 @@ export const App: Component = () => {
         <Show when={phase() === 'start'}>
           <StartScreen
             due={due()}
-            newQuotaLeft={newQuotaLeft()}
-            newQuotaTotal={newQuotaTotal()}
+            newPerRound={newPerRound()}
             newTotal={newTotal()}
             busy={false}
             onBegin={startNewRound}
@@ -524,6 +622,9 @@ export const App: Component = () => {
             onUndo={undo}
             undoEnabled={canUndo()}
             undoBusy={undoBusy()}
+            onAdd={openAdd}
+            onDelete={() => askDelete(currentCard()!)}
+            onToPreview={() => askToPreview(currentCard()!)}
           />
           <ActionArea
             revealed={revealed()}
@@ -537,7 +638,6 @@ export const App: Component = () => {
           <DoneScreen
             count={totalDone()}
             due={due()}
-            newQuotaLeft={newQuotaLeft()}
             newTotal={newTotal()}
             reviewDone={reviewDone()}
             reviewTotal={reviewTotal()}
@@ -590,6 +690,34 @@ export const App: Component = () => {
           }}
         />
       </Show>
+
+      <Show when={addOpen()}>
+        <EditDialog
+          mode="add"
+          onClose={() => setAddOpen(false)}
+          onAdded={() => onCardAdded()}
+        />
+      </Show>
+
+      <ConfirmDialog
+        open={deleteTarget() !== null}
+        headline="删除这张卡片？"
+        body={deleteTarget() ? `“${deleteTarget()!.preview}” 及其所有卡片都会被永久删除，无法撤销。` : ''}
+        confirmLabel="删除"
+        busy={deleteBusy()}
+        onConfirm={confirmDelete}
+        onCancel={() => setDeleteTarget(null)}
+      />
+
+      <ConfirmDialog
+        open={toPreviewTarget() !== null}
+        headline="移回预览池？"
+        body={toPreviewTarget() ? `“${toPreviewTarget()!.preview}” 的复习记录会被清零，回到预览池重新学习（先看后考）。` : ''}
+        confirmLabel="移回预览池"
+        busy={toPreviewBusy()}
+        onConfirm={confirmToPreview}
+        onCancel={() => setToPreviewTarget(null)}
+      />
     </div>
   )
 }

@@ -2,8 +2,7 @@ import { Component } from 'solid-js'
 
 interface Props {
   due: number | null
-  newQuotaLeft: number | null
-  newQuotaTotal: number | null
+  newPerRound: number | null
   newTotal: number | null
   busy: boolean
   onBegin: () => void
@@ -25,8 +24,8 @@ export const StartScreen: Component<Props> = (props) => {
               <span class="stat-value">{props.due ?? '—'} 张</span>
             </div>
             <div class="stat-row">
-              <span>本小时新卡额度</span>
-              <span class="stat-value">{props.newQuotaLeft ?? '—'} / {props.newQuotaTotal ?? '—'}</span>
+              <span>每轮新卡上限</span>
+              <span class="stat-value">{props.newPerRound ?? '—'} 张</span>
             </div>
             <div class="stat-row">
               <span>牌组新卡池</span>

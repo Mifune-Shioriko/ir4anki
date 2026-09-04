@@ -13,6 +13,13 @@ import {
 // directly, Solid only mounts the initial HTML (fresh mount per card —
 // App.tsx unmounts the dialog on close).
 //
+// Two modes share the exact same UI:
+//  - mode='edit' (default): loads the note behind props.cardId, saves via
+//    /api/note/update.
+//  - mode='add': blank fields from /api/card/add/info (问答题: 正面/背面),
+//    saves via /api/card/add → the card enters the preview pool suspended
+//    (same route as the add_cards.py pipeline).
+//
 // Math: fields store LaTeX delimiters (\(…\) inline / $$…$$ display, same
 // convention as Flashcard's KaTeX auto-render). The editor turns them into
 // atomic KaTeX-rendered chips (contenteditable=false); the fx toolbar button
@@ -22,9 +29,11 @@ import {
 // Media round-trip: bare Anki filenames <-> /media/ URLs via data-media,
 // restored verbatim on save (rich.ts).
 interface Props {
-  cardId: number
+  cardId?: number
+  mode?: 'edit' | 'add'
   onClose: () => void
-  onSaved: (question: string, answer: string) => void
+  onSaved?: (question: string, answer: string) => void
+  onAdded?: (noteId: number) => void
 }
 
 export const EditDialog: Component<Props> = (props) => {
@@ -38,6 +47,8 @@ export const EditDialog: Component<Props> = (props) => {
   const [allTags, setAllTags] = createSignal<string[]>([])
   const [tagInput, setTagInput] = createSignal('')
   const [error, setError] = createSignal('')
+
+  const isAdd = () => props.mode === 'add'
 
   // ---- imperative editor state (not reactive on purpose) ----
   const fieldRefs = new Map<string, HTMLDivElement>()
@@ -62,10 +73,17 @@ export const EditDialog: Component<Props> = (props) => {
     ;(async () => {
       try {
         setLoading(true)
-        const [noteData, tagsData] = await Promise.all([api.note(props.cardId), api.tags()])
-        setFields(noteData.fields)
-        setTags(noteData.tags)
-        setAllTags(tagsData.tags)
+        if (isAdd()) {
+          const [info, tagsData] = await Promise.all([api.addInfo(), api.tags()])
+          setFields(Object.fromEntries(info.fields.map(f => [f, ''])))
+          setTags([])
+          setAllTags(tagsData.tags)
+        } else {
+          const [noteData, tagsData] = await Promise.all([api.note(props.cardId!), api.tags()])
+          setFields(noteData.fields)
+          setTags(noteData.tags)
+          setAllTags(tagsData.tags)
+        }
       } catch (e) {
         setError((e as Error).message)
       } finally {
@@ -275,8 +293,18 @@ export const EditDialog: Component<Props> = (props) => {
       fieldRefs.forEach((el, name) => {
         out[name] = fromEditorHtml(el.innerHTML)
       })
-      const res = await api.updateNote(props.cardId, out, tags())
-      props.onSaved(res.question, res.answer)
+      if (isAdd()) {
+        if (!Object.values(out).some(v => v.replace(/<[^>]*>/g, '').trim())) {
+          setError('卡片内容不能为空')
+          setSaving(false)
+          return
+        }
+        const res = await api.addCard(out, tags())
+        props.onAdded?.(res.noteId)
+      } else {
+        const res = await api.updateNote(props.cardId!, out, tags())
+        props.onSaved?.(res.question, res.answer)
+      }
       props.onClose()
     } catch (e) {
       setError((e as Error).message)
@@ -297,7 +325,7 @@ export const EditDialog: Component<Props> = (props) => {
         applyBottomSheetAnimation(el)
       }}
     >
-      <div slot="headline">编辑卡片</div>
+      <div slot="headline">{isAdd() ? '添加卡片' : '编辑卡片'}</div>
 
       <div slot="content" class="edit-dialog-content">
         <Show when={loading()}>
@@ -425,7 +453,9 @@ export const EditDialog: Component<Props> = (props) => {
           </div>
 
           <div class="edit-hint md-typescale-body-small">
-            富文本编辑：格式、公式、图片、标签都会原样写回 Anki，保存后立即生效。
+            {isAdd()
+              ? '富文本编辑：格式、公式、图片、标签都会原样写回 Anki。新卡进入预览池（挂起），预览放行后进入复习队列。'
+              : '富文本编辑：格式、公式、图片、标签都会原样写回 Anki，保存后立即生效。'}
           </div>
         </Show>
       </div>
@@ -433,7 +463,7 @@ export const EditDialog: Component<Props> = (props) => {
       <div slot="actions">
         <md-text-button onClick={() => props.onClose()}>取消</md-text-button>
         <md-filled-button onClick={handleSave} disabled={loading() || saving()}>
-          保存
+          {isAdd() ? '添加' : '保存'}
         </md-filled-button>
       </div>
     </md-dialog>

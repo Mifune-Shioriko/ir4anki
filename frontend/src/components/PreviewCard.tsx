@@ -4,6 +4,7 @@ import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
 import { KATEX_OPTS, textWithMath } from '../lib/math'
+import { IconAdd, IconDelete } from './icons'
 
 // Preview card (先看后考): question AND answer are shown together — this
 // round is pure reading with NO grading, so there is no reveal step and no
@@ -19,6 +20,8 @@ interface Props {
   onDefer: () => void
   onUndo: () => void
   onEdit: () => void
+  onAdd: () => void
+  onDelete: () => void
   undoEnabled: boolean
   undoBusy: boolean
   busy: boolean
@@ -75,6 +78,13 @@ export const PreviewCard: Component<Props> = (props) => {
                     <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
                   </svg>
                 </md-icon>
+              </md-icon-button>
+              <div class="header-actions-sep" aria-hidden="true" />
+              <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>
+                <md-icon><IconAdd /></md-icon>
+              </md-icon-button>
+              <md-icon-button aria-label="删除卡片" onClick={() => props.onDelete()}>
+                <md-icon><IconDelete /></md-icon>
               </md-icon-button>
             </div>
           </div>

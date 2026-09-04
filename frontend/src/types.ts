@@ -26,8 +26,7 @@ export interface RoundInfo {
   done: number
   total: number
   due_remaining?: number
-  new_quota_left?: number
-  new_quota_total?: number
+  new_per_round?: number
   new_total?: number
 }
 
@@ -59,25 +58,23 @@ export interface PreviewExtras {
 }
 
 export type SessionStateResponse = PreviewExtras & (
-  | { state: 'none'; due_remaining: number | null; new_quota_left: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
-  | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_quota_left?: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
-  | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_quota_left?: number | null; new_quota_total?: number | null; new_total?: number | null; can_undo: boolean }
+  | { state: 'none'; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
+  | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
+  | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
 )
 
 export interface StartResponse {
   synced: boolean
   cards: Card[]
   due_remaining: number
-  new_quota_left: number
-  new_quota_total: number
+  new_per_round: number
   new_total: number
 }
 
 export interface MoreResponse {
   cards: Card[]
   due_remaining: number
-  new_quota_left: number
-  new_quota_total: number
+  new_per_round: number
   new_total: number
 }
 

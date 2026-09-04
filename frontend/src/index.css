@@ -146,6 +146,39 @@ body {
   flex-shrink: 0;
 }
 
+/* thin divider separating the undo/edit group from the add/move/delete
+ * lifecycle group (user spec 2026-09-04) */
+.header-actions-sep {
+  width: 1px;
+  height: 24px;
+  margin: 0 6px;
+  background: var(--md-sys-color-outline-variant, #c4c7c5);
+}
+
+/* ---- confirm dialogs (delete / back-to-preview, user spec 2026-09-04) ----
+ * Standard centered MD3 basic dialog — no bottom-sheet anchoring (the UA
+ * default margin:auto centers the inner <dialog>). */
+.confirm-dialog {
+  width: min(440px, calc(100vw - 48px));
+  /* lift the host's built-in max-width clamp like the edit sheet */
+  max-width: calc(100vw - 48px);
+}
+
+.confirm-text {
+  color: var(--md-sys-color-on-surface-variant);
+  line-height: 1.6;
+}
+
+/* destructive confirm button: filled button in error color (MD3 destructive
+ * emphasis) */
+.danger-button {
+  --md-filled-button-container-color: var(--md-sys-color-error);
+  --md-filled-button-label-text-color: var(--md-sys-color-on-error);
+  --md-filled-button-hover-container-color: var(--md-sys-color-error);
+  --md-filled-button-focus-container-color: var(--md-sys-color-error);
+  --md-filled-button-pressed-container-color: var(--md-sys-color-error);
+}
+
 /* Anki field content. Template CSS is stripped in cleanCardHtml(), so
  * provide a sane reading baseline instead of the note type's hardcoded
  * arial/20px/center. */

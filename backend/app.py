@@ -2,10 +2,12 @@
 
 Session model:
   - one round = a 5-card read-only PREVIEW lead-in (preview mode), then
-    up to 10 review cards + up to 5 new cards (user spec 2026-09-03:
-    先预览 5 张新卡，然后复习 10 + 5)
-  - new cards capped at 5 per clock hour (quota tracked in state file)
-  - 'continue' after a round serves more review cards (like normal Anki)
+    up to 25 review cards + up to 5 new cards (user spec 2026-09-04:
+    先预览 5 张新卡，然后复习 25 + 5)
+  - new cards: NO hourly quota — every round (and 'continue') draws up to
+    NEW_PER_ROUND cards UNIFORMLY AT RANDOM from the new-card pool (user
+    spec 2026-09-04; replaces the hourly quota + preview-priority funnel so
+    older released cards can't be starved by fresher ones)
   - every answer triggers a fire-and-forget sync to the self-hosted server
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
@@ -14,6 +16,7 @@ import asyncio
 import base64
 import json
 import os
+import random
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -41,20 +44,19 @@ REVIEW_WEB_V2_DIST = Path(
     os.getenv("REVIEW_DIST_DIR", str(_REPO_ROOT / "frontend" / "dist"))
 )
 STATE_DIR = Path(os.getenv("ANKI_STATE_DIR", str(Path(__file__).parent / "state")))
-QUOTA_FILE = STATE_DIR / "quota.json"
 ROUND_FILE = STATE_DIR / "round.json"
 
-REVIEW_PER_ROUND = 10  # + up to NEW_PER_HOUR new cards = 15 total per round
-NEW_PER_HOUR = 5
+REVIEW_PER_ROUND = 25   # + up to NEW_PER_ROUND new cards = 30 total per round
+NEW_PER_ROUND = 5       # random draw from the new pool, per round, no quota
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
 # ---- preview mode (先看后考: read new cards before they enter testing) ----
 # Newly injected cards land in PREVIEW_DECK SUSPENDED, so they are invisible
 # to the scheduler and to normal rounds. A preview round shows them
 # question+answer together with NO grading; per card the user either
-# approves (放行: move to RELEASE_DECK + unsuspend → joins the regular
-# hourly new-card quota pool) or defers (tagged deferred-YYYYMMDD, hidden
-# from today's preview rounds, resurfaces tomorrow).
+# approves (放行: move to RELEASE_DECK + unsuspend → joins the regular new
+# pool, from which every round draws at random) or defers (tagged
+# deferred-YYYYMMDD, hidden from today's preview rounds, resurfaces tomorrow).
 #
 # The whole feature is gated on ANKI_PREVIEW_MODE. With it unset, preview
 # endpoints return 404 and status reports preview_mode=false — the frontend
@@ -116,33 +118,10 @@ def fire_and_forget_sync():
     asyncio.get_running_loop().create_task(do_sync())
 
 
-# ---- new-card hourly quota ----------------------------------------------
-
-def hour_key() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H")
-
-
-def quota_state() -> dict:
-    STATE_DIR.mkdir(exist_ok=True)
-    if QUOTA_FILE.exists():
-        try:
-            st = json.loads(QUOTA_FILE.read_text())
-            if st.get("hour") == hour_key():
-                return st
-        except Exception:
-            pass
-    return {"hour": hour_key(), "served": 0}
-
-
-def quota_add(n: int) -> dict:
-    st = quota_state()
-    st["served"] += n
-    QUOTA_FILE.write_text(json.dumps(st))
-    return st
-
-
-def new_quota_left() -> int:
-    return max(0, NEW_PER_HOUR - quota_state()["served"])
+# ---- new-card drawing ------------------------------------------------------
+# No hourly quota since 2026-09-04 (user spec): every round independently
+# draws up to NEW_PER_ROUND cards UNIFORMLY AT RANDOM from the dealable new
+# pool. The old hour-keyed quota.json is no longer read or written.
 
 
 def new_card_query() -> str:
@@ -337,7 +316,7 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
     return out
 
 
-async def build_batch(review_count: int, allow_new: bool, priority_new: list[int] | None = None):
+async def build_batch(review_count: int, allow_new: bool):
     """Assemble one study batch.
 
     New cards are INTERLEAVED evenly among the review cards (like Anki's
@@ -345,9 +324,9 @@ async def build_batch(review_count: int, allow_new: bool, priority_new: list[int
     so a user who stopped after the 10 reviews never reached them — that
     was the "never pushes new cards" bug (2026-08-26).
 
-    priority_new: card ids approved in the preview lead-in that just
-    finished — they get the new-card slots FIRST (still quota-limited), so
-    the user is tested on exactly what they just read (先看后考闭环).
+    New-card draw (2026-09-04 spec): up to NEW_PER_ROUND cards sampled
+    UNIFORMLY AT RANDOM from the whole dealable pool — no hourly quota, no
+    priority for just-approved preview cards, so nothing starves.
     """
     cards: list[dict] = []
 
@@ -358,17 +337,12 @@ async def build_batch(review_count: int, allow_new: bool, priority_new: list[int
         infos.sort(key=lambda i: i["due"])
         cards += await fetch_cards([i["cardId"] for i in infos[:review_count]])
 
-    # new cards within the hourly quota, spread evenly through the batch
-    new_left = new_quota_left() if allow_new else 0
-    if new_left > 0:
+    # new cards: random sample within the per-round cap, spread evenly
+    if allow_new:
         new_ids = await anki("findCards", {"query": new_card_query()}) or []
-        if priority_new:
-            pool_set = set(new_ids)
-            prio = [c for c in priority_new if c in pool_set]
-            new_ids = prio + [c for c in new_ids if c not in set(prio)]
-        take = min(new_left, len(new_ids))
+        take = min(NEW_PER_ROUND, len(new_ids))
         if take > 0:
-            new_cards = await fetch_cards(new_ids[:take])
+            new_cards = await fetch_cards(random.sample(new_ids, take))
             n_reviews = len(cards)
             if n_reviews:
                 for i, c in enumerate(new_cards):
@@ -377,11 +351,10 @@ async def build_batch(review_count: int, allow_new: bool, priority_new: list[int
                     cards.insert(min(len(cards), pos), c)
             else:
                 cards += new_cards
-            quota_add(take)
 
     due_remaining = len(await anki("findCards", {"query": "is:due -is:new"}) or [])
     new_total = len(await anki("findCards", {"query": new_card_query()}) or [])
-    return cards, due_remaining, new_left if allow_new else 0, new_total
+    return cards, due_remaining, new_total
 
 
 # ---- API ------------------------------------------------------------------
@@ -395,8 +368,7 @@ async def status():
             "anki": "ok",
             "due_review": len(due or []),
             "new_total": len(new or []),
-            "new_quota_left": new_quota_left(),
-            "new_quota_total": NEW_PER_HOUR,
+            "new_per_round": NEW_PER_ROUND,
             "preview_mode": PREVIEW_MODE,
         }
         if PREVIEW_MODE:
@@ -409,10 +381,8 @@ async def status():
 @app.post("/api/session/start")
 async def start_session():
     synced = await do_sync()  # do_sync acquires the lock itself
-    # preview lead-in just finished? Deal its approved cards first (先看后考)
-    priority = _consume_preview_approved() if PREVIEW_MODE else []
-    cards, due_remaining, new_left, new_total = await build_batch(
-        REVIEW_PER_ROUND, allow_new=True, priority_new=priority
+    cards, due_remaining, new_total = await build_batch(
+        REVIEW_PER_ROUND, allow_new=True
     )
     if cards:
         _round_write(
@@ -431,8 +401,7 @@ async def start_session():
         "synced": synced,
         "cards": cards,
         "due_remaining": due_remaining,
-        "new_quota_left": new_quota_left(),
-        "new_quota_total": NEW_PER_HOUR,
+        "new_per_round": NEW_PER_ROUND,
         "new_total": new_total,
     }
 
@@ -485,8 +454,8 @@ async def session_state():
                         "can_undo": bool(prd.get("last")),
                     }
                 else:
-                    # round drained — keep the approved tombstone (if any)
-                    # so the next review start still prioritizes it
+                    # round drained — keep the approved tombstone (if any):
+                    # the preview done-screen undo still needs it
                     approved = prd.get("approved") or []
                     _preview_write(
                         {"status": "complete", "approved": approved}
@@ -501,8 +470,7 @@ async def session_state():
         return {
             "state": "none",
             "due_remaining": due_left,
-            "new_quota_left": new_quota_left(),
-            "new_quota_total": NEW_PER_HOUR,
+            "new_per_round": NEW_PER_ROUND,
             "new_total": new_total,
             "can_undo": False,
             **preview,
@@ -515,8 +483,7 @@ async def session_state():
             "total": rd.get("total", 0),
             "new_in_batch": rd.get("new_count"),
             "due_remaining": due_left,
-            "new_quota_left": new_quota_left(),
-            "new_quota_total": NEW_PER_HOUR,
+            "new_per_round": NEW_PER_ROUND,
             "new_total": new_total,
             "can_undo": bool((rd.get("last") or {}).get("snap")),
             **preview,
@@ -541,8 +508,7 @@ async def session_state():
         "total": rd.get("total", len(cards)),
         "new_in_batch": rd.get("new_count"),
         "due_remaining": due_left,
-        "new_quota_left": new_quota_left(),
-        "new_quota_total": NEW_PER_HOUR,
+        "new_per_round": NEW_PER_ROUND,
         "new_total": new_total,
         "can_undo": bool((rd.get("last") or {}).get("snap")),
         **preview,
@@ -551,8 +517,8 @@ async def session_state():
 
 @app.post("/api/session/more")
 async def session_more():
-    """'Keep going' — next batch, reviews only (new-card quota already spent)."""
-    cards, due_remaining, _, new_total = await build_batch(REVIEW_PER_ROUND, allow_new=False)
+    """'Keep going' — another full batch: reviews + a fresh random new draw."""
+    cards, due_remaining, new_total = await build_batch(REVIEW_PER_ROUND, allow_new=True)
     if cards:
         _round_write(
             {
@@ -567,8 +533,7 @@ async def session_more():
     return {
         "cards": cards,
         "due_remaining": due_remaining,
-        "new_quota_left": new_quota_left(),
-        "new_quota_total": NEW_PER_HOUR,
+        "new_per_round": NEW_PER_ROUND,
         "new_total": new_total,
     }
 
@@ -640,8 +605,7 @@ async def answer(card_id: int, ease: int):
                 round_info["new_total"] = len(new_ids or [])
             except Exception:
                 pass
-            round_info["new_quota_left"] = new_quota_left()
-            round_info["new_quota_total"] = NEW_PER_HOUR
+            round_info["new_per_round"] = NEW_PER_ROUND
 
     fire_and_forget_sync()
     return {"answered": True, "round": round_info}
@@ -750,20 +714,6 @@ def _preview_read() -> dict | None:
         return None
 
 
-def _consume_preview_approved() -> list[int]:
-    """Pop the tombstone of cards approved in the last preview lead-in.
-
-    Called by /api/session/start so the fresh review round deals those
-    cards as its new-card material (tested right after being read).
-    Consuming removes the tombstone — a second start gets nothing.
-    """
-    rd = _preview_read()
-    approved = (rd or {}).get("approved") or []
-    if rd is not None and rd.get("status") == "complete":
-        _preview_write(None)
-    return approved
-
-
 def _preview_write(rd: dict | None):
     STATE_DIR.mkdir(exist_ok=True)
     if rd is None:
@@ -835,12 +785,14 @@ async def preview_state():
 
 @app.post("/api/preview/start")
 async def preview_start():
-    """Deal one preview batch: oldest pool cards not deferred today."""
+    """Deal one preview batch: a random sample of pool cards not deferred today."""
     _preview_guard()
     await do_sync()  # pull anything injected elsewhere
     pool = await preview_pool_ids()
     deferred = await _deferred_today_cards(pool)
-    pending = [c for c in pool if c not in deferred][:PREVIEW_PER_ROUND]
+    available = [c for c in pool if c not in deferred]
+    # random draw (2026-09-04 spec) — mirrors the review-round new draw
+    pending = random.sample(available, min(PREVIEW_PER_ROUND, len(available)))
     if not pending:
         return {"cards": [], "pool": len(pool), "available": 0}
     _preview_write(
@@ -864,9 +816,8 @@ async def preview_act(card_id: int, action: str):
     """Per-card decision inside a preview round.
 
     approve (放行): move card to RELEASE_DECK and unsuspend — it becomes a
-        regular new card subject to the hourly quota, AND is remembered as
-        priority new material for the next study round (先看后考闭环:
-        tested right after reading).
+        regular new card in the dealable pool, from which every study round
+        draws at random (no more 先看后考 priority deal).
     defer (明天再看): tag deferred-YYYYMMDD so today's preview skips it.
     Both are idempotent-ish; both verify the card is still in the round.
     """
@@ -911,8 +862,8 @@ async def preview_act(card_id: int, action: str):
     rd["pending"] = [c for c in rd["pending"] if c != card_id]
     rd["done"] = rd.get("done", 0) + 1
     if not rd["pending"]:
-        # tombstone: keep the approved list so the next /api/session/start
-        # deals those cards first; _consume_preview_approved() pops it.
+        # tombstone: kept for the preview done-screen undo (the priority
+        # deal was removed 2026-09-04 — approved cards just join the pool).
         # ALSO keep pending_before (= [card_id] here, the final card) plus
         # done/total: the undo slot indexes into this round's deal order,
         # and undoing the final act must restore the round's progress.
@@ -942,8 +893,8 @@ async def preview_act(card_id: int, action: str):
 async def preview_finish():
     """End the preview round; untouched cards stay suspended in the pool.
 
-    Cards already approved this session are kept as a tombstone so a later
-    review start still prioritizes them (preview-then-review funnel).
+    Cards already approved this session are kept as a tombstone so the
+    done-screen undo keeps working.
     """
     _preview_guard()
     rd = _preview_read()
@@ -1013,13 +964,14 @@ async def preview_undo():
 async def get_note(card_id: int):
     """Raw note fields behind a card, for the plain-text edit dialog."""
     infos = await anki("cardsInfo", {"cards": [card_id]})
-    if not infos:
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is None:
         raise HTTPException(status_code=404, detail="card not found")
-    note_id = infos[0]["note"]
+    note_id = info["note"]
     notes = await anki("notesInfo", {"notes": [note_id]})
-    if not notes:
+    n = next((x for x in notes or [] if x.get("noteId")), None)
+    if n is None:
         raise HTTPException(status_code=404, detail="note not found")
-    n = notes[0]
     return {
         "cardId": card_id,
         "noteId": note_id,
@@ -1039,9 +991,10 @@ class NoteUpdate(BaseModel):
 async def update_note(body: NoteUpdate):
     """Field edit (HTML round-trips verbatim into Anki) + optional tag replace."""
     infos = await anki("cardsInfo", {"cards": [body.card_id]})
-    if not infos:
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is None:
         raise HTTPException(status_code=404, detail="card not found")
-    note_id = infos[0]["note"]
+    note_id = info["note"]
     await anki(
         "updateNoteFields", {"note": {"id": note_id, "fields": body.fields}}
     )
@@ -1049,12 +1002,170 @@ async def update_note(body: NoteUpdate):
         await anki("updateNoteTags", {"note": note_id, "tags": body.tags})
     # hand back the re-rendered card so the UI refreshes without a reload
     fresh = await anki("cardsInfo", {"cards": [body.card_id]})
-    f = fresh[0]
+    f = next((i for i in fresh or [] if i.get("cardId")), None)
+    if f is None:
+        raise HTTPException(status_code=404, detail="card not found after update")
     return {
         "updated": True,
         "question": f["question"],
         "answer": f["answer"],
     }
+
+
+# ---- card lifecycle: add / delete / back to preview pool ------------------
+# Add (user spec 2026-09-04): fixed 问答题 note type (same as the add_cards.py
+# injection pipeline); the new card is routed into the preview pool SUSPENDED,
+# exactly like add_cards.py's default — it joins the real rotation only after
+# a preview round approves it.
+# Delete / to-preview are destructive per-card actions with confirmation
+# dialogs on the frontend. Both keep any active round consistent: the card
+# counts as handled (done_count +1) and the single-level undo slot is cleared
+# when it targeted the removed card (undo cannot resurrect what's gone).
+
+ADD_MODEL = os.getenv("ANKI_ADD_MODEL", "问答题")
+
+
+def _round_remove_card(rd: dict | None, card_id: int) -> None:
+    """A card left the review round without being answered (deleted or sent
+    back to the preview pool): count it as handled so progress, the
+    review/new split and the completion detection all stay correct."""
+    if not rd or rd.get("status") != "active" or card_id not in rd.get("pending", []):
+        return
+    rd["pending"] = [c for c in rd["pending"] if c != card_id]
+    rd["done_count"] = rd.get("done_count", 0) + 1
+    if (rd.get("last") or {}).get("cardId") == card_id:
+        rd.pop("last", None)
+    if not rd["pending"]:
+        rd["status"] = "complete"
+    _round_write(rd)
+
+
+def _preview_round_remove_card(rd: dict | None, card_id: int) -> None:
+    """Same bookkeeping for an in-flight preview round."""
+    if not rd or rd.get("status") != "active" or card_id not in rd.get("pending", []):
+        return
+    rd["pending"] = [c for c in rd["pending"] if c != card_id]
+    rd["done"] = rd.get("done", 0) + 1
+    if (rd.get("last") or {}).get("cardId") == card_id:
+        rd.pop("last", None)
+    if not rd["pending"]:
+        # round drained by removal — keep the approved tombstone so the
+        # preview done-screen undo for earlier acts keeps working
+        _preview_write({"status": "complete", "approved": rd.get("approved", [])})
+    else:
+        _preview_write(rd)
+
+
+@app.get("/api/card/add/info")
+async def add_info():
+    """Note type + field names for the add-card dialog (data-driven labels)."""
+    names = await anki("modelFieldNames", {"modelName": ADD_MODEL})
+    return {"model_name": ADD_MODEL, "fields": names or []}
+
+
+class NoteAdd(BaseModel):
+    fields: dict[str, str]
+    tags: list[str] = []
+
+
+@app.post("/api/card/add")
+async def add_card(body: NoteAdd):
+    """Create one card (ADD_MODEL) and route it into the preview pool.
+
+    Preview mode on: lands in PREVIEW_DECK suspended — invisible to the
+    scheduler until a preview round approves it (先看后考, same route as
+    add_cards.py's default). Preview mode off: stays in RELEASE_DECK as a
+    regular new card.
+    """
+    if not any(html_to_text(v) for v in body.fields.values()):
+        raise HTTPException(status_code=400, detail="卡片内容不能为空")
+    try:
+        note_ids = await anki(
+            "addNotes",
+            {
+                "notes": [
+                    {
+                        "deckName": RELEASE_DECK,
+                        "modelName": ADD_MODEL,
+                        "fields": body.fields,
+                        "tags": body.tags,
+                        # collection-wide duplicate check (防呆)
+                        "options": {"allowDuplicate": False, "duplicateScope": "collection"},
+                    }
+                ]
+            },
+        )
+    except HTTPException as e:
+        # AnkiConnect raises on duplicates ("cannot create note because it
+        # is a duplicate") instead of returning [None] — map it to a clean 409
+        if "duplicate" in str(e.detail).lower():
+            raise HTTPException(status_code=409, detail="添加失败：与已有卡片重复")
+        raise
+    if not note_ids or note_ids[0] is None:
+        raise HTTPException(status_code=409, detail="添加失败：与已有卡片重复")
+    note_id = note_ids[0]
+    card_ids = await anki("findCards", {"query": f"nid:{note_id}"}) or []
+    if not card_ids:
+        raise HTTPException(status_code=502, detail="note created but no card found")
+    pool = None
+    if PREVIEW_MODE:
+        await anki("changeDeck", {"cards": card_ids, "deck": PREVIEW_DECK})
+        await anki("suspend", {"cards": card_ids})
+        pool = await preview_pool_count()
+    fire_and_forget_sync()
+    return {"noteId": note_id, "cardIds": card_ids, "pool": pool}
+
+
+@app.post("/api/card/delete")
+async def delete_card(card_id: int):
+    """Delete the note behind a card (all of its cards go with it)."""
+    infos = await anki("cardsInfo", {"cards": [card_id]})
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    note_id = info["note"]
+    await anki("deleteNotes", {"notes": [note_id]})
+    # bookkeeping AFTER a successful delete — never strand round state
+    _round_remove_card(current_round(), card_id)
+    _preview_round_remove_card(_preview_read(), card_id)
+    fire_and_forget_sync()
+    return {"deleted": True}
+
+
+@app.post("/api/card/to-preview")
+async def to_preview_pool(card_id: int):
+    """Send a card back to the preview pool for re-learning (user spec).
+
+    The card's scheduling history is CLEARED first (forgetCards → fresh new
+    card): the pool query is `is:new is:suspended`, and 重新学习 means
+    starting over. Without the reset the card would sit suspended forever,
+    invisible to both the pool and the scheduler.
+    """
+    _preview_guard()
+    infos = await anki("cardsInfo", {"cards": [card_id]})
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is None:
+        raise HTTPException(status_code=404, detail="card not found")
+    if info.get("deckName") == PREVIEW_DECK:
+        raise HTTPException(status_code=409, detail="already in the preview pool")
+    await anki("forgetCards", {"cards": [card_id]})
+    # forgetCards keeps reps/lapses by default (Anki's own Forget behavior);
+    # the user spec wants the counts ZEROED too (清零次数) — wipe explicitly
+    await anki(
+        "setSpecificValueOfCard",
+        {
+            "card": card_id,
+            "keys": ["reps", "lapses", "left"],
+            "newValues": [0, 0, 0],
+            "warning_check": True,
+        },
+    )
+    await anki("changeDeck", {"cards": [card_id], "deck": PREVIEW_DECK})
+    await anki("suspend", {"cards": [card_id]})
+    _round_remove_card(current_round(), card_id)
+    _preview_round_remove_card(_preview_read(), card_id)
+    fire_and_forget_sync()
+    return {"moved": True, "pool": await preview_pool_count()}
 
 
 # ---- media upload + tag helpers --------------------------------------------

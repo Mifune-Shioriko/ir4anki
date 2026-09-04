@@ -4,7 +4,6 @@ import { Show } from 'solid-js'
 interface Props {
   count: number
   due: number | null
-  newQuotaLeft: number | null
   newTotal: number | null
   reviewDone: number
   reviewTotal: number
