@@ -26,7 +26,7 @@ import base64
 import json
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -92,6 +92,17 @@ PREVIEW_FILE = STATE_DIR / "preview.json"
 # stamp tag added on approve; the card is released (unsuspended) when this
 # date is strictly BEFORE today — see release_yesterday_approved()
 RELEASED_TAG_PREFIX = "released-"
+# Anki's day rollover is 4 AM (collection default, container TZ fixed to
+# Asia/Shanghai). Stamp/release comparisons use the ANKI day, not the
+# calendar day, so a card approved at 23:50 is not "released" at 00:05 —
+# it waits until the scheduler's own next day (04:00), guaranteeing a real
+# overnight gap before the first grading.
+ANKI_ROLLOVER_HOUR = int(os.getenv("ANKI_ROLLOVER_HOUR", "4"))
+
+
+def _anki_day() -> str:
+    """Current Anki day (YYYYMMDD): calendar day, rolled over at 4 AM."""
+    return (datetime.now() - timedelta(hours=ANKI_ROLLOVER_HOUR)).strftime("%Y%m%d")
 
 # card fields snapshotted before answering (for /api/undo) and the Anki
 # attribute names used to restore them via setSpecificValueOfCard
@@ -807,7 +818,7 @@ async def release_yesterday_approved() -> int:
         for n in await anki("notesInfo", {"notes": note_ids}) or []:
             if n.get("noteId"):
                 ntags[n["noteId"]] = n.get("tags") or []
-        today = datetime.now().strftime("%Y%m%d")
+        today = _anki_day()
         ready = []
         for i in infos:
             if i.get("type") != 0:
@@ -832,7 +843,7 @@ async def _pending_release_today() -> int:
     """Cards approved TODAY — still suspended, will release at tomorrow's
     first entry point. Reported in the wire payload so the UI can explain
     why the just-approved cards are not in the new pool yet."""
-    stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+    stamp = RELEASED_TAG_PREFIX + _anki_day()
     ids = await anki(
         "findCards",
         {"query": f'deck:"{RELEASE_DECK}" is:new is:suspended tag:{stamp}'},
@@ -963,7 +974,7 @@ async def preview_act(card_id: int, action: str):
         # unsuspends it the next calendar day, so the first grading happens
         # ≥1 night after preview (honest recall, not recognition).
         await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
-        stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+        stamp = RELEASED_TAG_PREFIX + _anki_day()
         await anki("addTags", {"notes": [infos[0]["note"]], "tags": stamp})
         # provenance tag: marks this note as having passed through the
         # preview flow. The pool sweeper (anki_pool_sweep.py) uses it to
@@ -1062,7 +1073,7 @@ async def preview_undo():
         await anki("suspend", {"cards": [cid]})
         # drop today's released- stamp (next-day release marker, 2026-09-07)
         # so the card never leaks into tomorrow's release batch from the pool
-        stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+        stamp = RELEASED_TAG_PREFIX + _anki_day()
         await anki(
             "removeTags",
             {"notes": [last.get("note") or info["note"]], "tags": stamp},
