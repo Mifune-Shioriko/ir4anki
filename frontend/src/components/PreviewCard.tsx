@@ -6,22 +6,29 @@ import { cleanCardHtml } from '../lib/clean'
 import { KATEX_OPTS, textWithMath } from '../lib/math'
 import { IconAdd, IconDelete } from './icons'
 
-// Preview card (先看后考): question AND answer are shown together — this
-// round is pure reading with NO grading, so there is no reveal step and no
-// ease buttons. Per-card decisions live in the action area below (passed in
-// as children via props callbacks): approve (放行) or defer (明天再看).
+// Preview card (先看后考, 2026-09-07 redesign): the question shows first and
+// the answer stays HIDDEN until the user reveals it — a low-stakes retrieval
+// attempt (test-potentiated learning) instead of pure reading. There is
+// still NO grading. Per-card decisions: approve (放行 — released into the
+// study queue the NEXT day, see backend release_yesterday_approved) or
+// defer (明天再看). Approve is only enabled after reveal: "已看完" must
+// mean the card was actually seen.
 //
 // MD3: md-elevated-card container, sys color tokens only, md-typescale
 // classes for text. Same visual lineage as Flashcard so the app reads as
 // one product; a "预览" assist chip marks the mode.
 interface Props {
   card: Card
+  revealed: boolean
+  onReveal: () => void
   onApprove: () => void
   onDefer: () => void
   onUndo: () => void
   onEdit: () => void
   onAdd: () => void
   onDelete: () => void
+  /** mid-round exit (2026-09-06): untouched cards stay suspended in the pool */
+  onExit: () => void
   undoEnabled: boolean
   undoBusy: boolean
   busy: boolean
@@ -35,9 +42,10 @@ export const PreviewCard: Component<Props> = (props) => {
     props.card.cardId
     props.card.question
     props.card.answer
+    props.revealed
     requestAnimationFrame(() => {
       if (questionRef) renderMathInElement(questionRef, KATEX_OPTS)
-      if (answerRef) {
+      if (props.revealed && answerRef) {
         renderMathInElement(answerRef, KATEX_OPTS)
         answerRef.querySelectorAll('audio').forEach(a => a.play().catch(() => {}))
       }
@@ -57,7 +65,7 @@ export const PreviewCard: Component<Props> = (props) => {
         <div class="card-inner">
           <div class="card-header">
             <md-chip-set class="card-chips" aria-label="卡片信息">
-              <md-assist-chip label="预览 · 只读不考" disabled />
+              <md-assist-chip label="预览 · 先想后看" disabled />
               <md-assist-chip label={props.card.deckName} disabled />
             </md-chip-set>
             <div class="card-header-actions">
@@ -89,48 +97,52 @@ export const PreviewCard: Component<Props> = (props) => {
             </div>
           </div>
 
-          {/* question + answer together — the whole point of preview mode */}
+          {/* question — always visible; answer only after reveal (2026-09-07) */}
           <div
             class="card-content card-question"
             ref={questionRef}
             innerHTML={questionHtml()}
           />
 
-          <md-divider class="card-divider" />
-          <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
+          {props.revealed && (
+            <>
+              <md-divider class="card-divider" />
+              <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
 
-          {props.card.explanation && (
-            <div class="explain-section">
-              <div class="explain-title md-typescale-label-medium">
-                AI 讲解 · 仅供参考
-              </div>
-              <div
-                class="explain-text md-typescale-body-medium"
-                innerHTML={textWithMath(props.card.explanation)}
-              />
-            </div>
-          )}
-
-          {sims().length > 0 && (
-            <div class="similar-section">
-              <div class="similar-title md-typescale-label-medium">相关卡片</div>
-              {sims().map(s => (
-                <div class="similar-item">
-                  <div class="similar-q md-typescale-body-medium">
-                    <span innerHTML={textWithMath(s.question)} />
-                    <span class="similar-score md-typescale-label-small">
-                      相似 {Math.round(s.score * 100)}%
-                    </span>
+              {props.card.explanation && (
+                <div class="explain-section">
+                  <div class="explain-title md-typescale-label-medium">
+                    AI 讲解 · 仅供参考
                   </div>
-                  {s.answer && (
-                    <div
-                      class="similar-a md-typescale-body-small"
-                      innerHTML={textWithMath(s.answer)}
-                    />
-                  )}
+                  <div
+                    class="explain-text md-typescale-body-medium"
+                    innerHTML={textWithMath(props.card.explanation)}
+                  />
                 </div>
-              ))}
-            </div>
+              )}
+
+              {sims().length > 0 && (
+                <div class="similar-section">
+                  <div class="similar-title md-typescale-label-medium">相关卡片</div>
+                  {sims().map(s => (
+                    <div class="similar-item">
+                      <div class="similar-q md-typescale-body-medium">
+                        <span innerHTML={textWithMath(s.question)} />
+                        <span class="similar-score md-typescale-label-small">
+                          相似 {Math.round(s.score * 100)}%
+                        </span>
+                      </div>
+                      {s.answer && (
+                        <div
+                          class="similar-a md-typescale-body-small"
+                          innerHTML={textWithMath(s.answer)}
+                        />
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </>
           )}
 
           <div class="card-meta md-typescale-body-small">
@@ -140,21 +152,33 @@ export const PreviewCard: Component<Props> = (props) => {
       </md-elevated-card>
 
       <div class="action-area">
-        <div class="ease-buttons">
-          <md-outlined-button
-            onClick={() => props.onDefer()}
-            disabled={props.busy}
-          >
-            明天再看
-          </md-outlined-button>
-          <md-filled-button
-            class="preview-approve"
-            onClick={() => props.onApprove()}
-            disabled={props.busy}
-          >
-            已看完，放行
-          </md-filled-button>
-        </div>
+        {!props.revealed ? (
+          <md-filled-tonal-button onClick={() => props.onReveal()} disabled={props.busy}>
+            先想一想，再看答案
+          </md-filled-tonal-button>
+        ) : (
+          <div class="ease-buttons">
+            <md-outlined-button
+              onClick={() => props.onExit()}
+              disabled={props.busy}
+            >
+              结束预览
+            </md-outlined-button>
+            <md-outlined-button
+              onClick={() => props.onDefer()}
+              disabled={props.busy}
+            >
+              明天再看
+            </md-outlined-button>
+            <md-filled-button
+              class="preview-approve"
+              onClick={() => props.onApprove()}
+              disabled={props.busy}
+            >
+              已看完，放行
+            </md-filled-button>
+          </div>
+        )}
       </div>
     </div>
   )

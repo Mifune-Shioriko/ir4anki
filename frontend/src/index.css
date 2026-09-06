@@ -333,6 +333,12 @@ body {
   text-align: center;
 }
 
+/* emphasis inside screen-detail copy (next-day release wording) */
+.screen-detail .em {
+  color: var(--md-sys-color-primary);
+  font-weight: 500;
+}
+
 .screen-stats {
   width: 100%;
   display: flex;

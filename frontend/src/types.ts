@@ -38,6 +38,9 @@ export interface PreviewRoundResume {
   total: number
   /** single-level undo slot survives page refreshes, like the review round */
   can_undo?: boolean
+  /** approve/defer split — lets a resumed round report honest exit stats */
+  approved?: number
+  deferred?: number
 }
 
 /** Exact reverse of a preview act: approve→card back in the pool suspended,
@@ -55,6 +58,11 @@ export interface PreviewExtras {
   preview_pool?: number | null
   preview_available?: number
   preview_round?: PreviewRoundResume
+  /** preview batch size (3 since 2026-09-06) — never hardcode in UI text */
+  preview_per_round?: number
+  /** cards approved TODAY, still suspended — released into the study queue
+   * tomorrow (next-day release, 2026-09-07) */
+  pending_release?: number | null
 }
 
 export type SessionStateResponse = PreviewExtras & (

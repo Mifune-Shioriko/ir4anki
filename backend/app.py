@@ -1,9 +1,18 @@
 """Anki review web app — backend (v2).
 
 Session model:
-  - one round = a 5-card read-only PREVIEW lead-in (preview mode), then
-    up to 25 review cards + up to 5 new cards (user spec 2026-09-04:
-    先预览 5 张新卡，然后复习 25 + 5)
+  - one round = a 3-card PREVIEW lead-in (preview mode; since 2026-09-07
+    the preview hides the answer until revealed — a low-stakes retrieval
+    attempt), then up to 4 review cards + up to 1 new card (user spec
+    2026-09-06: 短视频式碎片节奏 — tiny rounds (几分钟一轮) the user opens
+    often, replacing the 27+3 marathon rounds that felt like a 20-min
+    commitment)
+  - PREVIEW APPROVE = NEXT-DAY RELEASE (user spec 2026-09-07): approved
+    cards stay suspended with a released-YYYYMMDD stamp and are unsuspended
+    by release_yesterday_approved() on the next calendar day, so the first
+    grading happens ≥1 night after preview. Same-day grading after reading
+    is recognition, not recall (measured: first-review pass 61% vs 88%
+    pre-preview cohort; first-Good→next-Again 33% vs 6%).
   - new cards: NO hourly quota — every round (and 'continue') draws up to
     NEW_PER_ROUND cards UNIFORMLY AT RANDOM from the new-card pool (user
     spec 2026-09-04; replaces the hourly quota + preview-priority funnel so
@@ -46,28 +55,43 @@ REVIEW_WEB_V2_DIST = Path(
 STATE_DIR = Path(os.getenv("ANKI_STATE_DIR", str(Path(__file__).parent / "state")))
 ROUND_FILE = STATE_DIR / "round.json"
 
-REVIEW_PER_ROUND = 25   # + up to NEW_PER_ROUND new cards = 30 total per round
-NEW_PER_ROUND = 5       # random draw from the new pool, per round, no quota
+REVIEW_PER_ROUND = 4    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06)
+NEW_PER_ROUND = 1       # random draw from the new pool, per round, no quota
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
 # ---- preview mode (先看后考: read new cards before they enter testing) ----
 # Newly injected cards land in PREVIEW_DECK SUSPENDED, so they are invisible
-# to the scheduler and to normal rounds. A preview round shows them
-# question+answer together with NO grading; per card the user either
-# approves (放行: move to RELEASE_DECK + unsuspend → joins the regular new
-# pool, from which every round draws at random) or defers (tagged
-# deferred-YYYYMMDD, hidden from today's preview rounds, resurfaces tomorrow).
+# to the scheduler and to normal rounds. A preview round shows the question
+# first (answer hidden until the user reveals it — a low-stakes retrieval
+# attempt, NO grading); per card the user either approves (放行) or defers
+# (tagged deferred-YYYYMMDD, hidden from today's preview rounds, resurfaces
+# tomorrow).
+#
+# Approve = NEXT-DAY release (2026-09-07, user spec): the card moves to
+# RELEASE_DECK but STAYS SUSPENDED and gets tag released-YYYYMMDD. On the
+# next calendar day release_yesterday_approved() unsuspends it, so the FIRST
+# grading happens ≥1 night after preview. Rationale (measured 2026-09-07):
+# same-day grading right after reading is recognition, not recall — first-
+# review pass rate for same-day-approved cards was 61% vs 88% for the pre-
+# preview cohort, and 33% of first-Good cards failed their very next answer
+# (vs 6% before). The overnight gap makes the first grade honest, so FSRS
+# seeds stability from recall instead of a fluency illusion.
 #
 # The whole feature is gated on ANKI_PREVIEW_MODE. With it unset, preview
 # endpoints return 404 and status reports preview_mode=false — the frontend
 # then renders the exact legacy UI (system-level rollback).
 # Data-level rollback: preview cards are untouched NEW cards; unsuspend them
-# and move them back into 2026 and the collection is exactly as before.
+# (and drop released-*/deferred-* tags) and the collection is exactly as
+# before — same-day release can be restored by unsuspensing right away in
+# the approve branch.
 PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes", "on")
 PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
 RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
-PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "5"))
+PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "3"))
 PREVIEW_FILE = STATE_DIR / "preview.json"
+# stamp tag added on approve; the card is released (unsuspended) when this
+# date is strictly BEFORE today — see release_yesterday_approved()
+RELEASED_TAG_PREFIX = "released-"
 
 # card fields snapshotted before answering (for /api/undo) and the Anki
 # attribute names used to restore them via setSpecificValueOfCard
@@ -381,6 +405,8 @@ async def status():
 @app.post("/api/session/start")
 async def start_session():
     synced = await do_sync()  # do_sync acquires the lock itself
+    if PREVIEW_MODE:
+        await release_yesterday_approved()
     cards, due_remaining, new_total = await build_batch(
         REVIEW_PER_ROUND, allow_new=True
     )
@@ -409,6 +435,10 @@ async def start_session():
 @app.get("/api/session/state")
 async def session_state():
     """Page-load entry point: resume an unfinished round instead of auto-starting."""
+    if PREVIEW_MODE:
+        # next-day release: cards approved on a PREVIOUS day become gradeable
+        # now, so every count below reflects today's true new-card pool
+        await release_yesterday_approved()
     try:
         due = await anki("findCards", {"query": "is:due -is:new"})
         due_left = len(due or [])
@@ -424,6 +454,12 @@ async def session_state():
     # render the preview UI at all — feature flag off ⇒ exact legacy shape)
     preview: dict = {"preview_mode": PREVIEW_MODE}
     if PREVIEW_MODE:
+        # batch size goes down too, so the frontend never hardcodes it
+        preview["preview_per_round"] = PREVIEW_PER_ROUND
+        try:
+            preview["pending_release"] = await _pending_release_today()
+        except Exception:
+            preview["pending_release"] = None
         try:
             pool = await preview_pool_ids()
             deferred = await _deferred_today_cards(pool)
@@ -452,6 +488,8 @@ async def session_state():
                         "done": prd.get("done", 0),
                         "total": prd.get("total", len(pending)),
                         "can_undo": bool(prd.get("last")),
+                        "approved": len(prd.get("approved") or []),
+                        "deferred": prd.get("deferred", 0),
                     }
                 else:
                     # round drained — keep the approved tombstone (if any):
@@ -518,6 +556,8 @@ async def session_state():
 @app.post("/api/session/more")
 async def session_more():
     """'Keep going' — another full batch: reviews + a fresh random new draw."""
+    if PREVIEW_MODE:
+        await release_yesterday_approved()
     cards, due_remaining, new_total = await build_batch(REVIEW_PER_ROUND, allow_new=True)
     if cards:
         _round_write(
@@ -728,10 +768,83 @@ async def preview_pool_count() -> int:
     return len(await preview_pool_ids())
 
 
+async def release_yesterday_approved() -> int:
+    """Next-day release (2026-09-07): unsuspend cards approved on a PREVIOUS
+    calendar day.
+
+    Approve now keeps the card SUSPENDED in RELEASE_DECK with a
+    `released-YYYYMMDD` stamp tag. This routine runs at the entry points
+    (session/state, session/start, preview/state, preview/start) and
+    unsuspends every stamped card whose date is strictly before today —
+    so a card previewed on day N first becomes gradeable on day N+1. The
+    overnight gap turns the first grade from recognition (fluency illusion)
+    into honest recall, which is what FSRS needs to seed stability.
+
+    Fail-soft: any error leaves cards suspended (they release on a later
+    run) — never blocks the caller.
+    """
+    try:
+        # deck-scoped: a released- stamp on a card back in the preview pool
+        # (undo path) must NOT release it there — the stamp is removed on
+        # undo anyway, but scope the query too for belt-and-braces
+        ids = await anki(
+            "findCards",
+            {
+                "query": (
+                    f'deck:"{RELEASE_DECK}" is:new is:suspended tag:released-*'
+                )
+            },
+        ) or []
+        if not ids:
+            return 0
+        # NOTE: cardsInfo does NOT return tags (always None) — tags come
+        # from notesInfo. Verified against AnkiConnect 2026-09-07.
+        infos = [i for i in await anki("cardsInfo", {"cards": ids}) or [] if i.get("cardId")]
+        if not infos:
+            return 0
+        note_ids = list({i["note"] for i in infos if i.get("note")})
+        ntags: dict[int, list[str]] = {}
+        for n in await anki("notesInfo", {"notes": note_ids}) or []:
+            if n.get("noteId"):
+                ntags[n["noteId"]] = n.get("tags") or []
+        today = datetime.now().strftime("%Y%m%d")
+        ready = []
+        for i in infos:
+            if i.get("type") != 0:
+                continue
+            stamps = [
+                t[len(RELEASED_TAG_PREFIX):]
+                for t in ntags.get(i.get("note"), [])
+                if t.startswith(RELEASED_TAG_PREFIX)
+            ]
+            if stamps and min(stamps) < today:
+                ready.append(i["cardId"])
+        if not ready:
+            return 0
+        await anki("unsuspend", {"cards": ready})
+        fire_and_forget_sync()
+        return len(ready)
+    except Exception:
+        return 0
+
+
+async def _pending_release_today() -> int:
+    """Cards approved TODAY — still suspended, will release at tomorrow's
+    first entry point. Reported in the wire payload so the UI can explain
+    why the just-approved cards are not in the new pool yet."""
+    stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+    ids = await anki(
+        "findCards",
+        {"query": f'deck:"{RELEASE_DECK}" is:new is:suspended tag:{stamp}'},
+    )
+    return len(ids or [])
+
+
 @app.get("/api/preview/state")
 async def preview_state():
     """Entry point for the preview UI: pool size + in-progress round resume."""
     _preview_guard()
+    await release_yesterday_approved()
     try:
         due_left = len(
             await anki("findCards", {"query": "is:due -is:new"}) or []
@@ -765,6 +878,10 @@ async def preview_state():
                 "pool": len(await preview_pool_ids()),
                 "due_remaining": due_left,
                 "can_undo": bool(rd.get("last")),
+                # approve/defer split, so a resumed round (page refresh) can
+                # still report honest numbers on the done / exit screens
+                "approved": len(rd.get("approved") or []),
+                "deferred": rd.get("deferred", 0),
             }
         # round drained — keep the approved tombstone (if any)
         approved = rd.get("approved") or []
@@ -788,6 +905,7 @@ async def preview_start():
     """Deal one preview batch: a random sample of pool cards not deferred today."""
     _preview_guard()
     await do_sync()  # pull anything injected elsewhere
+    await release_yesterday_approved()
     pool = await preview_pool_ids()
     deferred = await _deferred_today_cards(pool)
     available = [c for c in pool if c not in deferred]
@@ -840,8 +958,13 @@ async def preview_act(card_id: int, action: str):
         "note": infos[0]["note"],
     }
     if action == "approve":
+        # next-day release (2026-09-07): move to RELEASE_DECK but keep it
+        # SUSPENDED with a released-YYYYMMDD stamp — release_yesterday_approved()
+        # unsuspends it the next calendar day, so the first grading happens
+        # ≥1 night after preview (honest recall, not recognition).
         await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
-        await anki("unsuspend", {"cards": [card_id]})
+        stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+        await anki("addTags", {"notes": [infos[0]["note"]], "tags": stamp})
         # provenance tag: marks this note as having passed through the
         # preview flow. The pool sweeper (anki_pool_sweep.py) uses it to
         # tell legitimately-released cards apart from leaks that bypassed
@@ -851,6 +974,10 @@ async def preview_act(card_id: int, action: str):
     else:
         tag = "deferred-" + datetime.now().strftime("%Y%m%d")
         await anki("addTags", {"notes": [infos[0]["note"]], "tags": tag})
+        # explicit counter: `done` also absorbs cards that left the pool
+        # (deleted/released elsewhere), so done - approved is NOT the
+        # deferred count. The resume payload reports both (2026-09-06).
+        rd["deferred"] = rd.get("deferred", 0) + 1
 
     # deck move / tag change must reach the sync server (and thus the
     # user's phone + desktop) — same coalesced sync the answer path uses
@@ -933,6 +1060,13 @@ async def preview_undo():
             raise HTTPException(status_code=409, detail="card moved on")
         await anki("changeDeck", {"cards": [cid], "deck": PREVIEW_DECK})
         await anki("suspend", {"cards": [cid]})
+        # drop today's released- stamp (next-day release marker, 2026-09-07)
+        # so the card never leaks into tomorrow's release batch from the pool
+        stamp = RELEASED_TAG_PREFIX + datetime.now().strftime("%Y%m%d")
+        await anki(
+            "removeTags",
+            {"notes": [last.get("note") or info["note"]], "tags": stamp},
+        )
         rd["approved"] = [c for c in rd.get("approved", []) if c != cid]
     else:
         if info["type"] != 0 or PREVIEW_DECK not in info.get("deckName", ""):
@@ -941,6 +1075,7 @@ async def preview_undo():
         await anki(
             "removeTags", {"notes": [last.get("note") or info["note"]], "tags": tag}
         )
+        rd["deferred"] = max(0, rd.get("deferred", 0) - 1)
 
     pending = rd.get("pending") or []
     pos = min(last.get("index", 0), len(pending))
@@ -1162,6 +1297,22 @@ async def to_preview_pool(card_id: int):
     )
     await anki("changeDeck", {"cards": [card_id], "deck": PREVIEW_DECK})
     await anki("suspend", {"cards": [card_id]})
+    # strip any released-YYYYMMDD stamps (next-day release markers): a card
+    # re-approved later gets a FRESH stamp, and a stale old stamp would make
+    # release_yesterday_approved() release it same-day (min(stamps) < today).
+    # Tags come from notesInfo — cardsInfo does NOT return them.
+    ntags = []
+    try:
+        ninfo = [n for n in await anki("notesInfo", {"notes": [info["note"]]}) or []
+                 if n.get("noteId")]
+        ntags = ninfo[0].get("tags") or [] if ninfo else []
+    except Exception:
+        pass
+    stale_stamps = [t for t in ntags if t.startswith(RELEASED_TAG_PREFIX)]
+    if stale_stamps:
+        await anki(
+            "removeTags", {"notes": [info["note"]], "tags": " ".join(stale_stamps)}
+        )
     _round_remove_card(current_round(), card_id)
     _preview_round_remove_card(_preview_read(), card_id)
     fire_and_forget_sync()

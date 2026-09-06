@@ -91,6 +91,8 @@ export const App: Component = () => {
   const [previewMode, setPreviewMode] = createSignal(false)
   const [previewPool, setPreviewPool] = createSignal<number | null>(null)
   const [previewAvailable, setPreviewAvailable] = createSignal<number | null>(null)
+  // preview batch size from the backend (never hardcode — it changed 10→5→3)
+  const [previewPerRound, setPreviewPerRound] = createSignal(3)
   const [pvCards, setPvCards] = createSignal<Card[]>([])
   const [pvDone, setPvDone] = createSignal(0)
   const [pvTotal, setPvTotal] = createSignal(0)
@@ -101,6 +103,21 @@ export const App: Component = () => {
   const [pvCanUndo, setPvCanUndo] = createSignal(false)
   const [pvUndoBusy, setPvUndoBusy] = createSignal(false)
   const [pvEditOpen, setPvEditOpen] = createSignal(false)
+  // preview reveal state (2026-09-07): answer hidden until the user reveals
+  // it — the preview is now a low-stakes retrieval attempt, not pure reading
+  const [pvRevealed, setPvRevealed] = createSignal(false)
+  // cards approved TODAY (suspended, released tomorrow) — shown in the wire
+  // payload so the UI can explain why approved cards aren't gradeable yet
+  const [pendingRelease, setPendingRelease] = createSignal<number | null>(null)
+  // preview-only exit stats (2026-09-06): when the user finishes straight
+  // from preview (mid-round or after the done screen), the finished screen
+  // shows THESE instead of the review count (which would be a stale/misleading
+  // 0). Null = review-path exit → show the review count as before.
+  const [finishedPreview, setFinishedPreview] = createSignal<{
+    approved: number
+    deferred: number
+    pool: number | null
+  } | null>(null)
 
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
@@ -142,6 +159,8 @@ export const App: Component = () => {
       if (d.preview_mode) {
         setPreviewPool(d.preview_pool ?? null)
         setPreviewAvailable(d.preview_available ?? null)
+        if (d.preview_per_round != null) setPreviewPerRound(d.preview_per_round)
+        setPendingRelease(d.pending_release ?? null)
       }
       if (d.state === 'active') {
         // a normal review round in progress always wins — finish it first
@@ -151,9 +170,12 @@ export const App: Component = () => {
         setPvCards(d.preview_round.cards)
         setPvDone(d.preview_round.done)
         setPvTotal(d.preview_round.total)
-        setPvApproved(0)
-        setPvDeferred(0)
+        // backend tracks the approve/defer split since 2026-09-06 so a
+        // resumed round can still report honest exit stats
+        setPvApproved(d.preview_round.approved ?? 0)
+        setPvDeferred(d.preview_round.deferred ?? 0)
         setPvCanUndo(!!d.preview_round.can_undo)
+        setPvRevealed(false) // resumed round: card comes back face-down
         setPhase('preview')
       } else if (d.preview_mode && (d.preview_available ?? 0) > 0) {
         // top of the funnel: read new cards before they enter testing
@@ -286,6 +308,7 @@ export const App: Component = () => {
     try {
       await api.finish()
     } catch { /* sync result is not critical here */ }
+    setFinishedPreview(null) // review exit — show the review count
     setPhase('finished')
   }
 
@@ -397,6 +420,7 @@ export const App: Component = () => {
       setPvApproved(0)
       setPvDeferred(0)
       setPvCanUndo(false) // a fresh preview round has no undo slot
+      setPvRevealed(false) // first card starts hidden (先想后看)
       setPreviewPool(d.pool)
       setPreviewAvailable(d.available)
       setPhase('preview')
@@ -420,8 +444,12 @@ export const App: Component = () => {
       }
       setPvCards(prev => prev.slice(1))
       setPvDone(v => v + 1)
-      if (action === 'approve') setPvApproved(v => v + 1)
-      else setPvDeferred(v => v + 1)
+      setPvRevealed(false) // next card starts hidden again (先想后看)
+      if (action === 'approve') {
+        setPvApproved(v => v + 1)
+        // approved today = suspended until tomorrow (next-day release)
+        setPendingRelease(p => (p ?? 0) + 1)
+      } else setPvDeferred(v => v + 1)
       // the backend recorded a single-level undo slot for this act
       setPvCanUndo(true)
       if (d.round_complete) {
@@ -452,8 +480,11 @@ export const App: Component = () => {
           return next
         })
         setPvDone(v => Math.max(0, v - 1))
-        if (d.action === 'approve') setPvApproved(v => Math.max(0, v - 1))
-        else setPvDeferred(v => Math.max(0, v - 1))
+        if (d.action === 'approve') {
+          setPvApproved(v => Math.max(0, v - 1))
+          setPendingRelease(p => (p == null ? null : Math.max(0, p - 1)))
+        } else setPvDeferred(v => Math.max(0, v - 1))
+        setPvRevealed(false) // restored card comes back face-down
       } else {
         // undo from previewDone reactivates the round — resync to rebuild
         await resync()
@@ -480,9 +511,15 @@ export const App: Component = () => {
   const pvFinish = async () => {
     setPhase('loading')
     setLoadText('正在同步…')
+    // preview-only exit (2026-09-06): report what the preview round did
+    // instead of the review count (which would be a misleading 0). Works
+    // mid-round too — untouched cards stay suspended in the pool.
+    let pool = previewPool()
     try {
-      await api.previewFinish()
+      const d = await api.previewFinish()
+      pool = d.pool ?? pool
     } catch { /* not critical */ }
+    setFinishedPreview({ approved: pvApproved(), deferred: pvDeferred(), pool })
     setPhase('finished')
   }
 
@@ -496,6 +533,13 @@ export const App: Component = () => {
         pvUndo()
         return
       }
+      // 先想后看 (2026-09-07): space reveals; Enter/D only work once revealed
+      if (e.key === ' ' && !pvRevealed()) {
+        e.preventDefault()
+        setPvRevealed(true)
+        return
+      }
+      if (!pvRevealed()) return
       if (e.key === 'Enter') {
         e.preventDefault()
         pvAct('approve')
@@ -541,6 +585,7 @@ export const App: Component = () => {
             pool={previewPool()}
             available={previewAvailable()}
             due={due()}
+            pendingRelease={pendingRelease()}
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}
@@ -566,12 +611,15 @@ export const App: Component = () => {
           <PreviewCard
             card={previewCard()!}
             busy={pvBusy()}
+            revealed={pvRevealed()}
+            onReveal={() => setPvRevealed(true)}
             onApprove={() => pvAct('approve')}
             onDefer={() => pvAct('defer')}
             onUndo={pvUndo}
             onEdit={() => setPvEditOpen(true)}
             onAdd={openAdd}
             onDelete={() => askDelete(previewCard()!)}
+            onExit={pvFinish}
             undoEnabled={pvCanUndo()}
             undoBusy={pvUndoBusy()}
           />
@@ -585,6 +633,7 @@ export const App: Component = () => {
             available={previewAvailable()}
             due={due()}
             busy={pvBusy()}
+            perRound={previewPerRound()}
             onMore={pvStart}
             onToReview={pvToReview}
             onFinish={pvFinish}
@@ -659,7 +708,7 @@ export const App: Component = () => {
         </Show>
 
         <Show when={phase() === 'finished'}>
-          <FinishedScreen count={totalDone()} />
+          <FinishedScreen count={totalDone()} preview={finishedPreview()} />
         </Show>
       </div>
 
