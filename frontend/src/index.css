@@ -408,7 +408,14 @@ body {
   --md-dialog-container-shape-start-end: 28px;
   --md-dialog-container-shape-end-start: 0px;
   --md-dialog-container-shape-end-end: 0px;
-  max-height: min(720px, calc(100vh - 24px));
+  /* Raised 720px→810px (audit item #6): at 720px the inner shadow scroller
+   * (clientH = max-height − 152px for the fixed headline+actions) was 568px
+   * vs ~648px of content (2 field rows + upload + tags), so the 添加标签
+   * input fell ~80px below the fold and users had to scroll inside the
+   * sheet to reach it. 810px gives a 658px scroller — the tag row is now
+   * visible without scrolling on a normal desktop viewport, and the
+   * calc(100vh - 24px) guard still clamps short/mobile screens. */
+  max-height: min(810px, calc(100vh - 24px));
 }
 
 .edit-dialog-content {

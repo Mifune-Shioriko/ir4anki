@@ -71,7 +71,7 @@ export const PreviewCard: Component<Props> = (props) => {
             <div class="card-header-actions">
               <md-icon-button
                 aria-label="撤销上一步"
-                disabled={!props.undoEnabled || props.undoBusy}
+                disabled={!props.undoEnabled || props.undoBusy || props.busy}
                 onClick={() => props.onUndo()}
               >
                 <md-icon>

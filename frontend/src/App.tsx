@@ -1,4 +1,4 @@
-import { Component, Show, createEffect, createSignal } from 'solid-js'
+import { Component, Show, createEffect, createSignal, onMount, onCleanup } from 'solid-js'
 import { api } from './api'
 import type { Card } from './types'
 import { syncThemeColor } from './theme'
@@ -37,11 +37,26 @@ export const App: Component = () => {
   // ---- phase & loading text ----
   const [phase, setPhase] = createSignal<Phase>('loading')
   const [loadText, setLoadText] = createSignal('正在加载…')
+  // audit item #2 fix: a failed load used to leave the spinner up forever
+  // with only the error text — no way out but a hard refresh. loadError
+  // swaps the Loading screen for an error card with a retry button.
+  const [loadError, setLoadError] = createSignal(false)
 
   // ---- round state ----
   const [cards, setCards] = createSignal<Card[]>([])
   const [idx, setIdx] = createSignal(0)
-  const [revealed, setRevealed] = createSignal(false)
+  // Reveal state is keyed BY CARD ID, not a bare boolean (2026-09-07 fix):
+  // with a boolean, any path where the current card changed without the
+  // reset landing first (async race, engine timing quirk, stale resync)
+  // rendered the NEW card's question together with a revealed answer zone —
+  // the "上一张的正面 + 下一张的背面" bug. With an id key the answer zone
+  // can only ever open for the card that was actually revealed; any other
+  // card is face-down by construction.
+  const [revealedFor, setRevealedFor] = createSignal<number | null>(null)
+  const revealed = () => {
+    const c = cards()[idx()]
+    return !!c && revealedFor() === c.cardId
+  }
   const [answering, setAnswering] = createSignal(false)
   const [finishing, setFinishing] = createSignal(false)
   // roundTotal is the round's ORIGINAL size (done + pending) — from the
@@ -104,8 +119,17 @@ export const App: Component = () => {
   const [pvUndoBusy, setPvUndoBusy] = createSignal(false)
   const [pvEditOpen, setPvEditOpen] = createSignal(false)
   // preview reveal state (2026-09-07): answer hidden until the user reveals
-  // it — the preview is now a low-stakes retrieval attempt, not pure reading
-  const [pvRevealed, setPvRevealed] = createSignal(false)
+  // it — the preview is now a low-stakes retrieval attempt, not pure reading.
+  // Keyed BY CARD ID like the review reveal (see above) — the preview's
+  // current card is always pvCards()[0], so any act/undo/resume that swaps
+  // the head card automatically shows it face-down. A bare boolean could
+  // stay true across a card swap (async race), rendering one card's front
+  // with another card's answer.
+  const [pvRevealedFor, setPvRevealedFor] = createSignal<number | null>(null)
+  const pvRevealed = () => {
+    const c = pvCards()[0]
+    return !!c && pvRevealedFor() === c.cardId
+  }
   // cards approved TODAY (suspended, released tomorrow) — shown in the wire
   // payload so the UI can explain why approved cards aren't gradeable yet
   const [pendingRelease, setPendingRelease] = createSignal<number | null>(null)
@@ -144,7 +168,7 @@ export const App: Component = () => {
     setIdx(0)
     setTotalDone(done)
     setRoundTotal(total)
-    setRevealed(false)
+    setRevealedFor(null)
     setPhase('review')
   }
 
@@ -175,7 +199,7 @@ export const App: Component = () => {
         setPvApproved(d.preview_round.approved ?? 0)
         setPvDeferred(d.preview_round.deferred ?? 0)
         setPvCanUndo(!!d.preview_round.can_undo)
-        setPvRevealed(false) // resumed round: card comes back face-down
+        setPvRevealedFor(null) // resumed round: card comes back face-down
         setPhase('preview')
       } else if (d.preview_mode && (d.preview_available ?? 0) > 0) {
         // top of the funnel: read new cards before they enter testing
@@ -201,6 +225,7 @@ export const App: Component = () => {
   // ---- actions ----
   const startNewRound = async () => {
     setPhase('loading')
+    setLoadError(false)
     setLoadText('正在同步并加载卡片…')
     try {
       const data = await api.start()
@@ -218,11 +243,13 @@ export const App: Component = () => {
       loadBatch(data.cards, 0, data.cards.length)
     } catch (e) {
       setLoadText('加载失败：' + (e as Error).message)
+      setLoadError(true)
     }
   }
 
   const continueRound = async () => {
     setPhase('loading')
+    setLoadError(false)
     setLoadText('正在加载更多复习卡…')
     try {
       const data = await api.more()
@@ -238,6 +265,7 @@ export const App: Component = () => {
       loadBatch(data.cards, 0, data.cards.length)
     } catch (e) {
       setLoadText('加载失败：' + (e as Error).message)
+      setLoadError(true)
     }
   }
 
@@ -255,9 +283,11 @@ export const App: Component = () => {
         return
       }
 
-      // Remove the answered card — the local array mirrors the backend's
-      // pending list 1:1, so undo positions (backend 'index') line up.
-      setCards(prev => prev.filter((_, i) => i !== idx()))
+      // Remove the answered card BY ID — the local array mirrors the
+      // backend's pending list 1:1, so undo positions (backend 'index')
+      // line up. Position-based removal could drop the wrong card if idx
+      // drifted while the request was in flight.
+      setCards(prev => prev.filter(c => c.cardId !== card.cardId))
       setTotalDone(totalDone() + 1)
       // idx now naturally points at the next card (or past the end)
 
@@ -266,7 +296,7 @@ export const App: Component = () => {
 
       const roundDone = data.round != null && data.round.state === 'complete'
       if (!roundDone && idx() < cards().length) {
-        setRevealed(false)
+        setRevealedFor(null)
       } else {
         if (data.round) adoptGlobal(data.round)
         setPhase('done')
@@ -279,7 +309,7 @@ export const App: Component = () => {
   }
 
   const undo = async () => {
-    if (undoBusy()) return
+    if (undoBusy() || answering()) return
     setUndoBusy(true)
     try {
       const d = await api.undo()
@@ -291,7 +321,7 @@ export const App: Component = () => {
       })
       setIdx(Math.min(d.index, cards().length - 1))
       setTotalDone(v => Math.max(0, v - 1))
-      setRevealed(false)
+      setRevealedFor(null)
       setCanUndo(false) // the single undo slot is consumed
       if (phase() === 'done') setPhase('review')
     } catch (e) {
@@ -336,7 +366,7 @@ export const App: Component = () => {
       await api.deleteCard(t.cardId)
       setDeleteTarget(null)
       if (phase() === 'preview') {
-        setPvCards(prev => prev.slice(1))
+        setPvCards(prev => prev.filter(c => c.cardId !== t.cardId))
         setPvDone(v => v + 1)
         setPreviewPool(p => (p == null ? p : Math.max(0, p - 1)))
         if (pvCards().length === 0) {
@@ -345,13 +375,14 @@ export const App: Component = () => {
           setPhase(pvApproved() > 0 ? 'previewDone' : 'previewStart')
         }
       } else if (phase() === 'review') {
-        const wasNew = cards()[idx()]?.isNew
-        setCards(prev => prev.filter((_, i) => i !== idx()))
+        const removed = cards().find(c => c.cardId === t.cardId)
+        const wasNew = removed?.isNew
+        setCards(prev => prev.filter(c => c.cardId !== t.cardId))
         setTotalDone(v => v + 1)
         if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
         else setBatchReviewTotal(v => Math.max(0, v - 1))
         if (cards().length === 0) setPhase('done')
-        else setRevealed(false)
+        else setRevealedFor(null)
       }
     } catch (e) {
       alert('删除失败：' + (e as Error).message)
@@ -372,13 +403,14 @@ export const App: Component = () => {
         setPreviewAvailable(p => (p == null ? p : p + 1))
       }
       if (phase() === 'review') {
-        const wasNew = cards()[idx()]?.isNew
-        setCards(prev => prev.filter((_, i) => i !== idx()))
+        const removed = cards().find(c => c.cardId === t.cardId)
+        const wasNew = removed?.isNew
+        setCards(prev => prev.filter(c => c.cardId !== t.cardId))
         setTotalDone(v => v + 1)
         if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
         else setBatchReviewTotal(v => Math.max(0, v - 1))
         if (cards().length === 0) setPhase('done')
-        else setRevealed(false)
+        else setRevealedFor(null)
       }
     } catch (e) {
       alert('移动失败：' + (e as Error).message)
@@ -405,6 +437,7 @@ export const App: Component = () => {
 
   const pvStart = async () => {
     setPhase('loading')
+    setLoadError(false)
     setLoadText('正在加载预览卡…')
     setPvBusy(true)
     try {
@@ -420,12 +453,13 @@ export const App: Component = () => {
       setPvApproved(0)
       setPvDeferred(0)
       setPvCanUndo(false) // a fresh preview round has no undo slot
-      setPvRevealed(false) // first card starts hidden (先想后看)
+      setPvRevealedFor(null) // first card starts hidden (先想后看)
       setPreviewPool(d.pool)
       setPreviewAvailable(d.available)
       setPhase('preview')
     } catch (e) {
       setLoadText('加载失败：' + (e as Error).message)
+      setLoadError(true)
     } finally {
       setPvBusy(false)
     }
@@ -442,9 +476,12 @@ export const App: Component = () => {
         await resync()
         return
       }
-      setPvCards(prev => prev.slice(1))
+      // remove BY ID (not slice(1)): if anything else touched pvCards while
+      // the request was in flight, position-based removal would drop the
+      // wrong card and desync from the backend's pending list
+      setPvCards(prev => prev.filter(c => c.cardId !== card.cardId))
       setPvDone(v => v + 1)
-      setPvRevealed(false) // next card starts hidden again (先想后看)
+      setPvRevealedFor(null) // next card starts hidden again (先想后看)
       if (action === 'approve') {
         setPvApproved(v => v + 1)
         // approved today = suspended until tomorrow (next-day release)
@@ -468,7 +505,9 @@ export const App: Component = () => {
   // defer→today's deferred tag removed). Works in-round AND from the
   // previewDone screen (the backend keeps the slot in the tombstone).
   const pvUndo = async () => {
-    if (pvUndoBusy()) return
+    // guard against undo racing an in-flight act (both mutate the same
+    // backend state file — the button is also disabled while busy)
+    if (pvUndoBusy() || pvBusy()) return
     setPvUndoBusy(true)
     try {
       const d = await api.previewUndo()
@@ -484,7 +523,7 @@ export const App: Component = () => {
           setPvApproved(v => Math.max(0, v - 1))
           setPendingRelease(p => (p == null ? null : Math.max(0, p - 1)))
         } else setPvDeferred(v => Math.max(0, v - 1))
-        setPvRevealed(false) // restored card comes back face-down
+        setPvRevealedFor(null) // restored card comes back face-down
       } else {
         // undo from previewDone reactivates the round — resync to rebuild
         await resync()
@@ -524,7 +563,17 @@ export const App: Component = () => {
   }
 
   // ---- keyboard shortcuts ----
+  // Attached at WINDOW level (2026-09-07 fix): the old div-level onKeyDown
+  // only fired when focus was already inside the app — on a fresh page load
+  // focus sits on <body>, so Space/Enter/1-4/Ctrl+Z were dead until the
+  // user clicked something first.
+  const isTypingTarget = (t: EventTarget | null) => {
+    const el = t as HTMLElement | null
+    if (!el || !el.tagName) return false
+    return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
+  }
   const handleKeyDown = (e: KeyboardEvent) => {
+    if (isTypingTarget(e.target)) return
     if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
     if (phase() === 'preview') {
       if (pvBusy()) return
@@ -536,7 +585,7 @@ export const App: Component = () => {
       // 先想后看 (2026-09-07): space reveals; Enter/D only work once revealed
       if (e.key === ' ' && !pvRevealed()) {
         e.preventDefault()
-        setPvRevealed(true)
+        setPvRevealedFor(previewCard()?.cardId ?? null)
         return
       }
       if (!pvRevealed()) return
@@ -552,7 +601,7 @@ export const App: Component = () => {
     if (phase() !== 'review') return
     if (e.key === ' ' && !revealed()) {
       e.preventDefault()
-      setRevealed(true)
+      setRevealedFor(currentCard()?.cardId ?? null)
     } else if (revealed() && !answering()) {
       if (e.key === '1') answer(1)
       else if (e.key === '2') answer(2)
@@ -565,10 +614,16 @@ export const App: Component = () => {
     }
   }
 
+  // Window-level registration (2026-09-07): works even when focus is on
+  // <body> right after page load. The old div-level onKeyDown only fired
+  // after the user clicked something inside the app first.
+  onMount(() => window.addEventListener('keydown', handleKeyDown))
+  onCleanup(() => window.removeEventListener('keydown', handleKeyDown))
+
   const currentCard = () => cards()[idx()]
 
   return (
-    <div class="app" onKeyDown={handleKeyDown}>
+    <div class="app">
       <TopAppBar
         due={due()}
         newTotal={newTotal()}
@@ -577,7 +632,11 @@ export const App: Component = () => {
 
       <div class="content">
         <Show when={phase() === 'loading'}>
-          <Loading text={loadText()} />
+          <Loading
+            text={loadText()}
+            error={loadError()}
+            onRetry={() => { setLoadError(false); resync() }}
+          />
         </Show>
 
         <Show when={phase() === 'previewStart'}>
@@ -612,7 +671,7 @@ export const App: Component = () => {
             card={previewCard()!}
             busy={pvBusy()}
             revealed={pvRevealed()}
-            onReveal={() => setPvRevealed(true)}
+            onReveal={() => setPvRevealedFor(previewCard()?.cardId ?? null)}
             onApprove={() => pvAct('approve')}
             onDefer={() => pvAct('defer')}
             onUndo={pvUndo}
@@ -678,7 +737,7 @@ export const App: Component = () => {
           <ActionArea
             revealed={revealed()}
             answering={answering()}
-            onReveal={() => setRevealed(true)}
+            onReveal={() => setRevealedFor(currentCard()?.cardId ?? null)}
             onAnswer={answer}
           />
         </Show>
@@ -722,7 +781,7 @@ export const App: Component = () => {
                 c.cardId === currentCard()!.cardId ? { ...c, question: q, answer: a } : c
               )
             )
-            setRevealed(false)
+            setRevealedFor(null)
           }}
         />
       </Show>

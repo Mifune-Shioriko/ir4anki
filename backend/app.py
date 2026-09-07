@@ -26,12 +26,13 @@ import base64
 import json
 import os
 import random
+import uuid
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -119,6 +120,16 @@ app.add_middleware(
 
 _sync_lock = asyncio.Lock()
 _sync_pending = False  # coalesce fire-and-forget syncs
+
+# Serializes the read-modify-write cycles on round.json / preview.json in
+# the per-card mutation endpoints (answer, undo, preview act/undo, delete,
+# to-preview). The user reviews from MULTIPLE devices (phone + desktop over
+# tailscale); without this lock two concurrent mutations both read the old
+# pending list and the later write silently drops the earlier one — an
+# answered card comes back, undo slots point at stale indices. Single
+# uvicorn process, so an asyncio.Lock is sufficient. Lock order is always
+# _state_lock -> _sync_lock (do_sync); never the reverse, so no deadlock.
+_state_lock = asyncio.Lock()
 
 
 async def anki(action: str, params: dict | None = None, timeout: float = 30):
@@ -224,7 +235,8 @@ async def restore_round_cards(rd: dict) -> list[dict]:
         return []
     due_ids = set(await anki("findCards", {"query": "prop:due<=0"}) or [])
     infos = await anki("cardsInfo", {"cards": ids})
-    info_by_id = {i["cardId"]: i for i in infos or []}
+    # filter [{}] empty rows (vanished cards) before indexing
+    info_by_id = {i["cardId"]: i for i in infos or [] if i.get("cardId")}
     keep = [
         cid
         for cid in ids
@@ -324,8 +336,10 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
         return []
     infos = await anki("cardsInfo", {"cards": ids})
     # cardsInfo returns cards sorted by id — re-order to match the REQUEST
-    # order (matters for preview-priority new cards and due-order batches)
-    by_id = {i["cardId"]: i for i in infos or []}
+    # order (matters for preview-priority new cards and due-order batches).
+    # Defensive: AnkiConnect returns [{}] (one EMPTY row) for vanished ids —
+    # never index those rows directly (KeyError → 500).
+    by_id = {i["cardId"]: i for i in infos or [] if i.get("cardId")}
     ordered = [by_id[cid] for cid in ids if cid in by_id]
     out = []
     for info in ordered:
@@ -369,6 +383,8 @@ async def build_batch(review_count: int, allow_new: bool):
     due_ids = await anki("findCards", {"query": "is:due -is:new"}) or []
     if due_ids:
         infos = await anki("cardsInfo", {"cards": due_ids})
+        # filter [{}] empty rows before indexing "due"
+        infos = [i for i in infos or [] if i.get("cardId")]
         infos.sort(key=lambda i: i["due"])
         cards += await fetch_cards([i["cardId"] for i in infos[:review_count]])
 
@@ -415,7 +431,14 @@ async def status():
 
 @app.post("/api/session/start")
 async def start_session():
-    synced = await do_sync()  # do_sync acquires the lock itself
+    """Deal under _state_lock; the (potentially slow) sync runs outside it
+    so other devices' state polls are never blocked for minutes."""
+    synced = await do_sync()  # do_sync acquires _sync_lock itself
+    async with _state_lock:
+        return await _start_session_impl(synced)
+
+
+async def _start_session_impl(synced: bool):
     if PREVIEW_MODE:
         await release_yesterday_approved()
     cards, due_remaining, new_total = await build_batch(
@@ -445,6 +468,12 @@ async def start_session():
 
 @app.get("/api/session/state")
 async def session_state():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _session_state_impl()
+
+
+async def _session_state_impl():
     """Page-load entry point: resume an unfinished round instead of auto-starting."""
     if PREVIEW_MODE:
         # next-day release: cards approved on a PREVIOUS day become gradeable
@@ -566,6 +595,12 @@ async def session_state():
 
 @app.post("/api/session/more")
 async def session_more():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _session_more_impl()
+
+
+async def _session_more_impl():
     """'Keep going' — another full batch: reviews + a fresh random new draw."""
     if PREVIEW_MODE:
         await release_yesterday_approved()
@@ -591,13 +626,21 @@ async def session_more():
 
 @app.post("/api/session/finish")
 async def session_finish():
-    _round_write(None)
+    """State write under _state_lock; the (slow) sync runs outside it."""
+    async with _state_lock:
+        _round_write(None)
     synced = await do_sync()
     return {"synced": synced}
 
 
 @app.post("/api/answer")
 async def answer(card_id: int, ease: int):
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _answer_impl(card_id, ease)
+
+
+async def _answer_impl(card_id: int, ease: int):
     if ease not in (1, 2, 3, 4):
         raise HTTPException(status_code=400, detail="ease must be 1-4")
 
@@ -619,8 +662,9 @@ async def answer(card_id: int, ease: int):
     # setSpecificValueOfCard instead of guiUndo.
     snap = None
     infos = await anki("cardsInfo", {"cards": [card_id]})
-    if infos:
-        snap = {k: infos[0].get(k) for k in SNAPSHOT_FIELDS}
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is not None:
+        snap = {k: info.get(k) for k in SNAPSHOT_FIELDS}
 
     res = await anki("answerCards", {"answers": [{"cardId": card_id, "ease": ease}]})
     if not (res and res[0]):
@@ -664,6 +708,12 @@ async def answer(card_id: int, ease: int):
 
 @app.post("/api/undo")
 async def undo():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _undo_impl()
+
+
+async def _undo_impl():
     """Undo the last answer of the current round.
 
     Sync wipes Anki's native undo stack, so this restores the card's
@@ -853,6 +903,12 @@ async def _pending_release_today() -> int:
 
 @app.get("/api/preview/state")
 async def preview_state():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _preview_state_impl()
+
+
+async def _preview_state_impl():
     """Entry point for the preview UI: pool size + in-progress round resume."""
     _preview_guard()
     await release_yesterday_approved()
@@ -913,9 +969,21 @@ async def preview_state():
 
 @app.post("/api/preview/start")
 async def preview_start():
-    """Deal one preview batch: a random sample of pool cards not deferred today."""
+    """Serialized under _state_lock (see its declaration).
+
+    do_sync() runs OUTSIDE the lock: a cold sync can take minutes, and
+    holding the state lock that long would block every other endpoint
+    (including GET state). The lock only protects the pool read + deal.
+    """
     _preview_guard()
     await do_sync()  # pull anything injected elsewhere
+    async with _state_lock:
+        return await _preview_start_impl()
+
+
+async def _preview_start_impl():
+    """Deal one preview batch: a random sample of pool cards not deferred today."""
+    _preview_guard()
     await release_yesterday_approved()
     pool = await preview_pool_ids()
     deferred = await _deferred_today_cards(pool)
@@ -942,6 +1010,12 @@ async def preview_start():
 
 @app.post("/api/preview/act")
 async def preview_act(card_id: int, action: str):
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _preview_act_impl(card_id, action)
+
+
+async def _preview_act_impl(card_id: int, action: str):
     """Per-card decision inside a preview round.
 
     approve (放行): move card to RELEASE_DECK and unsuspend — it becomes a
@@ -958,7 +1032,10 @@ async def preview_act(card_id: int, action: str):
         return {"ok": False, "reason": "stale"}
 
     infos = await anki("cardsInfo", {"cards": [card_id]})
-    if not infos:
+    # AnkiConnect returns [{}] for a vanished id — filter before indexing,
+    # else infos[0]["note"] is a KeyError → 500 (audit hardening spot)
+    info = next((i for i in infos or [] if i.get("cardId")), None)
+    if info is None:
         raise HTTPException(status_code=404, detail="card vanished")
     # single-level undo slot (mirrors the review round's "last"): enough to
     # reverse this exact act — deck+suspend for approve, note+tag for defer
@@ -966,7 +1043,7 @@ async def preview_act(card_id: int, action: str):
         "cardId": card_id,
         "index": rd["pending"].index(card_id),
         "action": action,
-        "note": infos[0]["note"],
+        "note": info["note"],
     }
     if action == "approve":
         # next-day release (2026-09-07): move to RELEASE_DECK but keep it
@@ -975,16 +1052,16 @@ async def preview_act(card_id: int, action: str):
         # ≥1 night after preview (honest recall, not recognition).
         await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
         stamp = RELEASED_TAG_PREFIX + _anki_day()
-        await anki("addTags", {"notes": [infos[0]["note"]], "tags": stamp})
+        await anki("addTags", {"notes": [info["note"]], "tags": stamp})
         # provenance tag: marks this note as having passed through the
         # preview flow. The pool sweeper (anki_pool_sweep.py) uses it to
         # tell legitimately-released cards apart from leaks that bypassed
         # the pool (e.g. added on the desktop client straight into 2026).
-        await anki("addTags", {"notes": [infos[0]["note"]], "tags": "previewed"})
+        await anki("addTags", {"notes": [info["note"]], "tags": "previewed"})
         rd.setdefault("approved", []).append(card_id)
     else:
         tag = "deferred-" + datetime.now().strftime("%Y%m%d")
-        await anki("addTags", {"notes": [infos[0]["note"]], "tags": tag})
+        await anki("addTags", {"notes": [info["note"]], "tags": tag})
         # explicit counter: `done` also absorbs cards that left the pool
         # (deleted/released elsewhere), so done - approved is NOT the
         # deferred count. The resume payload reports both (2026-09-06).
@@ -1029,6 +1106,12 @@ async def preview_act(card_id: int, action: str):
 
 @app.post("/api/preview/finish")
 async def preview_finish():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _preview_finish_impl()
+
+
+async def _preview_finish_impl():
     """End the preview round; untouched cards stay suspended in the pool.
 
     Cards already approved this session are kept as a tombstone so the
@@ -1046,6 +1129,12 @@ async def preview_finish():
 
 @app.post("/api/preview/undo")
 async def preview_undo():
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _preview_undo_impl()
+
+
+async def _preview_undo_impl():
     """Undo the last preview act (预览环节的"返回上一张").
 
     Exact reverse of /api/preview/act: an approved card goes back into the
@@ -1264,6 +1353,12 @@ async def add_card(body: NoteAdd):
 
 @app.post("/api/card/delete")
 async def delete_card(card_id: int):
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _delete_card_impl(card_id)
+
+
+async def _delete_card_impl(card_id: int):
     """Delete the note behind a card (all of its cards go with it)."""
     infos = await anki("cardsInfo", {"cards": [card_id]})
     info = next((i for i in infos or [] if i.get("cardId")), None)
@@ -1280,6 +1375,12 @@ async def delete_card(card_id: int):
 
 @app.post("/api/card/to-preview")
 async def to_preview_pool(card_id: int):
+    """Serialized under _state_lock (see its declaration)."""
+    async with _state_lock:
+        return await _to_preview_pool_impl(card_id)
+
+
+async def _to_preview_pool_impl(card_id: int):
     """Send a card back to the preview pool for re-learning (user spec).
 
     The card's scheduling history is CLEARED first (forgetCards → fresh new
@@ -1355,7 +1456,6 @@ async def media_upload(file: UploadFile = File(...)):
     if ext not in ALLOWED_MEDIA_EXT:
         raise HTTPException(status_code=400, detail=f"unsupported type: {ext or '(none)'}")
     # timestamp + random suffix → never clobbers an existing media file
-    import uuid
     stem = datetime.now().strftime("paste-%Y%m%d-%H%M%S")
     filename = f"{stem}-{uuid.uuid4().hex[:6]}{ext}"
     await anki(
