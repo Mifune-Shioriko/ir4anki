@@ -3,7 +3,7 @@
 Session model:
   - one round = a 3-card PREVIEW lead-in (preview mode; since 2026-09-07
     the preview hides the answer until revealed — a low-stakes retrieval
-    attempt), then up to 4 review cards + up to 1 new card (user spec
+    attempt), then up to 3 review cards + up to 1 new card (user spec
     2026-09-06: 短视频式碎片节奏 — tiny rounds (几分钟一轮) the user opens
     often, replacing the 27+3 marathon rounds that felt like a 20-min
     commitment)
@@ -56,7 +56,7 @@ REVIEW_WEB_V2_DIST = Path(
 STATE_DIR = Path(os.getenv("ANKI_STATE_DIR", str(Path(__file__).parent / "state")))
 ROUND_FILE = STATE_DIR / "round.json"
 
-REVIEW_PER_ROUND = 4    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06)
+REVIEW_PER_ROUND = 3    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06; 4→3 on 2026-09-10)
 NEW_PER_ROUND = 1       # random draw from the new pool, per round, no quota
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
@@ -88,7 +88,7 @@ ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes", "on")
 PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
 RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
-PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "3"))
+PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "1"))
 PREVIEW_FILE = STATE_DIR / "preview.json"
 # stamp tag added on approve; the card is released (unsuspended) when this
 # date is strictly BEFORE today — see release_yesterday_approved()
