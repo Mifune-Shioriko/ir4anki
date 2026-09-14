@@ -1,4 +1,6 @@
-import { Component } from 'solid-js'
+import { Component, Show } from 'solid-js'
+import { ModeSelector } from './ModeSelector'
+import type { StudyModes } from '../types'
 
 interface Props {
   due: number | null
@@ -9,6 +11,10 @@ interface Props {
   /** preview pool size; button hidden when null or 0 */
   previewPool?: number | null
   onToPreview?: () => void
+  /** two-tier pacing (2026-09-14): table from the wire + current selection */
+  studyModes?: StudyModes | null
+  mode?: string
+  onModeChange?: (mode: string) => void
 }
 
 export const StartScreen: Component<Props> = (props) => {
@@ -18,14 +24,24 @@ export const StartScreen: Component<Props> = (props) => {
         <div class="screen-content">
           <h1 class="screen-title md-typescale-headline-small">开始学习</h1>
 
+          <Show when={props.studyModes}>
+            <div class="screen-modes">
+              <div class="modes-label md-typescale-label-medium">
+                现在有多少时间？
+              </div>
+              <ModeSelector
+                modes={props.studyModes!}
+                selected={props.mode ?? 'quick'}
+                onSelect={m => props.onModeChange?.(m)}
+                disabled={props.busy}
+              />
+            </div>
+          </Show>
+
           <div class="screen-stats md-typescale-body-medium">
             <div class="stat-row">
               <span>全局待复习</span>
               <span class="stat-value">{props.due ?? '—'} 张</span>
-            </div>
-            <div class="stat-row">
-              <span>每轮新卡上限</span>
-              <span class="stat-value">{props.newPerRound ?? '—'} 张</span>
             </div>
             <div class="stat-row">
               <span>牌组新卡池</span>

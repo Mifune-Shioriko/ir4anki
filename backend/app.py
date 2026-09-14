@@ -1,12 +1,17 @@
 """Anki review web app — backend (v2).
 
 Session model:
-  - one round = a 3-card PREVIEW lead-in (preview mode; since 2026-09-07
+  - TWO PACING MODES (user spec 2026-09-14): "quick" = 1 preview + 1 new +
+    4 review (碎片时间, a few minutes — the 短视频式 rhythm of 2026-09-06),
+    "focus" = 5 preview + 5 new + 20 review (整块时间, exactly 5× quick).
+    The mode is chosen per round at start and travels with round.json /
+    preview.json so a page refresh resumes the SAME mode. 'more' inherits
+    the mode of the round that just completed. Numbers are overridable via
+    env (ANKI_QUICK_REVIEW / ANKI_FOCUS_NEW / …) without code changes.
+  - one round = a PREVIEW lead-in (preview mode; since 2026-09-07
     the preview hides the answer until revealed — a low-stakes retrieval
-    attempt), then up to 3 review cards + up to 1 new card (user spec
-    2026-09-06: 短视频式碎片节奏 — tiny rounds (几分钟一轮) the user opens
-    often, replacing the 27+3 marathon rounds that felt like a 20-min
-    commitment)
+    attempt), then up to {mode.review} review cards + up to {mode.new}
+    new cards
   - PREVIEW APPROVE = NEXT-DAY RELEASE (user spec 2026-09-07): approved
     cards stay suspended with a released-YYYYMMDD stamp and are unsuspended
     by release_yesterday_approved() on the next calendar day, so the first
@@ -14,7 +19,8 @@ Session model:
     is recognition, not recall (measured: first-review pass 61% vs 88%
     pre-preview cohort; first-Good→next-Again 33% vs 6%).
   - new cards: NO hourly quota — every round (and 'continue') draws up to
-    NEW_PER_ROUND cards UNIFORMLY AT RANDOM from the new-card pool (user
+    the active mode's `new` count UNIFORMLY AT RANDOM from the new-card pool
+    (user
     spec 2026-09-04; replaces the hourly quota + preview-priority funnel so
     older released cards can't be starved by fresher ones)
   - every answer triggers a fire-and-forget sync to the self-hosted server
@@ -57,9 +63,38 @@ REVIEW_WEB_V2_DIST = Path(
 STATE_DIR = Path(os.getenv("ANKI_STATE_DIR", str(Path(__file__).parent / "state")))
 ROUND_FILE = STATE_DIR / "round.json"
 
-REVIEW_PER_ROUND = 4    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06; 4→3 on 2026-09-10, 3→4 on 2026-09-13)
-NEW_PER_ROUND = 1       # random draw from the new pool, per round, no quota
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
+
+# ---- two pacing modes (user spec 2026-09-14) ----
+# quick = 碎片时间 (queue at the canteen): the tiny 1+1+4 rhythm, meant to
+#         be opened many times a day.
+# focus = 整块时间 (a free afternoon block): exactly 5× the quick round.
+# The mode is picked per round on the start screen and PERSISTS in
+# round.json / preview.json (page refresh resumes the same mode); 'more'
+# inherits the completed round's mode. All numbers env-overridable.
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+STUDY_MODES: dict[str, dict[str, int]] = {
+    "quick": {
+        "preview": _env_int("ANKI_QUICK_PREVIEW", 1),
+        "new": _env_int("ANKI_QUICK_NEW", 1),
+        "review": _env_int("ANKI_QUICK_REVIEW", 4),
+    },
+    "focus": {
+        "preview": _env_int("ANKI_FOCUS_PREVIEW", 5),
+        "new": _env_int("ANKI_FOCUS_NEW", 5),
+        "review": _env_int("ANKI_FOCUS_REVIEW", 20),
+    },
+}
+DEFAULT_MODE = "quick"
+
+def study_mode(name: str | None) -> str:
+    """Validate/normalize a mode name; falls back to the default."""
+    return name if name in STUDY_MODES else DEFAULT_MODE
 
 # ---- preview mode (先看后考: read new cards before they enter testing) ----
 # Newly injected cards land in PREVIEW_DECK SUSPENDED, so they are invisible
@@ -89,8 +124,20 @@ ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes", "on")
 PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
 RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
-PREVIEW_PER_ROUND = int(os.getenv("ANKI_PREVIEW_PER_ROUND", "1"))
 PREVIEW_FILE = STATE_DIR / "preview.json"
+
+
+def _active_preview_per_round() -> int | None:
+    """Batch size of the ACTIVE preview round, derived from its stored mode.
+
+    None when there is no active preview round — the frontend then renders
+    sizes from study_modes[selected] on the start screens instead.
+    """
+    prd = _preview_read()
+    if prd is not None and prd.get("status") == "active" and prd.get("pending"):
+        return STUDY_MODES[study_mode(prd.get("mode"))]["preview"]
+    return None
+
 # stamp tag added on approve; the card is released (unsuspended) when this
 # date is strictly BEFORE today — see release_yesterday_approved()
 RELEASED_TAG_PREFIX = "released-"
@@ -167,8 +214,9 @@ def fire_and_forget_sync():
 
 # ---- new-card drawing ------------------------------------------------------
 # No hourly quota since 2026-09-04 (user spec): every round independently
-# draws up to NEW_PER_ROUND cards UNIFORMLY AT RANDOM from the dealable new
-# pool. The old hour-keyed quota.json is no longer read or written.
+# draws up to the active mode's `new` count UNIFORMLY AT RANDOM from the
+# dealable new pool. The old hour-keyed quota.json is no longer read or
+# written.
 
 
 def new_card_query() -> str:
@@ -388,7 +436,7 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
     return out
 
 
-async def build_batch(review_count: int, allow_new: bool):
+async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
     """Assemble one study batch.
 
     New cards are INTERLEAVED evenly among the review cards (like Anki's
@@ -396,7 +444,7 @@ async def build_batch(review_count: int, allow_new: bool):
     so a user who stopped after the 10 reviews never reached them — that
     was the "never pushes new cards" bug (2026-08-26).
 
-    New-card draw (2026-09-04 spec): up to NEW_PER_ROUND cards sampled
+    New-card draw (2026-09-04 spec): up to `new_count` cards sampled
     UNIFORMLY AT RANDOM from the whole dealable pool — no hourly quota, no
     priority for just-approved preview cards, so nothing starves.
     """
@@ -414,7 +462,7 @@ async def build_batch(review_count: int, allow_new: bool):
     # new cards: random sample within the per-round cap, spread evenly
     if allow_new:
         new_ids = await anki("findCards", {"query": new_card_query()}) or []
-        take = min(NEW_PER_ROUND, len(new_ids))
+        take = min(new_count, len(new_ids))
         if take > 0:
             new_cards = await fetch_cards(random.sample(new_ids, take))
             n_reviews = len(cards)
@@ -442,8 +490,12 @@ async def status():
             "anki": "ok",
             "due_review": len(due or []),
             "new_total": len(new or []),
-            "new_per_round": NEW_PER_ROUND,
+            "new_per_round": STUDY_MODES[DEFAULT_MODE]["new"],
             "preview_mode": PREVIEW_MODE,
+            # two pacing modes (user spec 2026-09-14) — the frontend renders
+            # the start-screen choice from this table, never hardcoded
+            "study_modes": STUDY_MODES,
+            "default_mode": DEFAULT_MODE,
         }
         if PREVIEW_MODE:
             out["preview_pool"] = len(await preview_pool_ids() or [])
@@ -453,19 +505,23 @@ async def status():
 
 
 @app.post("/api/session/start")
-async def start_session():
+async def start_session(mode: str | None = None):
     """Deal under _state_lock; the (potentially slow) sync runs outside it
-    so other devices' state polls are never blocked for minutes."""
+    so other devices' state polls are never blocked for minutes.
+
+    `mode` picks the pacing (quick = 碎片时间 1+1+4, focus = 整块时间
+    5+5+20); unknown/absent falls back to DEFAULT_MODE."""
     synced = await do_sync()  # do_sync acquires _sync_lock itself
     async with _state_lock:
-        return await _start_session_impl(synced)
+        return await _start_session_impl(synced, study_mode(mode))
 
 
-async def _start_session_impl(synced: bool):
+async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
     if PREVIEW_MODE:
         await release_yesterday_approved()
+    m = STUDY_MODES[mode]
     cards, due_remaining, new_total = await build_batch(
-        REVIEW_PER_ROUND, allow_new=True
+        m["review"], allow_new=True, new_count=m["new"]
     )
     if cards:
         _round_write(
@@ -478,14 +534,18 @@ async def _start_session_impl(synced: bool):
                 # batch composition (review/new split) — the frontend needs
                 # it for the done-screen stats even after a page reload
                 "new_count": sum(1 for c in cards if c["isNew"]),
+                # pacing mode — travels with the round so refresh/more keep it
+                "mode": mode,
             }
         )
     return {
         "synced": synced,
         "cards": cards,
         "due_remaining": due_remaining,
-        "new_per_round": NEW_PER_ROUND,
+        "new_per_round": m["new"],
         "new_total": new_total,
+        "mode": mode,
+        "study_modes": STUDY_MODES,
     }
 
 
@@ -515,10 +575,18 @@ async def _session_state_impl():
 
     # preview-mode extras (the frontend decides from preview_mode whether to
     # render the preview UI at all — feature flag off ⇒ exact legacy shape)
-    preview: dict = {"preview_mode": PREVIEW_MODE}
+    preview: dict = {
+        "preview_mode": PREVIEW_MODE,
+        # pacing-mode table for the start screens (2026-09-14) — the UI
+        # renders the quick/focus choice from this, never hardcoded numbers
+        "study_modes": STUDY_MODES,
+        "default_mode": DEFAULT_MODE,
+    }
     if PREVIEW_MODE:
-        # batch size goes down too, so the frontend never hardcodes it
-        preview["preview_per_round"] = PREVIEW_PER_ROUND
+        # batch size of the ACTIVE preview round (mode-dependent since
+        # 2026-09-14) — None when no preview round: the start screens then
+        # use study_modes[selected] to preview the sizes
+        preview["preview_per_round"] = _active_preview_per_round()
         try:
             preview["pending_release"] = await _pending_release_today()
         except Exception:
@@ -553,13 +621,19 @@ async def _session_state_impl():
                         "can_undo": bool(prd.get("last")),
                         "approved": len(prd.get("approved") or []),
                         "deferred": prd.get("deferred", 0),
+                        "mode": study_mode(prd.get("mode")),
                     }
                 else:
                     # round drained — keep the approved tombstone (if any):
-                    # the preview done-screen undo still needs it
+                    # the preview done-screen undo still needs it; mode rides
+                    # along so 're-preview' chains the same pacing
                     approved = prd.get("approved") or []
                     _preview_write(
-                        {"status": "complete", "approved": approved}
+                        {
+                            "status": "complete",
+                            "approved": approved,
+                            "mode": study_mode(prd.get("mode")),
+                        }
                         if approved
                         else None
                     )
@@ -571,12 +645,13 @@ async def _session_state_impl():
         return {
             "state": "none",
             "due_remaining": due_left,
-            "new_per_round": NEW_PER_ROUND,
+            "new_per_round": STUDY_MODES[DEFAULT_MODE]["new"],
             "new_total": new_total,
             "can_undo": False,
             **preview,
         }
 
+    mode = study_mode(rd.get("mode"))
     if rd.get("status") == "complete" or not rd.get("pending"):
         return {
             "state": "complete",
@@ -584,9 +659,10 @@ async def _session_state_impl():
             "total": rd.get("total", 0),
             "new_in_batch": rd.get("new_count"),
             "due_remaining": due_left,
-            "new_per_round": NEW_PER_ROUND,
+            "new_per_round": STUDY_MODES[mode]["new"],
             "new_total": new_total,
             "can_undo": bool((rd.get("last") or {}).get("snap")),
+            "mode": mode,
             **preview,
         }
 
@@ -598,8 +674,10 @@ async def _session_state_impl():
             "total": rd.get("total", 0),
             "new_in_batch": rd.get("new_count"),
             "due_remaining": due_left,
+            "new_per_round": STUDY_MODES[study_mode(rd.get("mode"))]["new"],
             "new_total": new_total,
             "can_undo": bool((rd.get("last") or {}).get("snap")),
+            "mode": study_mode(rd.get("mode")),
             **preview,
         }
     return {
@@ -609,9 +687,10 @@ async def _session_state_impl():
         "total": rd.get("total", len(cards)),
         "new_in_batch": rd.get("new_count"),
         "due_remaining": due_left,
-        "new_per_round": NEW_PER_ROUND,
+        "new_per_round": STUDY_MODES[mode]["new"],
         "new_total": new_total,
         "can_undo": bool((rd.get("last") or {}).get("snap")),
+        "mode": mode,
         **preview,
     }
 
@@ -624,10 +703,19 @@ async def session_more():
 
 
 async def _session_more_impl():
-    """'Keep going' — another full batch: reviews + a fresh random new draw."""
+    """'Keep going' — another full batch: reviews + a fresh random new draw.
+
+    INHERITS the pacing mode of the round that just finished (2026-09-14):
+    a focus session chains focus-sized batches, a quick session quick ones.
+    """
     if PREVIEW_MODE:
         await release_yesterday_approved()
-    cards, due_remaining, new_total = await build_batch(REVIEW_PER_ROUND, allow_new=True)
+    rd = current_round()
+    mode = study_mode((rd or {}).get("mode"))
+    m = STUDY_MODES[mode]
+    cards, due_remaining, new_total = await build_batch(
+        m["review"], allow_new=True, new_count=m["new"]
+    )
     if cards:
         _round_write(
             {
@@ -637,13 +725,16 @@ async def _session_more_impl():
                 "done_count": 0,
                 "pending": [c["cardId"] for c in cards],
                 "new_count": sum(1 for c in cards if c["isNew"]),
+                "mode": mode,
             }
         )
     return {
         "cards": cards,
         "due_remaining": due_remaining,
-        "new_per_round": NEW_PER_ROUND,
+        "new_per_round": m["new"],
         "new_total": new_total,
+        "mode": mode,
+        "study_modes": STUDY_MODES,
     }
 
 
@@ -713,6 +804,7 @@ async def _answer_impl(card_id: int, ease: int):
             "state": rd["status"],
             "done": rd["done_count"],
             "total": rd.get("total", rd["done_count"]),
+            "mode": study_mode(rd.get("mode")),
         }
         # round just finished: hand the UI fresh pool/quota numbers for the done page
         if rd["status"] == "complete":
@@ -723,7 +815,7 @@ async def _answer_impl(card_id: int, ease: int):
                 round_info["new_total"] = len(new_ids or [])
             except Exception:
                 pass
-            round_info["new_per_round"] = NEW_PER_ROUND
+            round_info["new_per_round"] = STUDY_MODES[study_mode(rd.get("mode"))]["new"]
 
     fire_and_forget_sync()
     return {"answered": True, "round": round_info}
@@ -972,11 +1064,18 @@ async def _preview_state_impl():
                 # still report honest numbers on the done / exit screens
                 "approved": len(rd.get("approved") or []),
                 "deferred": rd.get("deferred", 0),
+                "mode": study_mode(rd.get("mode")),
             }
         # round drained — keep the approved tombstone (if any)
         approved = rd.get("approved") or []
         _preview_write(
-            {"status": "complete", "approved": approved} if approved else None
+            {
+                "status": "complete",
+                "approved": approved,
+                "mode": study_mode(rd.get("mode")),
+            }
+            if approved
+            else None
         )
 
     pool = await preview_pool_ids()
@@ -991,20 +1090,24 @@ async def _preview_state_impl():
 
 
 @app.post("/api/preview/start")
-async def preview_start():
+async def preview_start(mode: str | None = None):
     """Serialized under _state_lock (see its declaration).
 
     do_sync() runs OUTSIDE the lock: a cold sync can take minutes, and
     holding the state lock that long would block every other endpoint
     (including GET state). The lock only protects the pool read + deal.
+
+    `mode` picks the preview batch size (quick=1, focus=5); it is stored in
+    preview.json so a refresh / 'more' keeps the same pacing, and handed to
+    the frontend so 'skip to review' starts a review round of the SAME mode.
     """
     _preview_guard()
     await do_sync()  # pull anything injected elsewhere
     async with _state_lock:
-        return await _preview_start_impl()
+        return await _preview_start_impl(study_mode(mode))
 
 
-async def _preview_start_impl():
+async def _preview_start_impl(mode: str = DEFAULT_MODE):
     """Deal one preview batch: a random sample of pool cards not deferred today."""
     _preview_guard()
     await release_yesterday_approved()
@@ -1012,9 +1115,10 @@ async def _preview_start_impl():
     deferred = await _deferred_today_cards(pool)
     available = [c for c in pool if c not in deferred]
     # random draw (2026-09-04 spec) — mirrors the review-round new draw
-    pending = random.sample(available, min(PREVIEW_PER_ROUND, len(available)))
+    per_round = STUDY_MODES[mode]["preview"]
+    pending = random.sample(available, min(per_round, len(available)))
     if not pending:
-        return {"cards": [], "pool": len(pool), "available": 0}
+        return {"cards": [], "pool": len(pool), "available": 0, "mode": mode}
     _preview_write(
         {
             "status": "active",
@@ -1022,12 +1126,15 @@ async def _preview_start_impl():
             "total": len(pending),
             "done": 0,
             "pending": pending,
+            "mode": mode,
         }
     )
     return {
         "cards": await fetch_cards(pending),
         "pool": len(pool),
         "available": len(pool) - len(deferred) - len(pending),
+        "mode": mode,
+        "preview_per_round": per_round,
     }
 
 
@@ -1113,6 +1220,7 @@ async def _preview_act_impl(card_id: int, action: str):
                 "done": rd.get("done", 0),
                 "total": rd.get("total", rd.get("done", 0)),
                 "last": rd.get("last"),
+                "mode": study_mode(rd.get("mode")),
             }
         )
         remaining = await preview_pool_ids()
@@ -1122,6 +1230,7 @@ async def _preview_act_impl(card_id: int, action: str):
             "round_complete": True,
             "pool": len(remaining),
             "available": len(remaining) - len(deferred),
+            "mode": study_mode(rd.get("mode")),
         }
     _preview_write(rd)
     return {"ok": True, "round_complete": False}
@@ -1144,7 +1253,13 @@ async def _preview_finish_impl():
     rd = _preview_read()
     approved = (rd or {}).get("approved") or []
     if approved:
-        _preview_write({"status": "complete", "approved": approved})
+        _preview_write(
+            {
+                "status": "complete",
+                "approved": approved,
+                "mode": study_mode((rd or {}).get("mode")),
+            }
+        )
     else:
         _preview_write(None)
     return {"ok": True, "pool": await preview_pool_count()}

@@ -10,8 +10,10 @@ interface Props {
   available: number | null
   due: number | null
   busy: boolean
-  /** preview batch size from the backend (never hardcode) */
-  perRound: number
+  /** preview batch size for the CURRENT mode (from studyModes; the wire's
+   * preview_per_round only covers ACTIVE rounds and is null here) — never
+   * hardcode */
+  perRound: number | null
   onUndo: () => void
   canUndo: boolean
   undoBusy: boolean
@@ -63,7 +65,7 @@ export const PreviewDoneScreen: Component<Props> = (props) => {
             </Show>
             <Show when={(props.available ?? 0) > 0}>
               <md-text-button onClick={() => props.onMore()} disabled={props.busy}>
-                再预览 {props.perRound} 张
+                再预览{props.perRound != null ? ` ${props.perRound} 张` : ''}
               </md-text-button>
             </Show>
             <md-text-button onClick={() => props.onFinish()} disabled={props.busy}>

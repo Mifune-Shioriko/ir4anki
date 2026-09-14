@@ -18,6 +18,25 @@ import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
 import { PreviewScreen } from './components/PreviewScreen'
 import { PreviewDoneScreen } from './components/PreviewDoneScreen'
+import type { StudyModes } from './types'
+
+// Pacing-mode persistence (2026-09-14): the last tier the user picked is
+// remembered across page loads, so the habitual case is one tap ("开始").
+const MODE_STORAGE_KEY = 'anki-review-app.study-mode'
+const readStoredMode = (): string | null => {
+  try {
+    return localStorage.getItem(MODE_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+const writeStoredMode = (mode: string) => {
+  try {
+    localStorage.setItem(MODE_STORAGE_KEY, mode)
+  } catch {
+    /* private mode / storage full — not critical */
+  }
+}
 
 type Phase =
   | 'loading'
@@ -68,6 +87,20 @@ export const App: Component = () => {
   const [due, setDue] = createSignal<number | null>(null)
   const [newPerRound, setNewPerRound] = createSignal<number | null>(null)
   const [newTotal, setNewTotal] = createSignal<number | null>(null)
+
+  // ---- pacing mode (two tiers, user spec 2026-09-14) ----
+  // studyModes = the backend's size table (quick 1+1+4 / focus 5+5+20),
+  // selectedMode = the start-screen selection. Seeded from localStorage so
+  // the habitual tier is pre-selected; validated against the wire table on
+  // every resync (an unknown stored value falls back to default_mode).
+  const [studyModes, setStudyModes] = createSignal<StudyModes | null>(null)
+  const [selectedMode, setSelectedMode] = createSignal<string>(
+    readStoredMode() ?? 'quick'
+  )
+  const chooseMode = (mode: string) => {
+    setSelectedMode(mode)
+    writeStoredMode(mode)
+  }
 
   // ---- review/new split for the current batch (front-end only) ----
   // Batch composition is snapshotted at load time; live done counts derive
@@ -178,6 +211,15 @@ export const App: Component = () => {
       const d = await api.sessionState()
       adoptGlobal(d)
       setCanUndo(d.can_undo)
+      // pacing-mode table from the wire (2026-09-14); validate the stored
+      // selection against it so a renamed/removed tier can't strand the UI
+      if (d.study_modes) {
+        setStudyModes(d.study_modes)
+        const stored = readStoredMode()
+        if (stored && stored in d.study_modes) setSelectedMode(stored)
+        else if (!(selectedMode() in d.study_modes))
+          setSelectedMode(d.default_mode && d.default_mode in d.study_modes ? d.default_mode : 'quick')
+      }
       // preview-mode signals (absent when the backend flag is off)
       setPreviewMode(!!d.preview_mode)
       if (d.preview_mode) {
@@ -190,7 +232,9 @@ export const App: Component = () => {
         // a normal review round in progress always wins — finish it first
         loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
       } else if (d.preview_mode && d.preview_round) {
-        // resume an unfinished preview round
+        // resume an unfinished preview round — its stored mode drives
+        // 're-preview' and 'skip to review' so the pacing survives refresh
+        if (d.preview_round.mode) setSelectedMode(d.preview_round.mode)
         setPvCards(d.preview_round.cards)
         setPvDone(d.preview_round.done)
         setPvTotal(d.preview_round.total)
@@ -205,6 +249,8 @@ export const App: Component = () => {
         // top of the funnel: read new cards before they enter testing
         setPhase('previewStart')
       } else if (d.state === 'complete') {
+        // the completed round's mode drives '继续复习' (more inherits it)
+        if (d.mode) setSelectedMode(d.mode)
         setTotalDone(d.done || d.total || 0)
         if (d.new_in_batch != null) {
           setBatchNewTotal(d.new_in_batch)
@@ -228,8 +274,9 @@ export const App: Component = () => {
     setLoadError(false)
     setLoadText('正在同步并加载卡片…')
     try {
-      const data = await api.start()
+      const data = await api.start(selectedMode())
       adoptGlobal(data)
+      if (data.study_modes) setStudyModes(data.study_modes)
       if (!data.cards.length) {
         setEmptyDetail(
           data.due_remaining === 0
@@ -254,6 +301,7 @@ export const App: Component = () => {
     try {
       const data = await api.more()
       adoptGlobal(data)
+      if (data.study_modes) setStudyModes(data.study_modes)
       if (!data.cards.length) {
         setEmptyDetail(
           data.due_remaining === 0 ? '复习池已清空，真没了 🎉' : `待复习 ${data.due_remaining} 张`
@@ -441,12 +489,14 @@ export const App: Component = () => {
     setLoadText('正在加载预览卡…')
     setPvBusy(true)
     try {
-      const d = await api.previewStart()
+      const d = await api.previewStart(selectedMode())
       if (!d.cards.length) {
         // pool drained (deferred today) — back to whatever resync decides
         await resync()
         return
       }
+      if (d.mode) setSelectedMode(d.mode)
+      if (d.preview_per_round != null) setPreviewPerRound(d.preview_per_round)
       setPvCards(d.cards)
       setPvDone(0)
       setPvTotal(d.cards.length)
@@ -648,6 +698,9 @@ export const App: Component = () => {
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}
+            studyModes={studyModes()}
+            mode={selectedMode()}
+            onModeChange={chooseMode}
           />
         </Show>
 
@@ -692,7 +745,11 @@ export const App: Component = () => {
             available={previewAvailable()}
             due={due()}
             busy={pvBusy()}
-            perRound={previewPerRound()}
+            perRound={
+              studyModes() && studyModes()![selectedMode()]
+                ? studyModes()![selectedMode()].preview
+                : previewPerRound()
+            }
             onMore={pvStart}
             onToReview={pvToReview}
             onFinish={pvFinish}
@@ -711,6 +768,9 @@ export const App: Component = () => {
             onBegin={startNewRound}
             previewPool={previewMode() ? previewPool() : null}
             onToPreview={pvToPreview}
+            studyModes={studyModes()}
+            mode={selectedMode()}
+            onModeChange={chooseMode}
           />
         </Show>
 

@@ -43,7 +43,8 @@ function post<T>(url: string, body?: unknown): Promise<T> {
 
 export const api = {
   sessionState: () => get<SessionStateResponse>('/api/session/state'),
-  start: () => post<StartResponse>('/api/session/start'),
+  start: (mode?: string) =>
+    post<StartResponse>(mode ? `/api/session/start?mode=${mode}` : '/api/session/start'),
   more: () => post<MoreResponse>('/api/session/more'),
   finish: () => post<{ synced: boolean }>('/api/session/finish'),
   answer: (cardId: number, ease: number) =>
@@ -53,7 +54,8 @@ export const api = {
   tags: () => get<{ tags: string[] }>('/api/tags'),
   updateNote: (cardId: number, fields: Record<string, string>, tags: string[]) =>
     post<NoteUpdateResponse>('/api/note/update', { card_id: cardId, fields, tags }),
-  previewStart: () => post<PreviewStartResponse>('/api/preview/start'),
+  previewStart: (mode?: string) =>
+    post<PreviewStartResponse>(mode ? `/api/preview/start?mode=${mode}` : '/api/preview/start'),
   previewAct: (cardId: number, action: 'approve' | 'defer') =>
     post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
   previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),

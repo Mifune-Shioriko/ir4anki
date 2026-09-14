@@ -31,7 +31,20 @@ export interface RoundInfo {
   due_remaining?: number
   new_per_round?: number
   new_total?: number
+  /** pacing mode of the round (quick/focus) — 2026-09-14 */
+  mode?: string
 }
+
+/** Pacing-mode table from the backend (user spec 2026-09-14):
+ * quick = 碎片时间 (1 preview + 1 new + 4 review),
+ * focus = 整块时间 (5 preview + 5 new + 20 review).
+ * Sizes ALWAYS come from the wire — never hardcode them in UI copy. */
+export interface StudyModeSizes {
+  preview: number
+  new: number
+  review: number
+}
+export type StudyModes = Record<string, StudyModeSizes>
 
 /** Preview-mode fields ride on every session/state response. When
  * preview_mode is false/absent the frontend renders the exact legacy UI. */
@@ -44,6 +57,8 @@ export interface PreviewRoundResume {
   /** approve/defer split — lets a resumed round report honest exit stats */
   approved?: number
   deferred?: number
+  /** pacing mode of the resumed preview round (2026-09-14) */
+  mode?: string
 }
 
 /** Exact reverse of a preview act: approve→card back in the pool suspended,
@@ -61,17 +76,22 @@ export interface PreviewExtras {
   preview_pool?: number | null
   preview_available?: number
   preview_round?: PreviewRoundResume
-  /** preview batch size (3 since 2026-09-06) — never hardcode in UI text */
-  preview_per_round?: number
+  /** preview batch size of the ACTIVE preview round (mode-dependent since
+   * 2026-09-14); null when no round — start screens use study_modes instead */
+  preview_per_round?: number | null
   /** cards approved TODAY, still suspended — released into the study queue
    * tomorrow (next-day release, 2026-09-07) */
   pending_release?: number | null
+  /** pacing-mode table + default (2026-09-14) — the start screens render
+   * the quick/focus choice from these, never hardcoded numbers */
+  study_modes?: StudyModes
+  default_mode?: string
 }
 
 export type SessionStateResponse = PreviewExtras & (
   | { state: 'none'; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
-  | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
-  | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
+  | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean; mode?: string }
+  | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean; mode?: string }
 )
 
 export interface StartResponse {
@@ -80,6 +100,8 @@ export interface StartResponse {
   due_remaining: number
   new_per_round: number
   new_total: number
+  mode?: string
+  study_modes?: StudyModes
 }
 
 export interface MoreResponse {
@@ -87,12 +109,16 @@ export interface MoreResponse {
   due_remaining: number
   new_per_round: number
   new_total: number
+  mode?: string
+  study_modes?: StudyModes
 }
 
 export interface PreviewStartResponse {
   cards: Card[]
   pool: number
   available: number
+  mode?: string
+  preview_per_round?: number
 }
 
 export interface PreviewActResponse {
