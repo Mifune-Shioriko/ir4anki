@@ -57,7 +57,7 @@ REVIEW_WEB_V2_DIST = Path(
 STATE_DIR = Path(os.getenv("ANKI_STATE_DIR", str(Path(__file__).parent / "state")))
 ROUND_FILE = STATE_DIR / "round.json"
 
-REVIEW_PER_ROUND = 3    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06; 4→3 on 2026-09-10)
+REVIEW_PER_ROUND = 4    # + up to NEW_PER_ROUND new cards (user spec 2026-09-06; 4→3 on 2026-09-10, 3→4 on 2026-09-13)
 NEW_PER_ROUND = 1       # random draw from the new pool, per round, no quota
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 

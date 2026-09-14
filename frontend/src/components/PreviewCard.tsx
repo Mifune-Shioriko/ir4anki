@@ -115,7 +115,7 @@ export const PreviewCard: Component<Props> = (props) => {
               {priors().length > 0 && (
                 <div class="prior-section">
                   <div class="prior-title md-typescale-label-medium">
-                    📚 前置知识 · AI 生成
+                    前置知识
                   </div>
                   <ul class="prior-list md-typescale-body-medium">
                     {priors().map(item => (
@@ -128,7 +128,7 @@ export const PreviewCard: Component<Props> = (props) => {
               {props.card.explanation && (
                 <div class="explain-section">
                   <div class="explain-title md-typescale-label-medium">
-                    AI 讲解 · 仅供参考
+                    AI 讲解
                   </div>
                   <div
                     class="explain-text md-typescale-body-medium"
