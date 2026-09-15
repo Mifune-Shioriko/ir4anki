@@ -23,6 +23,10 @@ Session model:
     (user
     spec 2026-09-04; replaces the hourly quota + preview-priority funnel so
     older released cards can't be starved by fresher ones)
+  - DOUBLE-AGAIN AUTO-RETURN (user spec 2026-09-16): a NEW card whose first
+    two consecutive gradings are both Again is automatically sent back to
+    the preview pool (same reset as the manual 移回预览池). Only the first
+    learning cycle counts; streak state persists in state/new_again.json.
   - every answer triggers a fire-and-forget sync to the self-hosted server
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
@@ -125,6 +129,21 @@ PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes"
 PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
 RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
 PREVIEW_FILE = STATE_DIR / "preview.json"
+
+# ---- double-Again auto-return (user spec 2026-09-16) ----
+# A NEW card whose first two consecutive gradings are both Again goes back
+# to the preview pool (先看后考 again): two honest recall failures right
+# after release mean the card was approved too early — re-learning it beats
+# grinding relearning steps. Only the FIRST learning cycle counts (初学):
+# the streak opens only while the card is still type==0 (new) and is cleared
+# by any other grade, by undo, by a manual 移回预览池, and by delete. Streak
+# state persists in state/new_again.json so it survives rounds, refreshes
+# and restarts (the two Agains usually land in DIFFERENT rounds — Anki's
+# relearning step re-deals the card minutes later).
+# Kill-switch: ANKI_NEW_AGAIN_RETURN=0; threshold: ANKI_NEW_AGAIN_LIMIT.
+NEW_AGAIN_RETURN = os.getenv("ANKI_NEW_AGAIN_RETURN", "1").lower() in ("1", "true", "yes", "on")
+NEW_AGAIN_LIMIT = max(1, _env_int("ANKI_NEW_AGAIN_LIMIT", 2))
+NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
 
 
 def _active_preview_per_round() -> int | None:
@@ -817,6 +836,21 @@ async def _answer_impl(card_id: int, ease: int):
                 pass
             round_info["new_per_round"] = STUDY_MODES[study_mode(rd.get("mode"))]["new"]
 
+    # ---- double-Again auto-return (user spec 2026-09-16) ----
+    # A NEW card whose first two consecutive grades are both Again goes
+    # back to the preview pool. Non-Again grades clear the streak. Runs
+    # AFTER the round bookkeeping so the undo slot is already recorded —
+    # the hook marks it auto_return so /api/undo can reverse the move.
+    returned = None
+    if PREVIEW_MODE and NEW_AGAIN_RETURN:
+        if ease == 1:
+            returned = await _maybe_auto_return_to_preview(card_id, ease, info)
+        else:
+            _streak_clear(card_id)
+    if returned is not None:
+        fire_and_forget_sync()
+        return {"answered": True, "round": round_info, "returned_to_preview": returned}
+
     fire_and_forget_sync()
     return {"answered": True, "round": round_info}
 
@@ -864,6 +898,17 @@ async def _undo_impl():
     if not (res and res[0] is True):
         raise HTTPException(status_code=502, detail=f"restore failed: {res}")
 
+    # the answer triggered a double-Again auto-return (2026-09-16): the card
+    # was forget'd, moved to PREVIEW_DECK and suspended AFTER the snapshot.
+    # Field restore alone would leave a scheduled card sitting suspended in
+    # the pool — also undo the deck move + suspend so it's a normal due card.
+    if last.get("auto_return"):
+        try:
+            await anki("changeDeck", {"cards": [cid], "deck": RELEASE_DECK})
+            await anki("unsuspend", {"cards": [cid]})
+        except Exception:
+            pass  # best-effort: the scheduling restore above is the critical part
+
     # put the card back into the round where it was (defensive: never
     # duplicate if it somehow never left)
     pos = min(last.get("index", 0), len(rd.get("pending", [])))
@@ -875,13 +920,37 @@ async def _undo_impl():
     rd.pop("last", None)
     _round_write(rd)
 
+    # the undone answer had triggered a double-Again auto-return: the streak
+    # file was cleared by the hook, so put the counter back to just-below the
+    # threshold — a fresh Again after the undo correctly re-triggers the return
+    if last.get("auto_return") and PREVIEW_MODE:
+        d = _streak_read()
+        d[str(cid)] = max(1, NEW_AGAIN_LIMIT - 1)
+        _streak_write(d)
+    elif last.get("ease") == 1 and PREVIEW_MODE:
+        # plain Again answer undone (no auto-return yet): give the streak
+        # count back so the counter mirrors what actually happened
+        d = _streak_read()
+        k = str(cid)
+        if k in d:
+            d[k] -= 1
+            if d[k] <= 0:
+                d.pop(k)
+            _streak_write(d)
+
     cards = await fetch_cards([cid])
     if not cards:
         raise HTTPException(status_code=404, detail="card vanished after restore")
 
     # propagate the corrected scheduling to the sync server
     fire_and_forget_sync()
-    return {"restored": True, "card": cards[0], "index": pos}
+    out: dict = {"restored": True, "card": cards[0], "index": pos}
+    if last.get("auto_return"):
+        try:
+            out["returned_from_preview"] = {"cardId": cid, "pool": await preview_pool_count()}
+        except Exception:
+            out["returned_from_preview"] = {"cardId": cid, "pool": None}
+    return out
 
 
 # ---- preview mode: pool, rounds, endpoints --------------------------------
@@ -942,6 +1011,87 @@ def _preview_write(rd: dict | None):
 
 async def preview_pool_count() -> int:
     return len(await preview_pool_ids())
+
+
+# ---- double-Again auto-return state (user spec 2026-09-16) ---------------
+# {card_id(str): consecutive-Again count in the card's FIRST learning cycle}.
+# Lives in its own file (not round.json) because the two Agains usually land
+# in DIFFERENT rounds — Anki's relearning steps re-deal the card minutes
+# later, often into the next batch. Cleared by: any non-Again grade, undo,
+# manual 移回预览池, delete, and the auto-return itself.
+
+def _streak_read() -> dict[str, int]:
+    STATE_DIR.mkdir(exist_ok=True)
+    if not NEW_AGAIN_FILE.exists():
+        return {}
+    try:
+        d = json.loads(NEW_AGAIN_FILE.read_text())
+        return {str(k): int(v) for k, v in d.items() if isinstance(v, int)}
+    except Exception:
+        return {}
+
+
+def _streak_write(d: dict[str, int]) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    tmp = NEW_AGAIN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d))
+    tmp.replace(NEW_AGAIN_FILE)
+
+
+def _streak_clear(card_id: int) -> None:
+    d = _streak_read()
+    if str(card_id) in d:
+        d.pop(str(card_id))
+        _streak_write(d)
+
+
+def _streak_note_again(card_id: int, card_is_new: bool) -> int:
+    """Record one Again grade; returns the new streak length.
+
+    The streak only tracks a NEW card's first learning cycle (初学): the
+    counter OPENS while the card is still type==0 and KEEPS counting across
+    its relearning steps (the second Again lands on a type==2 card, so the
+    guard is 'already tracking', not 'still new'). Review cards that lapse
+    never start a streak.
+    """
+    key = str(card_id)
+    d = _streak_read()
+    if card_is_new or key in d:
+        d[key] = d.get(key, 0) + 1
+        _streak_write(d)
+        return d[key]
+    return 0
+
+
+async def _maybe_auto_return_to_preview(
+    card_id: int, ease: int, info: dict | None
+) -> dict | None:
+    """Double-Again auto-return hook, called from /api/answer.
+
+    Returns {"cardId", "pool"} when the card was moved back to the preview
+    pool, else None. Fail-soft: any error degrades to 'no auto-return' —
+    the grade itself already landed, review must never break here.
+    """
+    if not (NEW_AGAIN_RETURN and PREVIEW_MODE and ease == 1):
+        return None
+    try:
+        streak = _streak_note_again(card_id, bool(info and info.get("type") == 0))
+        if streak < NEW_AGAIN_LIMIT:
+            return None
+        _streak_clear(card_id)
+        pool = (await _to_preview_pool_impl(card_id)).get("pool")
+        # _to_preview_pool_impl leaves the round's undo slot alone (the card
+        # already left pending when it was answered); just MARK the existing
+        # slot so /api/undo knows to also move the card back out of the pool.
+        rd = current_round()
+        if rd is not None:
+            last = rd.get("last")
+            if isinstance(last, dict) and last.get("cardId") == card_id:
+                last["auto_return"] = True
+                _round_write(rd)
+        return {"cardId": card_id, "pool": pool}
+    except Exception:
+        return None
 
 
 async def release_yesterday_approved() -> int:
@@ -1507,6 +1657,7 @@ async def _delete_card_impl(card_id: int):
     # bookkeeping AFTER a successful delete — never strand round state
     _round_remove_card(current_round(), card_id)
     _preview_round_remove_card(_preview_read(), card_id)
+    _streak_clear(card_id)  # a deleted card can't carry an Again streak
     fire_and_forget_sync()
     return {"deleted": True}
 
@@ -1565,6 +1716,7 @@ async def _to_preview_pool_impl(card_id: int):
         )
     _round_remove_card(current_round(), card_id)
     _preview_round_remove_card(_preview_read(), card_id)
+    _streak_clear(card_id)  # manual return = fresh start; drop any streak
     fire_and_forget_sync()
     return {"moved": True, "pool": await preview_pool_count()}
 

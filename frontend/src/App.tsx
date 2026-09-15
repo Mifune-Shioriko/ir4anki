@@ -18,6 +18,7 @@ import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
 import { PreviewScreen } from './components/PreviewScreen'
 import { PreviewDoneScreen } from './components/PreviewDoneScreen'
+import { Snackbar } from './components/Snackbar'
 import type { StudyModes } from './types'
 
 // Pacing-mode persistence (2026-09-14): the last tier the user picked is
@@ -178,6 +179,19 @@ export const App: Component = () => {
 
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
+
+  // ---- MD3 snackbar (transient feedback, 2026-09-16) ----
+  // Currently used by the double-Again auto-return: the card silently left
+  // the round, so the user needs to know WHY. Auto-dismiss ~4s per the MD3
+  // snackbar guidance (short label, no action needed).
+  const [snackText, setSnackText] = createSignal<string | null>(null)
+  let snackTimer: ReturnType<typeof setTimeout> | null = null
+  const showSnack = (text: string) => {
+    if (snackTimer) clearTimeout(snackTimer)
+    setSnackText(text)
+    snackTimer = setTimeout(() => setSnackText(null), 4000)
+  }
+  onCleanup(() => { if (snackTimer) clearTimeout(snackTimer) })
 
   const adoptGlobal = (d: {
     due_remaining?: number | null
@@ -342,6 +356,21 @@ export const App: Component = () => {
       // backend now holds an undo slot for this answer — no time limit
       setCanUndo(true)
 
+      // double-Again auto-return (2026-09-16): a NEW card graded Again twice
+      // in its first learning cycle went back to the preview pool. Update the
+      // top-bar pool chip and tell the user why the card vanished. Undo still
+      // works (the backend marked the slot auto_return).
+      const rt = data.returned_to_preview
+      if (rt) {
+        if (previewMode()) {
+          if (rt.pool != null) setPreviewPool(rt.pool)
+          setPreviewAvailable(p => (p == null ? p : p + 1))
+        }
+        if (card.isNew) setBatchNewTotal(v => Math.max(0, v - 1))
+        else setBatchReviewTotal(v => Math.max(0, v - 1))
+        showSnack('连续两次 Again，已自动退回预览池重新学习')
+      }
+
       const roundDone = data.round != null && data.round.state === 'complete'
       if (!roundDone && idx() < cards().length) {
         setRevealedFor(null)
@@ -371,6 +400,18 @@ export const App: Component = () => {
       setTotalDone(v => Math.max(0, v - 1))
       setRevealedFor(null)
       setCanUndo(false) // the single undo slot is consumed
+      // the undone answer had auto-returned the card to the preview pool
+      // (2026-09-16): the backend moved it back out — mirror the pool chip
+      const rf = d.returned_from_preview
+      if (rf) {
+        if (previewMode()) {
+          if (rf.pool != null) setPreviewPool(rf.pool)
+          setPreviewAvailable(p => (p == null ? p : Math.max(0, p - 1)))
+        }
+        if (d.card.isNew) setBatchNewTotal(v => v + 1)
+        else setBatchReviewTotal(v => v + 1)
+        showSnack('已撤销：卡片移回了本轮复习')
+      }
       if (phase() === 'done') setPhase('review')
     } catch (e) {
       alert('撤销失败：' + (e as Error).message)
@@ -886,6 +927,8 @@ export const App: Component = () => {
         onConfirm={confirmToPreview}
         onCancel={() => setToPreviewTarget(null)}
       />
+
+      <Snackbar open={snackText() !== null} label={snackText() ?? ''} />
     </div>
   )
 }

@@ -1,5 +1,6 @@
-import { Component, For } from 'solid-js'
+import { Component, For, JSX } from 'solid-js'
 import type { StudyModes } from '../types'
+import { IconBolt, IconCheckCircle, IconTrackChanges } from './icons'
 
 // Two-tier pacing selector (user spec 2026-09-14).
 //   quick = 碎片时间 (canteen queue): the tiny 1 preview + 1 new + 4 review
@@ -9,14 +10,21 @@ import type { StudyModes } from '../types'
 // hardcoded here; this component only attaches the display copy (icon,
 // name, blurb) and derives a rough time estimate from the total card count.
 //
-// Rendered as two selectable tiles. The selected tile gets a primary border
-// + tinted background + a check dot (MD3 selected-state idiom). Clicking a
-// tile fires onSelect; App persists the choice in localStorage so the next
-// open pre-selects it.
+// MD3 (audit 2026-09-16): icons are official Material Symbols outlined SVGs
+// (bolt / track_changes) tinted via currentColor — the previous emoji glyphs
+// (⚡🎯) render platform-dependent and can't take theme colors, which breaks
+// the MD3 token-driven color story. Selected state follows the MD3 list/card
+// selected idiom: primary border + secondary-container fill + a leading
+// indicator (check_circle). Tiles are role=radio inside role=radiogroup.
 
-const MODE_META: Record<string, { icon: string; name: string; desc: string }> = {
-  quick: { icon: '⚡', name: '快速', desc: '碎片时间' },
-  focus: { icon: '🎯', name: '专注', desc: '整块时间' },
+const MODE_ICONS: Record<string, (props: { size?: number }) => JSX.Element> = {
+  quick: IconBolt,
+  focus: IconTrackChanges,
+}
+
+const MODE_META: Record<string, { name: string; desc: string }> = {
+  quick: { name: '快速', desc: '碎片时间' },
+  focus: { name: '专注', desc: '整块时间' },
 }
 
 // Stable display order regardless of wire key order
@@ -51,9 +59,10 @@ export const ModeSelector: Component<Props> = (props) => {
       <For each={ordered()}>
         {key => {
           const m = () => props.modes[key]
-          const meta = () => MODE_META[key] ?? { icon: '•', name: key, desc: '' }
+          const meta = () => MODE_META[key] ?? { name: key, desc: '' }
           const sel = () => props.selected === key
           const total = () => m().preview + m().new + m().review
+          const icon = () => MODE_ICONS[key]
           return (
             <div
               class="mode-tile"
@@ -71,16 +80,13 @@ export const ModeSelector: Component<Props> = (props) => {
               }}
             >
               <div class="mode-tile__head">
-                <span class="mode-tile__icon" aria-hidden="true">{meta().icon}</span>
+                <span class="mode-tile__icon" aria-hidden="true">
+                  {icon() ? icon()({ size: 20 }) : '•'}
+                </span>
                 <span class="mode-tile__name md-typescale-title-medium">{meta().name}</span>
                 <span class="mode-tile__desc md-typescale-label-medium">{meta().desc}</span>
                 <span class="mode-tile__check" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" width="18" height="18">
-                    <path
-                      fill="currentColor"
-                      d="M9 16.17 4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"
-                    />
-                  </svg>
+                  <IconCheckCircle size={18} />
                 </span>
               </div>
               <div class="mode-tile__sizes md-typescale-body-medium">

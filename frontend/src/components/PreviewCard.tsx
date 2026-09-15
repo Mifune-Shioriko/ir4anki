@@ -4,7 +4,7 @@ import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
 import { KATEX_OPTS, textWithMath } from '../lib/math'
-import { IconAdd, IconDelete } from './icons'
+import { IconAdd, IconDelete, IconEdit, IconUndo } from './icons'
 
 // Preview card (先看后考, 2026-09-07 redesign): the question shows first and
 // the answer stays HIDDEN until the user reveals it — a low-stakes retrieval
@@ -77,18 +77,10 @@ export const PreviewCard: Component<Props> = (props) => {
                 disabled={!props.undoEnabled || props.undoBusy || props.busy}
                 onClick={() => props.onUndo()}
               >
-                <md-icon>
-                  <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-                    <path d="M12.5 8c-2.65 0-5.05.99-6.9 2.6L2 7v9h9l-3.62-3.62c1.39-1.16 3.16-1.88 5.12-1.88 3.54 0 6.55 2.31 7.6 5.5l2.37-.78C21.08 11.03 17.15 8 12.5 8z" />
-                  </svg>
-                </md-icon>
+                <md-icon><IconUndo /></md-icon>
               </md-icon-button>
               <md-icon-button aria-label="编辑卡片" onClick={() => props.onEdit()}>
-                <md-icon>
-                  <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-                    <path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 000-1.41l-2.34-2.34a1 1 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z" />
-                  </svg>
-                </md-icon>
+                <md-icon><IconEdit /></md-icon>
               </md-icon-button>
               <div class="header-actions-sep" aria-hidden="true" />
               <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>

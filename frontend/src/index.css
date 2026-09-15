@@ -11,6 +11,16 @@
 :root {
   --content-max-width: 680px;
   --content-padding: 24px;
+  /* MD3 baseline shape scale (tokens.css only carries the color scheme; the
+   * shape sys-tokens are the official MD3 values, needed by .mode-tile &
+   * friends which reference them WITHOUT fallbacks) */
+  --md-sys-shape-corner-none: 0px;
+  --md-sys-shape-corner-extra-small: 4px;
+  --md-sys-shape-corner-small: 8px;
+  --md-sys-shape-corner-medium: 12px;
+  --md-sys-shape-corner-large: 16px;
+  --md-sys-shape-corner-extra-large: 28px;
+  --md-sys-shape-corner-full: 9999px;
 }
 
 /* Reset. NEVER apply margin/padding resets to md-* custom elements: their
@@ -476,8 +486,9 @@ body {
 }
 
 .mode-tile__icon {
-  font-size: 18px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  color: var(--md-sys-color-primary);
 }
 
 .mode-tile__name {
@@ -526,6 +537,53 @@ body {
 
 .modes-label {
   color: var(--md-sys-color-on-surface-variant);
+}
+
+/* ---- MD3 snackbar (spec: m3.material.io/components/snackbar) ----
+ * @material/web ships no snackbar component; styled with sys tokens only.
+ * Container: inverse-surface, single-line, extra-small shape (4px),
+ * elevation 3 (raised above content). Action = inverse-primary text button. */
+.snackbar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: min(320px, calc(100vw - 32px));
+  max-width: min(560px, calc(100vw - 32px));
+  padding: 0 8px 0 16px;
+  min-height: 48px;
+  background: var(--md-sys-color-inverse-surface);
+  color: var(--md-sys-color-inverse-on-surface);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  box-shadow:
+    0 1px 3px 1px rgba(0, 0, 0, 0.15),
+    0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  animation: snackbar-in 0.25s cubic-bezier(0.2, 0, 0, 1);
+}
+
+@keyframes snackbar-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+.snackbar__label {
+  flex: 1;
+  padding: 14px 0;
+}
+
+.snackbar__action {
+  --md-text-button-label-text-color: var(--md-sys-color-inverse-primary);
+  flex-shrink: 0;
 }
 
 /* ---- loading ---- */

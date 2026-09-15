@@ -16,6 +16,17 @@ const P_Functions = ['M18 4H6v2l6.5 6L6 18v2h12v-3h-7l5-5-5-5h7V4z']
 const P_Add = ['M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z']
 const P_Delete = ['M280-120q-33 0-56.5-23.5T200-200v-520h-40v-80h200v-40h240v40h200v80h-40v520q0 33-23.5 56.5T680-120H280Zm400-600H280v520h400v-520ZM360-280h80v-360h-80v360Zm160 0h80v-360h-80v360ZM280-720v520-520Z']
 const P_RestartAlt = ['M440-122q-121-15-200.5-105.5T160-440q0-66 26-126.5T260-672l57 57q-38 34-57.5 79T240-440q0 88 56 155.5T440-202v80Zm80 0v-80q87-16 143.5-83T720-440q0-100-70-170t-170-70h-3l44 44-56 56-140-140 140-140 56 56-44 44h3q134 0 227 93t93 227q0 121-79.5 211.5T520-122Z']
+// MD3 audit (2026-09-16): official Material Symbols outlined paths for the
+// pacing-mode tiles (bolt = 快速, track_changes = 专注 — a literal target) and
+// the selected-tile indicator (check_circle). Fetched verbatim from the
+// @material-symbols/svg-400 package, replacing the former emoji icons.
+const P_Bolt = ['m393-165 279-335H492l36-286-253 366h154l-36 255Zm-73 85 40-280H160l360-520h80l-40 320h240L400-80h-80Zm154-396Z']
+const P_TrackChanges = ['M324-111.5Q251-143 197-197t-85.5-127Q80-397 80-480t31.5-156Q143-709 197-763t127-85.5Q397-880 480-880h30v326q22 9 36 29t14 45q0 33-23.5 56.5T480-400q-33 0-56.5-23.5T400-480q0-25 14-45t36-29v-104q-65 11-107.5 60.5T300-480q0 75 52.5 127.5T480-300q75 0 127.5-52.5T660-480q0-41-16-75t-44-59l43-43q35 33 56 78.5t21 98.5q0 100-70 170t-170 70q-100 0-170-70t-70-170q0-93 60-160.5T450-719v-100q-131 11-220.5 108T140-480q0 142 99 241t241 99q142 0 241-99t99-241q0-74-28.5-137T713-727l43-43q57 55 90.5 129.5T880-480q0 83-31.5 156T763-197q-54 54-127 85.5T480-80q-83 0-156-31.5Z']
+const P_CheckCircle = ['m421-298 283-283-46-45-237 237-120-120-45 45 165 166Zm59 218q-82 0-155-31.5t-127.5-86Q143-252 111.5-325T80-480q0-83 31.5-156t86-127Q252-817 325-848.5T480-880q83 0 156 31.5T763-763q54 54 85.5 127T880-480q0 82-31.5 155T763-197.5q-54 54.5-127 86T480-80Zm0-60q142 0 241-99.5T820-480q0-142-99-241t-241-99q-141 0-240.5 99T140-480q0 141 99.5 240.5T480-140Zm0-340Z']
+// undo / edit — official Material Symbols outlined, replacing the legacy
+// hand-drawn 24px Material Icons paths (MD3 audit 2026-09-16)
+const P_Undo = ['M259-200v-60h310q70 0 120.5-46.5T740-422q0-69-50.5-115.5T569-584H274l114 114-42 42-186-186 186-186 42 42-114 114h294q95 0 163.5 64T800-422q0 94-68.5 158T568-200H259Z']
+const P_Edit = ['M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z']
 
 export interface IconProps { size?: number }
 
@@ -43,3 +54,8 @@ export const IconFunctions = (props: IconProps) => <Svg paths={P_Functions} view
 export const IconAdd = (props: IconProps) => <Svg paths={P_Add} {...props} />
 export const IconDelete = (props: IconProps) => <Svg paths={P_Delete} {...props} />
 export const IconRestartAlt = (props: IconProps) => <Svg paths={P_RestartAlt} {...props} />
+export const IconBolt = (props: IconProps) => <Svg paths={P_Bolt} {...props} />
+export const IconTrackChanges = (props: IconProps) => <Svg paths={P_TrackChanges} {...props} />
+export const IconCheckCircle = (props: IconProps) => <Svg paths={P_CheckCircle} {...props} />
+export const IconUndo = (props: IconProps) => <Svg paths={P_Undo} {...props} />
+export const IconEdit = (props: IconProps) => <Svg paths={P_Edit} {...props} />

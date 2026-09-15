@@ -134,12 +134,18 @@ export interface AnswerResponse {
   round: RoundInfo | null
   /** present when answered=false: 'stale' = card no longer in this round */
   reason?: string
+  /** double-Again auto-return (2026-09-16): a NEW card graded Again twice in
+   * its first learning cycle was moved back to the preview pool */
+  returned_to_preview?: { cardId: number; pool: number | null } | null
 }
 
 export interface UndoResponse {
   restored: boolean
   card: Card
   index: number
+  /** set when the undone answer had auto-returned the card to the preview
+   * pool (2026-09-16) — the card was moved back out, pool is the new size */
+  returned_from_preview?: { cardId: number; pool: number | null } | null
 }
 
 export interface NoteResponse {
