@@ -169,6 +169,24 @@ export interface NoteResponse {
   tags: string[]
 }
 
+/** One retrieved note section for the right-hand note panel (notes-rag
+ * :8791 via /api/note/sections). line_start is the 1-based source line of
+ * the section's heading — the panel scrolls+flashes [data-src-line] there. */
+export interface NoteSection {
+  file: string
+  title: string
+  heading_path: string[]
+  line_start: number
+  line_end: number
+  year: number | null
+  score: number
+  snippet: string
+}
+
+export interface NoteSectionsResponse {
+  sections: NoteSection[]
+}
+
 export interface NoteUpdateResponse {
   updated: boolean
   question: string

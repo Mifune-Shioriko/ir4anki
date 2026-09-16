@@ -2,6 +2,7 @@ import type {
   AnswerResponse,
   MoreResponse,
   NoteResponse,
+  NoteSectionsResponse,
   NoteUpdateResponse,
   PreviewActResponse,
   PreviewStartResponse,
@@ -52,6 +53,10 @@ export const api = {
   undo: () => post<UndoResponse>('/api/undo'),
   note: (cardId: number) => get<NoteResponse>(`/api/note?card_id=${cardId}`),
   tags: () => get<{ tags: string[] }>('/api/tags'),
+  noteSections: (noteId: number, topK = 3) =>
+    get<NoteSectionsResponse>(`/api/note/sections?note_id=${noteId}&top_k=${topK}`),
+  notesRaw: (path: string) =>
+    get<{ path: string; text: string }>(`/api/notes/raw?path=${encodeURIComponent(path)}`),
   updateNote: (cardId: number, fields: Record<string, string>, tags: string[]) =>
     post<NoteUpdateResponse>('/api/note/update', { card_id: cardId, fields, tags }),
   previewStart: (mode?: string) =>

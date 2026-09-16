@@ -18,8 +18,15 @@ import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
 import { PreviewScreen } from './components/PreviewScreen'
 import { PreviewDoneScreen } from './components/PreviewDoneScreen'
+import { NotePanel } from './components/NotePanel'
 import { Snackbar } from './components/Snackbar'
 import type { StudyModes } from './types'
+
+// The note panel (知识成体系 Phase 1) only makes sense on a wide screen —
+// the user reviews from phone AND desktop, and on a phone the second column
+// would crush the card. A matchMedia signal (not CSS alone) also stops the
+// sections fetch from firing on narrow viewports.
+const WIDE_QUERY = '(min-width: 1180px)'
 
 // Pacing-mode persistence (2026-09-14): the last tier the user picked is
 // remembered across page loads, so the habitual case is one tap ("开始").
@@ -53,6 +60,13 @@ type Phase =
 
 export const App: Component = () => {
   createEffect(() => syncThemeColor())
+
+  // ---- wide-screen detection (note panel gate) ----
+  const mq = window.matchMedia(WIDE_QUERY)
+  const [isWide, setIsWide] = createSignal(mq.matches)
+  const onMq = (e: MediaQueryListEvent) => setIsWide(e.matches)
+  onMount(() => mq.addEventListener('change', onMq))
+  onCleanup(() => mq.removeEventListener('change', onMq))
 
   // ---- phase & loading text ----
   const [phase, setPhase] = createSignal<Phase>('loading')
@@ -738,10 +752,15 @@ export const App: Component = () => {
 
   const currentCard = () => cards()[idx()]
 
+  // the card the note panel tracks: the review card in a review round, the
+  // pool card during preview (先看后考 is exactly when source context helps)
+  const noteCard = () => (phase() === 'preview' ? previewCard() : currentCard())
+
   return (
     <div class="app">
       <TopAppBar />
 
+      <div class="columns">
       <div class="content">
         <Show when={phase() === 'loading'}>
           <Loading
@@ -895,6 +914,18 @@ export const App: Component = () => {
           <FinishedScreen count={totalDone()} preview={finishedPreview()} />
         </Show>
       </div>
+
+      {/* right-hand note panel (知识成体系 Phase 1): wide screens only, and
+          only while a card is actually on screen (review or preview round) */}
+      <Show when={isWide()}>
+        <div class="note-column">
+          <NotePanel
+            noteId={noteCard()?.noteId}
+            cardKey={noteCard()?.cardId ?? null}
+          />
+        </div>
+      </Show>
+      </div>{/* /columns */}
 
       <Show when={editOpen() && currentCard()}>
         <EditDialog

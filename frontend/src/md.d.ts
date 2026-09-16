@@ -33,6 +33,10 @@ declare module 'solid-js' {
       // switch
       'md-switch': any
 
+      // tabs
+      'md-tabs': any
+      'md-primary-tab': any
+
       // text field
       'md-outlined-text-field': any
     }

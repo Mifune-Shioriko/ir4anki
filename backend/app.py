@@ -58,6 +58,7 @@ ANKICONNECT = os.getenv("ANKICONNECT_URL", "http://127.0.0.1:8765")
 ANKI_RAG = os.getenv("ANKI_RAG_URL", "http://127.0.0.1:8789")
 ANKI_EXPLAIN = os.getenv("ANKI_EXPLAIN_URL", "http://127.0.0.1:8788")
 ANKI_PRIOR = os.getenv("ANKI_PRIOR_URL", "http://127.0.0.1:8790")
+NOTES_RAG = os.getenv("NOTES_RAG_URL", "http://127.0.0.1:8791")
 
 # Anki collection.media directory (served back at /media/<name>)
 MEDIA_DIR = Path(os.getenv("ANKI_MEDIA_DIR", str(_REPO_ROOT / "collection.media")))
@@ -462,6 +463,31 @@ async def fetch_prior_knowledge(note_id: int | None) -> list[str]:
             d = r.json()
             items = d.get("prior_knowledge", []) if d.get("found") else []
             return items if isinstance(items, list) else []
+    except Exception:
+        return []
+
+
+async def fetch_note_sections(note_id: int | None, top_k: int = 3) -> list[dict]:
+    """Ask notes-rag (:8791) for the note sections this card came from.
+
+    The right-hand note panel (Phase 1 of the 知识成体系 project) renders
+    the top-1 as a "page" with the rest switchable as tabs. Fail-soft like
+    the other enrichment calls: notes-rag down / card not embedded / note
+    gone → [] and the panel simply doesn't render. Timeout is generous
+    (6s) because notes-rag embeds on cache miss (one DashScope call) for
+    cards added after the last sync — a normal review must never wait on
+    that, so the frontend must treat this as async enrichment.
+    """
+    if not note_id:
+        return []
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            r = await client.get(
+                f"{NOTES_RAG}/search", params={"note_id": note_id, "top_k": top_k}
+            )
+            r.raise_for_status()
+            results = r.json().get("results", [])
+            return results if isinstance(results, list) else []
     except Exception:
         return []
 
@@ -1890,6 +1916,41 @@ async def media_upload(file: UploadFile = File(...)):
 async def list_tags():
     """All tags in the collection, for autocomplete in the edit dialog."""
     return {"tags": await anki("getTags") or []}
+
+
+# ---- note panel (知识成体系 Phase 1: card → source note sections) ----------
+
+@app.get("/api/note/sections")
+async def note_sections(note_id: int, top_k: int = 3):
+    """Top-k note sections for a card, via notes-rag (:8791).
+
+    The frontend fetches this LAZILY per current card (not bundled into
+    fetch_cards): a review round shouldn't wait on note retrieval, and only
+    the card on screen needs its note. notes-rag embeds on cache miss, so
+    the first lookup of a fresh card can take a few seconds.
+    """
+    sections = await fetch_note_sections(note_id, top_k)
+    return {"sections": sections}
+
+
+@app.get("/api/notes/raw")
+async def notes_raw(path: str):
+    """Raw markdown of one note file, relayed from notes-rag (traversal-safe
+    there — it only ever reads under ~/anki-notes)."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(f"{NOTES_RAG}/file", params={"path": path})
+            if r.status_code == 404:
+                raise HTTPException(status_code=404, detail="note file not found")
+            if 400 <= r.status_code < 500:
+                # traversal / bad path — propagate as 400, never serve content
+                raise HTTPException(status_code=400, detail="invalid note path")
+            r.raise_for_status()
+            return r.json()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"notes-rag unreachable: {e}")
 
 
 @app.get("/media/{name:path}")
