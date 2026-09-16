@@ -49,8 +49,9 @@ async def main():
         st = (await c.get("/api/status")).json()
         check("status anki ok", st.get("anki") == "ok", st)
         modes = st.get("study_modes") or {}
-        check("quick = 1+1+4", modes.get("quick") == {"preview": 1, "new": 1, "review": 4}, modes)
-        check("focus = 5+5+20", modes.get("focus") == {"preview": 5, "new": 5, "review": 20}, modes)
+        check("quick = 5+5+20", modes.get("quick") == {"preview": 5, "new": 5, "review": 20}, modes)
+        check("focus = 10+10+30", modes.get("focus") == {"preview": 10, "new": 10, "review": 30}, modes)
+        check("release_daily_goal = 40", st.get("release_daily_goal") == 40, st.get("release_daily_goal"))
         check("default_mode = quick", st.get("default_mode") == "quick")
         check("status still has preview_mode", st.get("preview_mode") is True)
 
@@ -66,16 +67,16 @@ async def main():
         n_new = sum(1 for x in r["cards"] if x["isNew"])
         n_rev = len(r["cards"]) - n_new
         check("response mode=focus", r.get("mode") == "focus", r.get("mode"))
-        check("new_per_round=5 on wire", r.get("new_per_round") == 5, r.get("new_per_round"))
-        check("reviews <= 20", n_rev <= 20, n_rev)
-        check("new <= 5", n_new <= 5, n_new)
+        check("new_per_round=10 on wire", r.get("new_per_round") == 10, r.get("new_per_round"))
+        check("reviews <= 30", n_rev <= 30, n_rev)
+        check("new <= 10", n_new <= 10, n_new)
         check("batch non-empty", len(r["cards"]) > 0)
         if r["cards"]:
-            # focus batch should normally exceed a quick batch (5 reviews
-            # alone beat quick's whole 4+1) unless the due pool is tiny
+            # focus review size is 30; expect the full draw unless the due
+            # pool is smaller
             due_pool = st["due_review"]
-            expect_min = min(20, due_pool)
-            check("review count respects mode (>= min(20,due_pool) or pool drained)",
+            expect_min = min(30, due_pool)
+            check("review count respects mode (>= min(30,due_pool) or pool drained)",
                   n_rev >= expect_min or due_pool < 5, f"n_rev={n_rev} due_pool={due_pool}")
         rd = json.loads((Path(STATE) / "round.json").read_text())
         check("round.json stores mode", rd.get("mode") == "focus", rd.get("mode"))
@@ -95,7 +96,7 @@ async def main():
         r3 = (await c.post("/api/session/more")).json()
         check("more keeps mode=focus", r3.get("mode") == "focus", r3.get("mode"))
         n_new3 = sum(1 for x in r3["cards"] if x["isNew"])
-        check("more draws up to 5 new", n_new3 <= 5, n_new3)
+        check("more draws up to 10 new", n_new3 <= 10, n_new3)
         await c.post("/api/session/finish")
 
         print("== start default (no mode) = quick ==")
@@ -103,8 +104,8 @@ async def main():
         n_new4 = sum(1 for x in r4["cards"] if x["isNew"])
         n_rev4 = len(r4["cards"]) - n_new4
         check("default mode=quick", r4.get("mode") == "quick", r4.get("mode"))
-        check("quick reviews <= 4", n_rev4 <= 4, n_rev4)
-        check("quick new <= 1", n_new4 <= 1, n_new4)
+        check("quick reviews <= 20", n_rev4 <= 20, n_rev4)
+        check("quick new <= 5", n_new4 <= 5, n_new4)
         await c.post("/api/session/finish")
 
         print("== invalid mode falls back to quick ==")
@@ -112,20 +113,20 @@ async def main():
         check("bogus -> quick", r5.get("mode") == "quick", r5.get("mode"))
         await c.post("/api/session/finish")
 
-        print("== preview/start?mode=focus deals up to 5 pool cards ==")
+        print("== preview/start?mode=focus deals up to 10 pool cards ==")
         pool = st.get("preview_pool") or 0
         p = (await c.post("/api/preview/start?mode=focus")).json()
-        if pool >= 5:
-            check("focus preview deals 5", len(p["cards"]) == 5, len(p["cards"]))
+        if pool >= 10:
+            check("focus preview deals 10", len(p["cards"]) == 10, len(p["cards"]))
         else:
-            check(f"preview deals min(5,pool={pool})", len(p["cards"]) == min(5, pool), len(p["cards"]))
+            check(f"preview deals min(10,pool={pool})", len(p["cards"]) == min(10, pool), len(p["cards"]))
         check("preview response mode=focus", p.get("mode") == "focus", p.get("mode"))
-        check("preview_per_round=5 on wire", p.get("preview_per_round") == 5, p.get("preview_per_round"))
+        check("preview_per_round=10 on wire", p.get("preview_per_round") == 10, p.get("preview_per_round"))
         prd = json.loads((Path(STATE) / "preview.json").read_text())
         check("preview.json stores mode", prd.get("mode") == "focus", prd.get("mode"))
         # state must expose the active round's per-round + mode
         s6 = (await c.get("/api/session/state")).json()
-        check("state preview_per_round=5 (active round)", s6.get("preview_per_round") == 5,
+        check("state preview_per_round=10 (active round)", s6.get("preview_per_round") == 10,
               s6.get("preview_per_round"))
         check("state preview_round.mode=focus",
               (s6.get("preview_round") or {}).get("mode") == "focus")
@@ -139,10 +140,12 @@ async def main():
         else:
             check("preview round cleared", False)
 
-        print("== preview/start default = quick (1 card) ==")
+        print("== preview/start default = quick (5 cards) ==")
         p2 = (await c.post("/api/preview/start")).json()
-        if pool >= 1:
-            check("quick preview deals 1", len(p2["cards"]) == 1, len(p2["cards"]))
+        if pool >= 5:
+            check("quick preview deals 5", len(p2["cards"]) == 5, len(p2["cards"]))
+        else:
+            check(f"quick preview deals min(5,pool={pool})", len(p2["cards"]) == min(5, pool), len(p2["cards"]))
         check("preview default mode=quick", p2.get("mode") == "quick", p2.get("mode"))
         await c.post("/api/preview/finish")
 

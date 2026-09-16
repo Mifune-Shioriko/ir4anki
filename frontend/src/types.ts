@@ -35,9 +35,9 @@ export interface RoundInfo {
   mode?: string
 }
 
-/** Pacing-mode table from the backend (user spec 2026-09-14):
- * quick = 碎片时间 (1 preview + 1 new + 4 review),
- * focus = 整块时间 (5 preview + 5 new + 20 review).
+/** Pacing-mode table from the backend (user spec 2026-09-14, retuned
+ * 2026-09-16): quick = 碎片时间 (5 preview + 5 new + 20 review),
+ * focus = 整块时间 (10 preview + 10 new + 30 review).
  * Sizes ALWAYS come from the wire — never hardcode them in UI copy. */
 export interface StudyModeSizes {
   preview: number
@@ -82,6 +82,8 @@ export interface PreviewExtras {
   /** cards approved TODAY, still suspended — released into the study queue
    * tomorrow (next-day release, 2026-09-07) */
   pending_release?: number | null
+  /** daily 放行 goal for the preview-start progress bar (2026-09-16) */
+  release_daily_goal?: number | null
   /** pacing-mode table + default (2026-09-14) — the start screens render
    * the quick/focus choice from these, never hardcoded numbers */
   study_modes?: StudyModes

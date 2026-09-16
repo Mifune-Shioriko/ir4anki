@@ -90,7 +90,7 @@ export const App: Component = () => {
   const [newTotal, setNewTotal] = createSignal<number | null>(null)
 
   // ---- pacing mode (two tiers, user spec 2026-09-14) ----
-  // studyModes = the backend's size table (quick 1+1+4 / focus 5+5+20),
+  // studyModes = the backend's size table (quick 5+5+20 / focus 10+10+30),
   // selectedMode = the start-screen selection. Seeded from localStorage so
   // the habitual tier is pre-selected; validated against the wire table on
   // every resync (an unknown stored value falls back to default_mode).
@@ -167,6 +167,10 @@ export const App: Component = () => {
   // cards approved TODAY (suspended, released tomorrow) — shown in the wire
   // payload so the UI can explain why approved cards aren't gradeable yet
   const [pendingRelease, setPendingRelease] = createSignal<number | null>(null)
+  // daily 放行 goal (2026-09-16) — the preview start screen draws a
+  // horizontal progress bar of pendingRelease / goal; null hides the bar
+  // (old backend without the field degrades gracefully)
+  const [releaseDailyGoal, setReleaseDailyGoal] = createSignal<number | null>(null)
   // preview-only exit stats (2026-09-06): when the user finishes straight
   // from preview (mid-round or after the done screen), the finished screen
   // shows THESE instead of the review count (which would be a stale/misleading
@@ -241,6 +245,7 @@ export const App: Component = () => {
         setPreviewAvailable(d.preview_available ?? null)
         if (d.preview_per_round != null) setPreviewPerRound(d.preview_per_round)
         setPendingRelease(d.pending_release ?? null)
+        setReleaseDailyGoal(d.release_daily_goal ?? null)
       }
       if (d.state === 'active') {
         // a normal review round in progress always wins — finish it first
@@ -736,6 +741,7 @@ export const App: Component = () => {
             available={previewAvailable()}
             due={due()}
             pendingRelease={pendingRelease()}
+            releaseDailyGoal={releaseDailyGoal()}
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}

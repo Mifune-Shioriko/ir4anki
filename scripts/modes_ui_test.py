@@ -68,8 +68,8 @@ def main():
         check("tile 2 = 专注", "专注" in focus_tile.inner_text())
         qt = quick_tile.inner_text()
         ft = focus_tile.inner_text()
-        check("quick shows 1/1/4", all(x in qt for x in ["预览 1", "新卡 1", "复习 4"]), qt)
-        check("focus shows 5/5/20", all(x in ft for x in ["预览 5", "新卡 5", "复习 20"]), ft)
+        check("quick shows 5/5/20", all(x in qt for x in ["预览 5", "新卡 5", "复习 20"]), qt)
+        check("focus shows 10/10/30", all(x in ft for x in ["预览 10", "新卡 10", "复习 30"]), ft)
         check("quick time estimate present", "分钟" in qt, qt)
         check("focus time estimate present", "分钟" in ft, ft)
 
@@ -99,15 +99,24 @@ def main():
             # previewStart screen also carries the selector
             check("preview start screen has mode selector",
                   page.locator(".mode-tile").count() == 2)
-            # start a focus preview round → 5 cards (pool is large)
+            # daily 放行 progress bar (2026-09-16): between the explainer
+            # copy and the mode selector, goal 40 from the wire
+            bar = page.locator(".release-progress")
+            check("release progress bar rendered", bar.count() == 1, bar.count())
+            if bar.count() == 1:
+                cnt = page.locator(".release-progress__count").inner_text()
+                check("release goal = 40 on wire text", "/ 40 张" in cnt, cnt)
+                check("release bar has md-linear-progress",
+                      page.locator(".release-progress md-linear-progress").count() == 1)
+            # start a focus preview round → up to 10 cards
             page.locator("md-filled-button").first.click()
             page.wait_for_selector(".preview-card, .pv-card, md-elevated-card", timeout=120000)
             page.wait_for_timeout(1500)
             s = api("/api/session/state")
             pr = s.get("preview_round") or {}
             check("preview round active with mode=focus", pr.get("mode") == "focus", pr)
-            check("preview round total=5", pr.get("total") == 5, pr.get("total"))
-            check("wire preview_per_round=5", s.get("preview_per_round") == 5, s.get("preview_per_round"))
+            check("preview round total <= 10", (pr.get("total") or 0) <= 10, pr.get("total"))
+            check("wire preview_per_round=10", s.get("preview_per_round") == 10, s.get("preview_per_round"))
             page.screenshot(path="/tmp/modes-ui-preview.png")
             # teardown: finish WITHOUT acting (net-zero)
             api("/api/preview/finish", "POST")
@@ -117,7 +126,7 @@ def main():
             page.wait_for_timeout(3000)
             s = api("/api/session/state")
             check("review round active with mode=focus", s.get("mode") == "focus", s.get("mode"))
-            check("focus batch > quick max (6)", (s.get("total") or 0) > 6 or (st.get("due_review", 0) + st.get("new_total", 0)) <= 6, s.get("total"))
+            check("focus batch > quick max (25)", (s.get("total") or 0) > 25 or (st.get("due_review", 0) + st.get("new_total", 0)) <= 25, s.get("total"))
             page.screenshot(path="/tmp/modes-ui-review.png")
             api("/api/session/finish", "POST")
 
@@ -133,7 +142,7 @@ def main():
             s2 = api("/api/session/state")
             if s2.get("state") == "active":
                 check("quick round mode", s2.get("mode") == "quick", s2.get("mode"))
-                check("quick batch <= 5", (s2.get("total") or 0) <= 5, s2.get("total"))
+                check("quick batch <= 25", (s2.get("total") or 0) <= 25, s2.get("total"))
                 api("/api/session/finish", "POST")
         else:
             page.locator("md-filled-button").first.click()
@@ -141,7 +150,7 @@ def main():
             s2 = api("/api/session/state")
             pr2 = s2.get("preview_round") or {}
             if pr2:
-                check("quick preview total=1", pr2.get("total") == 1, pr2.get("total"))
+                check("quick preview total <= 5", (pr2.get("total") or 0) <= 5, pr2.get("total"))
                 check("quick preview mode", pr2.get("mode") == "quick", pr2.get("mode"))
             api("/api/preview/finish", "POST")
 

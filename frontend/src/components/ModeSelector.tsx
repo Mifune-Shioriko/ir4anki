@@ -2,10 +2,10 @@ import { Component, For, JSX } from 'solid-js'
 import type { StudyModes } from '../types'
 import { IconBolt, IconCheckCircle, IconTrackChanges } from './icons'
 
-// Two-tier pacing selector (user spec 2026-09-14).
-//   quick = 碎片时间 (canteen queue): the tiny 1 preview + 1 new + 4 review
-//           rhythm, meant to be opened many times a day.
-//   focus = 整块时间 (a free block): exactly 5× quick — 5 + 5 + 20.
+// Two-tier pacing selector (user spec 2026-09-14, sizes retuned 2026-09-16).
+//   quick = 碎片时间 (canteen queue): 5 preview + 5 new + 20 review,
+//           meant to be opened many times a day.
+//   focus = 整块时间 (a free block): 10 + 10 + 30, roughly 2× quick.
 // The CARD SIZES come from the backend wire (`study_modes`), never
 // hardcoded here; this component only attaches the display copy (icon,
 // name, blurb) and derives a rough time estimate from the total card count.

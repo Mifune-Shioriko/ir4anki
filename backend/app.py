@@ -1,9 +1,10 @@
 """Anki review web app — backend (v2).
 
 Session model:
-  - TWO PACING MODES (user spec 2026-09-14): "quick" = 1 preview + 1 new +
-    4 review (碎片时间, a few minutes — the 短视频式 rhythm of 2026-09-06),
-    "focus" = 5 preview + 5 new + 20 review (整块时间, exactly 5× quick).
+  - TWO PACING MODES (user spec 2026-09-14, sizes retuned 2026-09-16):
+    "quick" = 5 preview + 5 new + 20 review (碎片时间, a few minutes — the
+    短视频式 rhythm of 2026-09-06), "focus" = 10 preview + 10 new + 30
+    review (整块时间, roughly 2× quick).
     The mode is chosen per round at start and travels with round.json /
     preview.json so a page refresh resumes the SAME mode. 'more' inherits
     the mode of the round that just completed. Numbers are overridable via
@@ -69,10 +70,10 @@ ROUND_FILE = STATE_DIR / "round.json"
 
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
-# ---- two pacing modes (user spec 2026-09-14) ----
-# quick = 碎片时间 (queue at the canteen): the tiny 1+1+4 rhythm, meant to
+# ---- two pacing modes (user spec 2026-09-14, sizes retuned 2026-09-16) ----
+# quick = 碎片时间 (queue at the canteen): the 5+5+20 rhythm, meant to
 #         be opened many times a day.
-# focus = 整块时间 (a free afternoon block): exactly 5× the quick round.
+# focus = 整块时间 (a free afternoon block): 10+10+30, roughly 2× quick.
 # The mode is picked per round on the start screen and PERSISTS in
 # round.json / preview.json (page refresh resumes the same mode); 'more'
 # inherits the completed round's mode. All numbers env-overridable.
@@ -84,17 +85,23 @@ def _env_int(name: str, default: int) -> int:
 
 STUDY_MODES: dict[str, dict[str, int]] = {
     "quick": {
-        "preview": _env_int("ANKI_QUICK_PREVIEW", 1),
-        "new": _env_int("ANKI_QUICK_NEW", 1),
-        "review": _env_int("ANKI_QUICK_REVIEW", 4),
+        "preview": _env_int("ANKI_QUICK_PREVIEW", 5),
+        "new": _env_int("ANKI_QUICK_NEW", 5),
+        "review": _env_int("ANKI_QUICK_REVIEW", 20),
     },
     "focus": {
-        "preview": _env_int("ANKI_FOCUS_PREVIEW", 5),
-        "new": _env_int("ANKI_FOCUS_NEW", 5),
-        "review": _env_int("ANKI_FOCUS_REVIEW", 20),
+        "preview": _env_int("ANKI_FOCUS_PREVIEW", 10),
+        "new": _env_int("ANKI_FOCUS_NEW", 10),
+        "review": _env_int("ANKI_FOCUS_REVIEW", 30),
     },
 }
 DEFAULT_MODE = "quick"
+
+# Daily goal for new-card releases (放行) shown as a horizontal progress bar
+# on the preview start screen (user spec 2026-09-16). Tracks the same number
+# as the wire field `pending_release` (cards approved TODAY, still suspended,
+# released tomorrow). Bar fills at the goal; env-overridable.
+RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 40)
 
 def study_mode(name: str | None) -> str:
     """Validate/normalize a mode name; falls back to the default."""
@@ -515,6 +522,8 @@ async def status():
             # the start-screen choice from this table, never hardcoded
             "study_modes": STUDY_MODES,
             "default_mode": DEFAULT_MODE,
+            # daily 放行 goal for the preview-start progress bar (2026-09-16)
+            "release_daily_goal": RELEASE_DAILY_GOAL,
         }
         if PREVIEW_MODE:
             out["preview_pool"] = len(await preview_pool_ids() or [])
@@ -528,8 +537,8 @@ async def start_session(mode: str | None = None):
     """Deal under _state_lock; the (potentially slow) sync runs outside it
     so other devices' state polls are never blocked for minutes.
 
-    `mode` picks the pacing (quick = 碎片时间 1+1+4, focus = 整块时间
-    5+5+20); unknown/absent falls back to DEFAULT_MODE."""
+    `mode` picks the pacing (quick = 碎片时间 5+5+20, focus = 整块时间
+    10+10+30); unknown/absent falls back to DEFAULT_MODE."""
     synced = await do_sync()  # do_sync acquires _sync_lock itself
     async with _state_lock:
         return await _start_session_impl(synced, study_mode(mode))
@@ -600,6 +609,9 @@ async def _session_state_impl():
         # renders the quick/focus choice from this, never hardcoded numbers
         "study_modes": STUDY_MODES,
         "default_mode": DEFAULT_MODE,
+        # daily 放行 goal for the preview-start progress bar (2026-09-16);
+        # the bar tracks pending_release below against this goal
+        "release_daily_goal": RELEASE_DAILY_GOAL,
     }
     if PREVIEW_MODE:
         # batch size of the ACTIVE preview round (mode-dependent since

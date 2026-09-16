@@ -390,6 +390,37 @@ body {
   font-weight: 500;
 }
 
+/* ---- daily 放行 progress bar (preview start screen, 2026-09-16) ----
+ * Horizontal bar tracking pending_release / release_daily_goal — the same
+ * number the 「今天已放行（明天开考）」 stat row shows. Sits between the
+ * explainer copy and the mode selector. */
+.release-progress {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.release-progress__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.release-progress__count {
+  color: var(--md-sys-color-primary);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.release-progress__bar {
+  width: 100%;
+  --md-linear-progress-track-height: 8px;
+  --md-linear-progress-active-indicator-height: 8px;
+  --md-linear-progress-track-shape: var(--md-sys-shape-corner-full, 9999px);
+}
+
 .screen-stats {
   width: 100%;
   display: flex;
