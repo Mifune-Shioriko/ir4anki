@@ -97,10 +97,16 @@ STUDY_MODES: dict[str, dict[str, int]] = {
 }
 DEFAULT_MODE = "quick"
 
-# Daily goal for new-card releases (放行) shown as a horizontal progress bar
-# on the preview start screen (user spec 2026-09-16). Tracks the same number
-# as the wire field `pending_release` (cards approved TODAY, still suspended,
-# released tomorrow). Bar fills at the goal; env-overridable.
+# Daily goal for new-card releases (放行) — progress bar on the preview
+# start screen (user spec 2026-09-16) AND a hard cap on preview dealing
+# (user spec 2026-09-16, second iteration): round sizes of 5/10 would
+# otherwise overshoot the goal (43, 48…), so once the remaining budget
+# drops below the biggest preview size, EVERY mode deals exactly what's
+# left, and at 0 the day's previews are done. Tracks the same number as
+# the wire field `pending_release` (cards approved TODAY, still suspended,
+# released tomorrow) — cap and bar can never disagree. Deferred cards
+# (明天再看) do NOT consume the budget; undoing an approval gives it back.
+# <=0 disables both the bar and the cap. Env-overridable.
 RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 40)
 
 def study_mode(name: str | None) -> str:
@@ -154,15 +160,50 @@ NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
 
 
 def _active_preview_per_round() -> int | None:
-    """Batch size of the ACTIVE preview round, derived from its stored mode.
+    """Batch size of the ACTIVE preview round.
 
+    The round's own `total` is authoritative: it already carries whatever
+    cap applied when it was dealt (release budget, small pool). Falls back
+    to the stored mode's size for legacy rounds without a total.
     None when there is no active preview round — the frontend then renders
     sizes from study_modes[selected] on the start screens instead.
     """
     prd = _preview_read()
     if prd is not None and prd.get("status") == "active" and prd.get("pending"):
+        total = prd.get("total")
+        if isinstance(total, int) and total > 0:
+            return total
         return STUDY_MODES[study_mode(prd.get("mode"))]["preview"]
     return None
+
+
+def _capped_study_modes(budget: int | None) -> dict[str, dict[str, int]]:
+    """STUDY_MODES with each tier's `preview` size adapted to the remaining
+    daily release budget (user spec 2026-09-16).
+
+    budget=None (goal disabled) → the raw table unchanged. While the budget
+    is at least the biggest preview size every tier deals its normal size;
+    once it drops below (e.g. 34 released of 40 → 6 left), EVERY tier deals
+    exactly what's left — one round lands the goal instead of dragging it
+    across several quick rounds. The frontend renders sizes from this table
+    only, so the rule lives in exactly one place.
+    """
+    if budget is None:
+        return STUDY_MODES
+    max_preview = max(m["preview"] for m in STUDY_MODES.values())
+    return {
+        name: {
+            **sizes,
+            "preview": budget if budget < max_preview else min(sizes["preview"], budget),
+        }
+        for name, sizes in STUDY_MODES.items()
+    }
+
+
+def _capped_preview_size(mode: str, budget: int | None) -> int:
+    """Preview batch size for one round: the mode's size, adapted to the
+    remaining daily release budget (see _capped_study_modes)."""
+    return _capped_study_modes(budget)[mode]["preview"]
 
 # stamp tag added on approve; the card is released (unsuspended) when this
 # date is strictly BEFORE today — see release_yesterday_approved()
@@ -512,6 +553,12 @@ async def status():
     try:
         due = await anki("findCards", {"query": "is:due -is:new"})
         new = await anki("findCards", {"query": new_card_query()})
+        # capped mode table (2026-09-16): preview sizes track the daily
+        # release budget, so every wire copy of study_modes agrees
+        try:
+            budget = await _release_budget_left()
+        except Exception:
+            budget = None
         out = {
             "anki": "ok",
             "due_review": len(due or []),
@@ -520,7 +567,7 @@ async def status():
             "preview_mode": PREVIEW_MODE,
             # two pacing modes (user spec 2026-09-14) — the frontend renders
             # the start-screen choice from this table, never hardcoded
-            "study_modes": STUDY_MODES,
+            "study_modes": _capped_study_modes(budget),
             "default_mode": DEFAULT_MODE,
             # daily 放行 goal for the preview-start progress bar (2026-09-16)
             "release_daily_goal": RELEASE_DAILY_GOAL,
@@ -566,6 +613,14 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
                 "mode": mode,
             }
         )
+    # capped table (2026-09-16): the frontend stores whatever study_modes
+    # rides along, so this must match session/state's view of the budget
+    budget = None
+    if PREVIEW_MODE:
+        try:
+            budget = await _release_budget_left()
+        except Exception:
+            budget = None
     return {
         "synced": synced,
         "cards": cards,
@@ -573,7 +628,7 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": STUDY_MODES,
+        "study_modes": _capped_study_modes(budget),
     }
 
 
@@ -622,6 +677,15 @@ async def _session_state_impl():
             preview["pending_release"] = await _pending_release_today()
         except Exception:
             preview["pending_release"] = None
+        # daily release budget (2026-09-16): remaining 放行 slots. The
+        # study_modes table below is capped by it, so the start screens
+        # show the ACTUAL deal size for each tier
+        try:
+            budget = await _release_budget_left()
+        except Exception:
+            budget = None
+        preview["release_budget_left"] = budget
+        preview["study_modes"] = _capped_study_modes(budget)
         try:
             pool = await preview_pool_ids()
             deferred = await _deferred_today_cards(pool)
@@ -759,13 +823,20 @@ async def _session_more_impl():
                 "mode": mode,
             }
         )
+    # capped table (2026-09-16) — same as session/start
+    budget = None
+    if PREVIEW_MODE:
+        try:
+            budget = await _release_budget_left()
+        except Exception:
+            budget = None
     return {
         "cards": cards,
         "due_remaining": due_remaining,
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": STUDY_MODES,
+        "study_modes": _capped_study_modes(budget),
     }
 
 
@@ -1178,6 +1249,25 @@ async def _pending_release_today() -> int:
     return len(ids or [])
 
 
+async def _release_budget_left(pending_release: int | None = None) -> int | None:
+    """Remaining daily release budget (user spec 2026-09-16).
+
+    RELEASE_DAILY_GOAL − cards approved today (the SAME number the preview
+    start screen's progress bar shows, so cap and bar can never disagree).
+    Pass an already-computed `pending_release` to avoid a second AnkiConnect
+    round-trip. None when the goal is disabled (<=0) — no cap, legacy
+    behavior. Deferred cards (明天再看) do NOT consume the budget (they
+    aren't released); undoing an approval gives the budget back
+    automatically because pending_release is recomputed from tags on every
+    call.
+    """
+    if RELEASE_DAILY_GOAL <= 0:
+        return None
+    if pending_release is None:
+        pending_release = await _pending_release_today()
+    return max(0, RELEASE_DAILY_GOAL - pending_release)
+
+
 @app.get("/api/preview/state")
 async def preview_state():
     """Serialized under _state_lock (see its declaration)."""
@@ -1270,14 +1360,31 @@ async def preview_start(mode: str | None = None):
 
 
 async def _preview_start_impl(mode: str = DEFAULT_MODE):
-    """Deal one preview batch: a random sample of pool cards not deferred today."""
+    """Deal one preview batch: a random sample of pool cards not deferred today.
+
+    Release-budget cap (user spec 2026-09-16): the batch is min(mode size,
+    remaining daily budget) — once fewer cards are left than a full round,
+    EVERY mode deals exactly the remainder, so the day lands on the goal
+    instead of overshooting it. Budget exhausted → no deal at all
+    (goal_reached), the day's previews are done.
+    """
     _preview_guard()
     await release_yesterday_approved()
+    budget = await _release_budget_left()
     pool = await preview_pool_ids()
     deferred = await _deferred_today_cards(pool)
     available = [c for c in pool if c not in deferred]
+    if budget is not None and budget <= 0:
+        return {
+            "cards": [],
+            "pool": len(pool),
+            "available": len(available),
+            "mode": mode,
+            "goal_reached": True,
+            "study_modes": _capped_study_modes(budget),
+        }
     # random draw (2026-09-04 spec) — mirrors the review-round new draw
-    per_round = STUDY_MODES[mode]["preview"]
+    per_round = _capped_preview_size(mode, budget)
     pending = random.sample(available, min(per_round, len(available)))
     if not pending:
         return {"cards": [], "pool": len(pool), "available": 0, "mode": mode}
@@ -1297,6 +1404,8 @@ async def _preview_start_impl(mode: str = DEFAULT_MODE):
         "available": len(pool) - len(deferred) - len(pending),
         "mode": mode,
         "preview_per_round": per_round,
+        # capped table so the UI's size labels track the budget immediately
+        "study_modes": _capped_study_modes(budget),
     }
 
 
@@ -1387,12 +1496,21 @@ async def _preview_act_impl(card_id: int, action: str):
         )
         remaining = await preview_pool_ids()
         deferred = await _deferred_today_cards(remaining)
+        # refreshed budget + capped table (2026-09-16): the done screen's
+        # 「再预览 N 张」 label and the start screens must reflect the
+        # approvals from the round that just finished without a reload
+        try:
+            budget = await _release_budget_left()
+        except Exception:
+            budget = None
         return {
             "ok": True,
             "round_complete": True,
             "pool": len(remaining),
             "available": len(remaining) - len(deferred),
             "mode": study_mode(rd.get("mode")),
+            "release_budget_left": budget,
+            "study_modes": _capped_study_modes(budget),
         }
     _preview_write(rd)
     return {"ok": True, "round_complete": False}

@@ -15,6 +15,9 @@ interface Props {
   /** daily 放行 goal (2026-09-16): horizontal progress bar of
    * pendingRelease / goal; null (old backend) hides the bar */
   releaseDailyGoal?: number | null
+  /** remaining release budget (2026-09-16): 0 = goal reached, the start
+   * button is replaced by a done-for-today note; null = goal disabled */
+  budgetLeft?: number | null
   busy: boolean
   onStart: () => void
   onSkipToReview: () => void
@@ -32,6 +35,18 @@ export const PreviewScreen: Component<Props> = (props) => {
   const releaseFraction = () => {
     const g = goal()
     return g && g > 0 ? Math.min(released() / g, 1) : 0
+  }
+  // daily budget exhausted (user spec 2026-09-16): no more preview rounds
+  // today — the wire's capped study_modes would show 预览 0 on every tile,
+  // so hide the selector and the start button and say why.
+  const goalReached = () => props.budgetLeft === 0
+  // cap ACTIVE: below the biggest normal round size every tier deals exactly
+  // the remaining budget, so the capped wire table has preview == budgetLeft
+  // on ALL tiles (at budget 12 the table is still 5/10 → note stays hidden)
+  const capActive = () => {
+    const b = props.budgetLeft
+    if (b == null || b <= 0 || !props.studyModes) return false
+    return Object.values(props.studyModes!).every(m => m.preview === b)
   }
   return (
     <div class="screen">
@@ -58,10 +73,20 @@ export const PreviewScreen: Component<Props> = (props) => {
                 aria-valuemin={0}
                 aria-valuemax={goal()!}
               />
+              <Show when={capActive()}>
+                <div class="release-progress__note md-typescale-label-small">
+                  今日还剩 {props.budgetLeft} 个名额——下一轮只预览 {props.budgetLeft} 张，正好收官。
+                </div>
+              </Show>
+              <Show when={goalReached()}>
+                <div class="release-progress__note md-typescale-label-small">
+                  🎉 今日目标达成！放行的卡明天开考，明天再继续预览。
+                </div>
+              </Show>
             </div>
           </Show>
 
-          <Show when={props.studyModes}>
+          <Show when={props.studyModes && !goalReached()}>
             <div class="screen-modes">
               <div class="modes-label md-typescale-label-medium">
                 现在有多少时间？
@@ -97,9 +122,11 @@ export const PreviewScreen: Component<Props> = (props) => {
           </div>
 
           <div class="screen-actions">
-            <md-filled-button onClick={() => props.onStart()} disabled={props.busy}>
-              开始预览
-            </md-filled-button>
+            <Show when={!goalReached()}>
+              <md-filled-button onClick={() => props.onStart()} disabled={props.busy}>
+                开始预览
+              </md-filled-button>
+            </Show>
           </div>
           <div class="screen-actions">
             <md-text-button onClick={() => props.onSkipToReview()} disabled={props.busy}>

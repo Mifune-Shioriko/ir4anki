@@ -14,6 +14,10 @@ interface Props {
    * preview_per_round only covers ACTIVE rounds and is null here) — never
    * hardcode */
   perRound: number | null
+  /** remaining daily release budget (2026-09-16): 0 = goal reached, no
+   * more preview rounds today — 再预览 is replaced by a done note;
+   * null = goal disabled (legacy behavior) */
+  budgetLeft?: number | null
   onUndo: () => void
   canUndo: boolean
   undoBusy: boolean
@@ -23,6 +27,7 @@ interface Props {
 }
 
 export const PreviewDoneScreen: Component<Props> = (props) => {
+  const goalReached = () => props.budgetLeft === 0
   return (
     <div class="screen">
       <md-elevated-card class="screen-card">
@@ -31,6 +36,12 @@ export const PreviewDoneScreen: Component<Props> = (props) => {
           <p class="screen-detail md-typescale-body-small">
             今天放行的卡明天才会开考——睡一觉再测，才是真提取。
           </p>
+
+          <Show when={goalReached()}>
+            <p class="screen-detail md-typescale-body-small goal-reached-note">
+              🎉 今日放行目标已达成，明天再继续预览。
+            </p>
+          </Show>
 
           <div class="screen-stats md-typescale-body-medium">
             <div class="stat-row">
@@ -63,9 +74,9 @@ export const PreviewDoneScreen: Component<Props> = (props) => {
                 撤销上一步
               </md-text-button>
             </Show>
-            <Show when={(props.available ?? 0) > 0}>
+            <Show when={(props.available ?? 0) > 0 && !goalReached()}>
               <md-text-button onClick={() => props.onMore()} disabled={props.busy}>
-                再预览{props.perRound != null ? ` ${props.perRound} 张` : ''}
+                再预览{props.perRound != null && props.perRound > 0 ? ` ${props.perRound} 张` : ''}
               </md-text-button>
             </Show>
             <md-text-button onClick={() => props.onFinish()} disabled={props.busy}>

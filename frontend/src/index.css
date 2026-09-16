@@ -421,6 +421,11 @@ body {
   --md-linear-progress-track-shape: var(--md-sys-shape-corner-full, 9999px);
 }
 
+/* budget note under the bar (2026-09-16): 「还剩 N 个名额」 / 达标提示 */
+.release-progress__note {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
 .screen-stats {
   width: 100%;
   display: flex;

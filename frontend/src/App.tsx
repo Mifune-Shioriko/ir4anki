@@ -171,6 +171,17 @@ export const App: Component = () => {
   // horizontal progress bar of pendingRelease / goal; null hides the bar
   // (old backend without the field degrades gracefully)
   const [releaseDailyGoal, setReleaseDailyGoal] = createSignal<number | null>(null)
+  // remaining daily release budget (user spec 2026-09-16): goal − approved
+  // today. DERIVED from the same two signals the progress bar reads, so bar,
+  // cap and optimistic approve-updates can never disagree. Once it drops
+  // below a round size the backend deals exactly the remainder (the capped
+  // study_modes table on the wire); at 0 the day's previews are done.
+  const releaseBudgetLeft = (): number | null => {
+    const g = releaseDailyGoal()
+    const p = pendingRelease()
+    if (g == null || g <= 0 || p == null) return null
+    return Math.max(0, g - p)
+  }
   // preview-only exit stats (2026-09-06): when the user finishes straight
   // from preview (mid-round or after the done screen), the finished screen
   // shows THESE instead of the review count (which would be a stale/misleading
@@ -536,7 +547,13 @@ export const App: Component = () => {
     setPvBusy(true)
     try {
       const d = await api.previewStart(selectedMode())
+      if (d.study_modes) setStudyModes(d.study_modes)
       if (!d.cards.length) {
+        // budget exhausted (2026-09-16): the day's goal is reached — say so
+        // instead of silently bouncing back to the start screen
+        if (d.goal_reached) {
+          showSnack(`今日放行目标 ${releaseDailyGoal() ?? ''} 张已达成，明天再继续预览`)
+        }
         // pool drained (deferred today) — back to whatever resync decides
         await resync()
         return
@@ -588,6 +605,9 @@ export const App: Component = () => {
       if (d.round_complete) {
         setPreviewPool(d.pool ?? null)
         setPreviewAvailable(d.available ?? null)
+        // capped pacing table (2026-09-16): the done screen's 再预览 N 张
+        // must reflect the approvals from THIS round without a reload
+        if (d.study_modes) setStudyModes(d.study_modes)
         setPhase('previewDone')
       }
     } catch (e) {
@@ -742,6 +762,7 @@ export const App: Component = () => {
             due={due()}
             pendingRelease={pendingRelease()}
             releaseDailyGoal={releaseDailyGoal()}
+            budgetLeft={releaseBudgetLeft()}
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}
@@ -797,6 +818,7 @@ export const App: Component = () => {
                 ? studyModes()![selectedMode()].preview
                 : previewPerRound()
             }
+            budgetLeft={releaseBudgetLeft()}
             onMore={pvStart}
             onToReview={pvToReview}
             onFinish={pvFinish}

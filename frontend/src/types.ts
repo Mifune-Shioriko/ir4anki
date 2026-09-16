@@ -84,6 +84,9 @@ export interface PreviewExtras {
   pending_release?: number | null
   /** daily 放行 goal for the preview-start progress bar (2026-09-16) */
   release_daily_goal?: number | null
+  /** remaining daily release slots (goal − approved today, 2026-09-16).
+   * 0 = goal reached → no more preview rounds today; null = goal disabled */
+  release_budget_left?: number | null
   /** pacing-mode table + default (2026-09-14) — the start screens render
    * the quick/focus choice from these, never hardcoded numbers */
   study_modes?: StudyModes
@@ -121,6 +124,11 @@ export interface PreviewStartResponse {
   available: number
   mode?: string
   preview_per_round?: number
+  /** true when the daily release budget is exhausted — no cards were dealt */
+  goal_reached?: boolean
+  /** capped pacing table (2026-09-16): preview sizes track remaining budget */
+  study_modes?: StudyModes
+  release_budget_left?: number | null
 }
 
 export interface PreviewActResponse {
@@ -129,6 +137,9 @@ export interface PreviewActResponse {
   round_complete?: boolean
   pool?: number
   available?: number
+  /** refreshed on round_complete so the done screen's 再预览 N 张 is correct */
+  study_modes?: StudyModes
+  release_budget_left?: number | null
 }
 
 export interface AnswerResponse {
