@@ -83,10 +83,6 @@ body {
   color: var(--md-sys-color-on-surface);
 }
 
-.top-bar__chips {
-  /* chip sets handle their own spacing */
-}
-
 /* ---- content column ---- */
 .content {
   flex: 1;

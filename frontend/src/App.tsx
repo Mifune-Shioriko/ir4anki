@@ -740,11 +740,7 @@ export const App: Component = () => {
 
   return (
     <div class="app">
-      <TopAppBar
-        due={due()}
-        newTotal={newTotal()}
-        previewPool={previewMode() ? previewPool() : null}
-      />
+      <TopAppBar />
 
       <div class="content">
         <Show when={phase() === 'loading'}>
