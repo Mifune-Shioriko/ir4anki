@@ -58,9 +58,6 @@ export const PreviewCard: Component<Props> = (props) => {
   }
   const questionHtml = () => cleanCardHtml(props.card.question)
   const sims = () => props.card.similar || []
-  // flat string list from anki-prior-knowledge; defensive filter in case a
-  // malformed payload ever sneaks a non-string in
-  const priors = () => (props.card.priorKnowledge || []).filter(x => typeof x === 'string' && x.trim())
 
   return (
     <div class="flashcard-wrapper">
@@ -103,19 +100,6 @@ export const PreviewCard: Component<Props> = (props) => {
             <>
               <md-divider class="card-divider" />
               <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
-
-              {priors().length > 0 && (
-                <div class="prior-section">
-                  <div class="prior-title md-typescale-label-medium">
-                    前置知识
-                  </div>
-                  <ul class="prior-list md-typescale-body-medium">
-                    {priors().map(item => (
-                      <li innerHTML={textWithMath(item)} />
-                    ))}
-                  </ul>
-                </div>
-              )}
 
               {props.card.explanation && (
                 <div class="explain-section">

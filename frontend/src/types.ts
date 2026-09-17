@@ -19,9 +19,6 @@ export interface Card {
   similar?: SimilarCard[]
   /** AI-generated explanation from anki-explain (:8788); "" when missing */
   explanation?: string
-  /** AI-generated prior-knowledge bullets from anki-prior-knowledge (:8790);
-   * flat list of strings (no nesting — guaranteed by the service) */
-  priorKnowledge?: string[]
 }
 
 export interface RoundInfo {

@@ -454,46 +454,8 @@ body {
   color: var(--md-sys-color-on-surface-variant);
 }
 
-/* ---- AI prior knowledge (anki-prior-knowledge :8790), shown after reveal,
-   between the answer and the AI explanation. Same visual lineage as
-   .explain-section but on tertiary-container so the two blocks are
-   distinguishable at a glance. Flat bullets only — the service returns a
-   flat string array and this is a single <ul>, no nesting possible. ---- */
-.prior-section {
-  margin-top: 16px;
-  padding: 12px 14px;
-  background: var(--md-sys-color-tertiary-container);
-  border-radius: var(--md-sys-shape-corner-small, 8px);
-}
-
-.prior-title {
-  color: var(--md-sys-color-on-tertiary-container);
-  opacity: 0.75;
-  margin-bottom: 6px;
-}
-
-.prior-list {
-  color: var(--md-sys-color-on-tertiary-container);
-  line-height: 1.6;
-  margin: 0;
-  padding-left: 20px;
-  list-style: disc outside;
-}
-
-.prior-list li {
-  margin-bottom: 4px;
-}
-
-.prior-list li:last-child {
-  margin-bottom: 0;
-}
-
-/* nesting is structurally impossible (flat array → single <ul>), but clamp
-   it in CSS too as a belt-and-braces guarantee */
-.prior-list ul,
-.prior-list ol {
-  display: contents;
-}
+/* ---- AI prior knowledge block REMOVED 2026-09-17 (anki-prior-knowledge
+   project retired at user request) ---- */
 
 /* ---- AI explanation (anki-explain :8788), shown after reveal ---- */
 .explain-section {

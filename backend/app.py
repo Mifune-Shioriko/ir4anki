@@ -57,7 +57,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 ANKICONNECT = os.getenv("ANKICONNECT_URL", "http://127.0.0.1:8765")
 ANKI_RAG = os.getenv("ANKI_RAG_URL", "http://127.0.0.1:8789")
 ANKI_EXPLAIN = os.getenv("ANKI_EXPLAIN_URL", "http://127.0.0.1:8788")
-ANKI_PRIOR = os.getenv("ANKI_PRIOR_URL", "http://127.0.0.1:8790")
 NOTES_RAG = os.getenv("NOTES_RAG_URL", "http://127.0.0.1:8791")
 
 # Anki collection.media directory (served back at /media/<name>)
@@ -448,25 +447,6 @@ async def fetch_explanation(note_id: int | None) -> str:
         return ""
 
 
-async def fetch_prior_knowledge(note_id: int | None) -> list[str]:
-    """Ask anki-prior-knowledge (:8790) for this note's prior-knowledge list.
-
-    Returns a flat list[str] (the service already guarantees no nesting).
-    Fail-soft like fetch_explanation: any error returns [].
-    """
-    if not note_id:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{ANKI_PRIOR}/note/{note_id}")
-            r.raise_for_status()
-            d = r.json()
-            items = d.get("prior_knowledge", []) if d.get("found") else []
-            return items if isinstance(items, list) else []
-    except Exception:
-        return []
-
-
 async def fetch_note_sections(note_id: int | None, top_k: int = 3) -> list[dict]:
     """Ask notes-rag (:8791) for the note sections this card came from.
 
@@ -517,15 +497,15 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
                 "due": info["due"],
             }
         )
-    # enrich with similar cards + AI explanations + prior knowledge in
-    # parallel (local lookups, fast)
+    # enrich with similar cards + AI explanations in parallel (local
+    # lookups, fast). NOTE: priorKnowledge enrichment removed 2026-09-17
+    # (anki-prior-knowledge project retired at user request — block judged
+    # not useful during actual reviews).
     similars = await asyncio.gather(*(fetch_similar(c["question"]) for c in out))
     explanations = await asyncio.gather(*(fetch_explanation(c["noteId"]) for c in out))
-    priors = await asyncio.gather(*(fetch_prior_knowledge(c["noteId"]) for c in out))
-    for card, sim, expl, prior in zip(out, similars, explanations, priors):
+    for card, sim, expl in zip(out, similars, explanations):
         card["similar"] = sim
         card["explanation"] = expl
-        card["priorKnowledge"] = prior
     return out
 
 
