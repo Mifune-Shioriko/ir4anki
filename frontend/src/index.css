@@ -123,7 +123,11 @@ body {
   position: sticky;
   top: 64px; /* below the top app bar */
   align-self: flex-start;
-  max-height: calc(100vh - 88px);
+  /* definite height (was max-height): the panel's scroll/clipping layer is
+   * absolutely positioned inside the md-elevated-card host, which needs a
+   * resolved height to scroll against. 100vh - 88px keeps a 24px gap above
+   * the viewport bottom while sticky. */
+  height: calc(100vh - 88px);
   display: flex;
   flex-direction: column;
 }
@@ -141,16 +145,61 @@ body {
   }
 }
 
-/* ---- note panel ---- */
+/* ---- round progress strip (above the two columns) ----
+ * Same horizontal geometry as .columns (max-width, centered, 24px side
+ * padding) so on wide screens the inner 680px bar lines up exactly with the
+ * left study column. It carries the top 24px gap; the columns' own
+ * padding-top then provides the gap between the bar and the boxes. */
+.round-strip {
+  width: 100%;
+  max-width: calc(var(--content-max-width) + 560px + 48px);
+  margin: 0 auto;
+  padding: var(--content-padding) var(--content-padding) 0;
+}
+
+.round-strip-inner {
+  width: 100%;
+  max-width: var(--content-max-width);
+}
+
+/* the progress block supplies its own bottom margin inside .content; here
+ * the columns' padding-top is the only gap, so zero it to avoid doubling */
+.round-strip .progress-area {
+  margin-bottom: 0;
+}
+
+@media (max-width: 1179px) {
+  .round-strip {
+    max-width: none;
+  }
+  .round-strip-inner {
+    margin: 0 auto;
+  }
+}
+
+/* ---- note panel ----
+ * The panel IS a real <md-elevated-card> now (2026-09-17, user request:
+ * same treatment as the study card — identical MD3 elevated-card tokens by
+ * construction: surface-container-low container, corner-medium 12px shape,
+ * elevation level 1 shadow rendered by the official md-elevation layer).
+ * The host must NOT set overflow:hidden — that would clip its own elevation
+ * shadow — so scrolling/clipping lives on .note-panel-inner, absolutely
+ * positioned over the host box. That also sidesteps the shadow-DOM <slot>
+ * (unstyleable from light CSS) which cannot take part in a flex height
+ * chain: absolute inset:0 anchors to the host (position:relative), and
+ * border-radius:inherit picks up the host's 12px corner for the clip. */
 .note-panel {
   flex: 1;
   min-height: 0;
+}
+
+.note-panel-inner {
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
-  background: var(--md-sys-color-surface-container-low);
-  border: 1px solid var(--md-sys-color-outline-variant);
-  border-radius: var(--md-sys-shape-corner-large);
   overflow: hidden;
+  border-radius: inherit;
 }
 
 .note-panel-header {

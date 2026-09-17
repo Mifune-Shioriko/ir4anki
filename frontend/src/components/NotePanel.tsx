@@ -170,7 +170,8 @@ export const NotePanel: Component<Props> = (props) => {
   }
 
   return (
-    <div class="note-panel" ref={panelRef}>
+    <md-elevated-card class="note-panel">
+      <div class="note-panel-inner" ref={panelRef}>
       <div class="note-panel-header">
         <span class="note-panel-title md-typescale-title-small">笔记</span>
         <Show when={status() === 'ready' && current()}>
@@ -234,6 +235,7 @@ export const NotePanel: Component<Props> = (props) => {
           <div class="note-body md-typescale-body-medium" ref={bodyRef} innerHTML={html()} />
         </Show>
       </Show>
-    </div>
+      </div>
+    </md-elevated-card>
   )
 }

@@ -772,6 +772,45 @@ export const App: Component = () => {
     <div class="app">
       <TopAppBar />
 
+      {/* Round progress as a full-width strip ABOVE the two columns
+          (2026-09-17): it used to live inside the left column, pushing the
+          card down by its own height so the card box and the note box no
+          longer shared a top edge. Lifting it out (inner width matched to
+          the left column) makes both columns start on the same baseline. */}
+      <Show when={(phase() === 'review' && currentCard()) || (phase() === 'preview' && previewCard())}>
+        <div class="round-strip">
+          <div class="round-strip-inner">
+            <Show when={phase() === 'review' && currentCard()}>
+              <ProgressBar
+                done={totalDone()}
+                total={roundTotal()}
+                reviewDone={reviewDone()}
+                reviewTotal={reviewTotal()}
+                newDone={newDone()}
+                newTotal={newInBatch()}
+              />
+            </Show>
+            <Show when={phase() === 'preview' && previewCard()}>
+              <div class="progress-area">
+                <div class="progress-row">
+                  <md-linear-progress
+                    class="progress-bar"
+                    value={pvTotal() > 0 ? Math.min(pvDone() / pvTotal(), 1) : 0}
+                  />
+                  <span class="progress-text md-typescale-label-large">
+                    {pvDone()}/{pvTotal()}
+                  </span>
+                </div>
+                <div class="progress-split md-typescale-label-medium">
+                  <span>已放行 {pvApproved()}</span>
+                  <span>明天再看 {pvDeferred()}</span>
+                </div>
+              </div>
+            </Show>
+          </div>
+        </div>
+      </Show>
+
       <div class="columns">
       <div class="content">
         <Show when={phase() === 'loading'}>
@@ -800,21 +839,6 @@ export const App: Component = () => {
         </Show>
 
         <Show when={phase() === 'preview' && previewCard()}>
-          <div class="progress-area">
-            <div class="progress-row">
-              <md-linear-progress
-                class="progress-bar"
-                value={pvTotal() > 0 ? Math.min(pvDone() / pvTotal(), 1) : 0}
-              />
-              <span class="progress-text md-typescale-label-large">
-                {pvDone()}/{pvTotal()}
-              </span>
-            </div>
-            <div class="progress-split md-typescale-label-medium">
-              <span>已放行 {pvApproved()}</span>
-              <span>明天再看 {pvDeferred()}</span>
-            </div>
-          </div>
           <PreviewCard
             card={previewCard()!}
             busy={pvBusy()}
@@ -871,14 +895,6 @@ export const App: Component = () => {
         </Show>
 
         <Show when={phase() === 'review' && currentCard()}>
-          <ProgressBar
-            done={totalDone()}
-            total={roundTotal()}
-            reviewDone={reviewDone()}
-            reviewTotal={reviewTotal()}
-            newDone={newDone()}
-            newTotal={newInBatch()}
-          />
           <Flashcard
             card={currentCard()!}
             revealed={revealed()}
