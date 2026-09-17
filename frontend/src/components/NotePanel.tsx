@@ -24,6 +24,12 @@ interface Props {
   noteId: number | null | undefined
   /** changes force a full reset even when noteId is unchanged (card swap) */
   cardKey: number | null
+  /** card is on screen but face-down: hold everything back until reveal
+   *  (answer-leak guard, user spec 2026-09-17) — the matched note section
+   *  usually contains the answer, so no fetch/scroll/jump may happen before
+   *  显示背面. App passes noteId=null while blocked; this flag only drives
+   *  the placeholder copy. */
+  blocked?: boolean
 }
 
 type Status = 'idle' | 'loading' | 'ready' | 'empty' | 'error'
@@ -182,7 +188,16 @@ export const NotePanel: Component<Props> = (props) => {
 
       <Show when={status() === 'idle'}>
         <div class="note-panel-state md-typescale-body-medium">
-          开始复习后，这里会显示卡片对应的笔记
+          {props.blocked ? (
+            <>
+              先想一想
+              <span class="note-panel-hint md-typescale-body-small">
+                显示背面后，这里会定位到对应笔记
+              </span>
+            </>
+          ) : (
+            '开始复习后，这里会显示卡片对应的笔记'
+          )}
         </div>
       </Show>
 

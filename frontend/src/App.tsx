@@ -753,8 +753,20 @@ export const App: Component = () => {
   const currentCard = () => cards()[idx()]
 
   // the card the note panel tracks: the review card in a review round, the
-  // pool card during preview (先看后考 is exactly when source context helps)
-  const noteCard = () => (phase() === 'preview' ? previewCard() : currentCard())
+  // pool card during preview (先看后考 is exactly when source context helps).
+  // GATED ON REVEAL (user spec 2026-09-17): the matched note section usually
+  // contains the answer, so the panel must stay dark until the back is shown
+  // — otherwise the note jumps to the answer spot before 显示背面 (leak).
+  // Applies to preview / new / review cards alike.
+  const noteCard = () => {
+    if (phase() === 'preview') return pvRevealed() ? previewCard() : undefined
+    if (phase() === 'review') return revealed() ? currentCard() : undefined
+    return undefined
+  }
+  // card on screen but face-down → panel shows a "revealed 后加载" placeholder
+  const noteBlocked = () =>
+    (phase() === 'preview' && !!previewCard() && !pvRevealed()) ||
+    (phase() === 'review' && !!currentCard() && !revealed())
 
   return (
     <div class="app">
@@ -922,6 +934,7 @@ export const App: Component = () => {
           <NotePanel
             noteId={noteCard()?.noteId}
             cardKey={noteCard()?.cardId ?? null}
+            blocked={noteBlocked()}
           />
         </div>
       </Show>
