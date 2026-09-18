@@ -18,9 +18,14 @@ import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
 import { PreviewScreen } from './components/PreviewScreen'
 import { PreviewDoneScreen } from './components/PreviewDoneScreen'
+import { ReadingCard } from './components/ReadingCard'
+import { ReadingPanel } from './components/ReadingPanel'
+import { ReadingStartScreen } from './components/ReadingStartScreen'
+import { ReadingDoneScreen } from './components/ReadingDoneScreen'
+import { ReadingListScreen } from './components/ReadingListScreen'
 import { NotePanel } from './components/NotePanel'
 import { Snackbar } from './components/Snackbar'
-import type { StudyModes } from './types'
+import type { StudyModes, ReadingChunk, ReadingRoundStats } from './types'
 
 // The note panel (知识成体系 Phase 1) only makes sense on a wide screen —
 // the user reviews from phone AND desktop, and on a phone the second column
@@ -57,6 +62,12 @@ type Phase =
   | 'previewStart'
   | 'preview'
   | 'previewDone'
+  // reading mode (渐进制卡, 2026-09-19) — rendered only when the backend
+  // flag is on; the funnel is reading → preview → review
+  | 'readingStart'
+  | 'reading'
+  | 'readingDone'
+  | 'readingList'
 
 export const App: Component = () => {
   createEffect(() => syncThemeColor())
@@ -206,6 +217,25 @@ export const App: Component = () => {
     pool: number | null
   } | null>(null)
 
+  // ---- reading mode (渐进制卡, user spec 2026-09-19) ----
+  // Gated by the backend flag like preview. Funnel: readingStart → reading
+  // → (previewStart | start). The round deals one frontier chunk per file
+  // (priority = 阅读清单 order); `active` chunks resurface first until the
+  // user marks them done/skipped. addSource links the add-card dialog to
+  // the current chunk (provenance → cards_created).
+  const [readingMode, setReadingMode] = createSignal(false)
+  const [readingListSize, setReadingListSize] = createSignal(0)
+  const [readingAvailable, setReadingAvailable] = createSignal(0)
+  const [readingActive, setReadingActive] = createSignal(0)
+  const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
+  const [rdDone, setRdDone] = createSignal(0)
+  const [rdTotal, setRdTotal] = createSignal(0)
+  const [rdStats, setRdStats] = createSignal<ReadingRoundStats>({})
+  const [rdBusy, setRdBusy] = createSignal(false)
+  // which chunk the add dialog is open FOR (provenance link); null = plain add
+  const [addSource, setAddSource] = createSignal<{ path: string; chunk_key: string } | null>(null)
+  const rdCurrent = () => rdChunks()[0] ?? null
+
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
 
@@ -272,9 +302,25 @@ export const App: Component = () => {
         setPendingRelease(d.pending_release ?? null)
         setReleaseDailyGoal(d.release_daily_goal ?? null)
       }
+      // reading-mode signals (absent when the backend flag is off)
+      setReadingMode(!!d.reading_mode)
+      if (d.reading_mode) {
+        setReadingListSize(d.reading_list_size ?? 0)
+        setReadingAvailable(d.reading_available ?? 0)
+        setReadingActive(d.reading_active ?? 0)
+      }
       if (d.state === 'active') {
         // a normal review round in progress always wins — finish it first
         loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
+      } else if (d.reading_mode && d.reading_round?.status === 'active') {
+        // resume an unfinished reading round — its stored mode drives the
+        // funnel so a refresh lands back on the same chunk
+        if (d.reading_round.mode) setSelectedMode(d.reading_round.mode)
+        setRdChunks(d.reading_round.chunks ?? [])
+        setRdDone(d.reading_round.done ?? 0)
+        setRdTotal(d.reading_round.total ?? 0)
+        setRdStats(d.reading_round.stats ?? {})
+        setPhase('reading')
       } else if (d.preview_mode && d.preview_round) {
         // resume an unfinished preview round — its stored mode drives
         // 're-preview' and 'skip to review' so the pacing survives refresh
@@ -289,8 +335,16 @@ export const App: Component = () => {
         setPvCanUndo(!!d.preview_round.can_undo)
         setPvRevealedFor(null) // resumed round: card comes back face-down
         setPhase('preview')
+      } else if (
+        d.reading_mode &&
+        ((d.reading_available ?? 0) > 0 || (d.reading_active ?? 0) > 0)
+      ) {
+        // top of the funnel (渐进制卡): read notes and make cards before
+        // previewing/reviewing. reading_available counts files with a
+        // dealable frontier; reading_active covers 正在制卡 leftovers.
+        setPhase('readingStart')
       } else if (d.preview_mode && (d.preview_available ?? 0) > 0) {
-        // top of the funnel: read new cards before they enter testing
+        // next in the funnel: read new cards before they enter testing
         setPhase('previewStart')
       } else if (d.state === 'complete') {
         // the completed round's mode drives '继续复习' (more inherits it)
@@ -467,7 +521,17 @@ export const App: Component = () => {
   // round.json/preview.json consistent (card counts as handled), so the
   // frontend just mirrors that locally — same splice pattern as answer().
 
-  const openAdd = () => setAddOpen(true)
+  const openAdd = () => {
+    setAddSource(null)
+    setAddOpen(true)
+  }
+  // 渐进制卡: add from the reading round — links the new card to the
+  // current chunk (provenance → cards_created)
+  const openReadingAdd = () => {
+    const chunk = rdCurrent()
+    setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
+    setAddOpen(true)
+  }
 
   const onCardAdded = () => {
     // the new card lands suspended in the preview pool — reflect in chips
@@ -475,6 +539,19 @@ export const App: Component = () => {
       setPreviewPool(p => (p == null ? p : p + 1))
       setPreviewAvailable(p => (p == null ? p : p + 1))
     }
+    // 渐进制卡: the backend recorded the note id on the source chunk —
+    // mirror it locally so 「已从本片段制卡 N 张」 updates without a reload
+    const src = addSource()
+    if (src) {
+      setRdChunks(prev =>
+        prev.map(c =>
+          c.path === src.path && c.chunk_key === src.chunk_key
+            ? { ...c, cards_created: [...c.cards_created, 0] }
+            : c,
+        ),
+      )
+    }
+    setAddSource(null)
   }
 
   const confirmDelete = async () => {
@@ -692,6 +769,120 @@ export const App: Component = () => {
     setPhase('finished')
   }
 
+  // ---- reading actions (渐进制卡, 2026-09-19) ----
+  const rdRefreshCounts = async () => {
+    // cheap count refresh after round changes (list/available/active)
+    try {
+      const d = await api.sessionState()
+      if (d.reading_mode) {
+        setReadingListSize(d.reading_list_size ?? 0)
+        setReadingAvailable(d.reading_available ?? 0)
+        setReadingActive(d.reading_active ?? 0)
+      }
+    } catch { /* counts are decorative; next resync fixes them */ }
+  }
+
+  const rdStart = async () => {
+    setPhase('loading')
+    setLoadError(false)
+    setLoadText('正在加载阅读片段…')
+    setRdBusy(true)
+    try {
+      const d = await api.readingStart(selectedMode())
+      if (d.study_modes) setStudyModes(d.study_modes)
+      if (!d.chunks.length) {
+        // nothing dealable (list empty or all done) — fall through the funnel
+        showSnack('阅读清单暂时没有可推进的片段')
+        await resync()
+        return
+      }
+      if (d.mode) setSelectedMode(d.mode)
+      setRdChunks(d.chunks)
+      setRdDone(0)
+      setRdTotal(d.chunks.length)
+      setRdStats({})
+      setPhase('reading')
+    } catch (e) {
+      setLoadText('加载失败：' + (e as Error).message)
+      setLoadError(true)
+    } finally {
+      setRdBusy(false)
+    }
+  }
+
+  const rdAct = async (action: 'mark_active' | 'complete' | 'skip' | 'next') => {
+    const chunk = rdCurrent()
+    if (!chunk || rdBusy()) return
+    setRdBusy(true)
+    try {
+      const d = await api.readingAct(chunk.path, chunk.chunk_key, action)
+      if (!d.ok) {
+        // stale / drifted — resync to the server's view
+        await resync()
+        return
+      }
+      if (action === 'mark_active') {
+        // stays on this chunk (正在制卡): update its status in place
+        setRdChunks(prev =>
+          prev.map(c =>
+            c.chunk_key === chunk.chunk_key && c.path === chunk.path
+              ? { ...c, status: 'active' }
+              : c,
+          ),
+        )
+        return
+      }
+      // complete / skip / next: remove BY chunk_key (never by position —
+      // the same rule as the review/preview arrays)
+      setRdChunks(prev =>
+        prev.filter(c => !(c.chunk_key === chunk.chunk_key && c.path === chunk.path)),
+      )
+      setRdDone(d.done ?? rdDone() + 1)
+      if (d.stats) setRdStats(d.stats)
+      if (d.round_complete || rdChunks().length === 0) {
+        setRdTotal(d.total ?? rdTotal())
+        setPhase('readingDone')
+        rdRefreshCounts()
+      }
+    } catch (e) {
+      alert('操作失败：' + (e as Error).message)
+    } finally {
+      setRdBusy(false)
+    }
+  }
+
+  // funnel next step after reading: preview (when on) else review
+  const rdNext = () => {
+    if (previewMode() && (previewAvailable() ?? 0) > 0) {
+      setPhase('previewStart')
+    } else {
+      startNewRound()
+    }
+  }
+  const rdNextLabel = () =>
+    previewMode() && (previewAvailable() ?? 0) > 0 ? '去预览新卡' : '开始复习'
+  // readingStart's skip follows the same funnel
+  const rdSkip = () => {
+    if (previewMode() && (previewAvailable() ?? 0) > 0) {
+      setPhase('previewStart')
+    } else {
+      setPhase('start')
+    }
+  }
+  const rdSkipLabel = () =>
+    previewMode() && (previewAvailable() ?? 0) > 0 ? '跳过阅读，去预览' : '跳过阅读，直接复习'
+
+  const rdFinish = async () => {
+    setRdBusy(true)
+    try {
+      await api.readingFinish()
+    } catch { /* not critical */ }
+    setRdBusy(false)
+    rdNext()
+  }
+
+  const openReadingList = () => setPhase('readingList')
+
   // ---- keyboard shortcuts ----
   // Attached at WINDOW level (2026-09-07 fix): the old div-level onKeyDown
   // only fired when focus was already inside the app — on a fresh page load
@@ -705,6 +896,27 @@ export const App: Component = () => {
   const handleKeyDown = (e: KeyboardEvent) => {
     if (isTypingTarget(e.target)) return
     if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
+    if (phase() === 'reading') {
+      // Space = primary action (开始制卡 / 制卡完成), A = add card,
+      // S = skip, N = 下一张 (稍后继续) — window-level like preview's
+      if (rdBusy()) return
+      const chunk = rdCurrent()
+      if (!chunk) return
+      if (e.key === ' ') {
+        e.preventDefault()
+        rdAct(chunk.status === 'active' ? 'complete' : 'mark_active')
+      } else if (e.key === 'a' || e.key === 'A') {
+        e.preventDefault()
+        openReadingAdd()
+      } else if (e.key === 's' || e.key === 'S') {
+        e.preventDefault()
+        rdAct('skip')
+      } else if (e.key === 'n' || e.key === 'N') {
+        e.preventDefault()
+        rdAct('next')
+      }
+      return
+    }
     if (phase() === 'preview') {
       if (pvBusy()) return
       if (e.key === 'z' && (e.ctrlKey || e.metaKey) && pvCanUndo() && !pvUndoBusy()) {
@@ -777,7 +989,13 @@ export const App: Component = () => {
           card down by its own height so the card box and the note box no
           longer shared a top edge. Lifting it out (inner width matched to
           the left column) makes both columns start on the same baseline. */}
-      <Show when={(phase() === 'review' && currentCard()) || (phase() === 'preview' && previewCard())}>
+      <Show
+        when={
+          (phase() === 'review' && currentCard()) ||
+          (phase() === 'preview' && previewCard()) ||
+          (phase() === 'reading' && rdCurrent())
+        }
+      >
         <div class="round-strip">
           <div class="round-strip-inner">
             <Show when={phase() === 'review' && currentCard()}>
@@ -789,6 +1007,23 @@ export const App: Component = () => {
                 newDone={newDone()}
                 newTotal={newInBatch()}
               />
+            </Show>
+            <Show when={phase() === 'reading' && rdCurrent()}>
+              <div class="progress-area">
+                <div class="progress-row">
+                  <md-linear-progress
+                    class="progress-bar"
+                    value={rdTotal() > 0 ? Math.min(rdDone() / rdTotal(), 1) : 0}
+                  />
+                  <span class="progress-text md-typescale-label-large">
+                    {rdDone()}/{rdTotal()}
+                  </span>
+                </div>
+                <div class="progress-split md-typescale-label-medium">
+                  <span>阅读 · 渐进制卡</span>
+                  <span>已完成 {rdStats().done ?? 0} · 跳过 {rdStats().skipped ?? 0}</span>
+                </div>
+              </div>
             </Show>
             <Show when={phase() === 'preview' && previewCard()}>
               <div class="progress-area">
@@ -821,6 +1056,54 @@ export const App: Component = () => {
           />
         </Show>
 
+        <Show when={phase() === 'readingStart'}>
+          <ReadingStartScreen
+            listSize={readingListSize()}
+            available={readingAvailable()}
+            active={readingActive()}
+            busy={rdBusy()}
+            onStart={rdStart}
+            onSkip={rdSkip}
+            skipLabel={rdSkipLabel()}
+            onManageList={openReadingList}
+            studyModes={studyModes()}
+            mode={selectedMode()}
+            onModeChange={chooseMode}
+          />
+        </Show>
+
+        <Show when={phase() === 'reading' && rdCurrent()}>
+          <ReadingCard
+            chunk={rdCurrent()!}
+            busy={rdBusy()}
+            onMarkActive={() => rdAct('mark_active')}
+            onComplete={() => rdAct('complete')}
+            onNext={() => rdAct('next')}
+            onSkip={() => rdAct('skip')}
+            onAdd={openReadingAdd}
+            onExit={rdFinish}
+          />
+        </Show>
+
+        <Show when={phase() === 'readingDone'}>
+          <ReadingDoneScreen
+            stats={rdStats()}
+            available={readingAvailable()}
+            busy={rdBusy()}
+            onMore={rdStart}
+            onNext={rdNext}
+            nextLabel={rdNextLabel()}
+            onFinish={async () => { setPhase('loading'); setLoadText('正在结束…'); await api.readingFinish().catch(() => {}); await resync() }}
+          />
+        </Show>
+
+        <Show when={phase() === 'readingList'}>
+          <ReadingListScreen
+            busy={false}
+            onBack={() => resync()}
+          />
+        </Show>
+
         <Show when={phase() === 'previewStart'}>
           <PreviewScreen
             pool={previewPool()}
@@ -832,6 +1115,9 @@ export const App: Component = () => {
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}
+            readingMode={readingMode()}
+            readingListSize={readingListSize()}
+            onToReadingList={openReadingList}
             studyModes={studyModes()}
             mode={selectedMode()}
             onModeChange={chooseMode}
@@ -888,6 +1174,9 @@ export const App: Component = () => {
             onBegin={startNewRound}
             previewPool={previewMode() ? previewPool() : null}
             onToPreview={pvToPreview}
+            readingMode={readingMode()}
+            readingListSize={readingListSize()}
+            onToReadingList={openReadingList}
             studyModes={studyModes()}
             mode={selectedMode()}
             onModeChange={chooseMode}
@@ -944,14 +1233,24 @@ export const App: Component = () => {
       </div>
 
       {/* right-hand note panel (知识成体系 Phase 1): wide screens only, and
-          only while a card is actually on screen (review or preview round) */}
+          only while a card is actually on screen (review or preview round).
+          During a reading round the column switches to ReadingPanel: the
+          whole source file anchored at the current chunk (user spec
+          2026-09-19 — 左栏只展示 chunk，右边回溯整个笔记看上下文). */}
       <Show when={isWide()}>
         <div class="note-column">
-          <NotePanel
-            noteId={noteCard()?.noteId}
-            cardKey={noteCard()?.cardId ?? null}
-            blocked={noteBlocked()}
-          />
+          <Show
+            when={phase() === 'reading' && rdCurrent()}
+            fallback={
+              <NotePanel
+                noteId={noteCard()?.noteId}
+                cardKey={noteCard()?.cardId ?? null}
+                blocked={noteBlocked()}
+              />
+            }
+          >
+            <ReadingPanel chunk={rdCurrent()!} />
+          </Show>
         </div>
       </Show>
       </div>{/* /columns */}
@@ -987,7 +1286,8 @@ export const App: Component = () => {
       <Show when={addOpen()}>
         <EditDialog
           mode="add"
-          onClose={() => setAddOpen(false)}
+          readingSource={addSource()}
+          onClose={() => { setAddOpen(false); setAddSource(null) }}
           onAdded={() => onCardAdded()}
         />
       </Show>

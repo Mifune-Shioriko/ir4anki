@@ -90,6 +90,11 @@ export const ModeSelector: Component<Props> = (props) => {
                 </span>
               </div>
               <div class="mode-tile__sizes md-typescale-body-medium">
+                {/* 渐进制卡 (2026-09-19): the read segment size rides the
+                    same wire table; absent (old backend) → chip hidden */}
+                {m().read != null && m().read! > 0 && (
+                  <span class="mode-size">阅读 <b>{m().read}</b></span>
+                )}
                 <span class="mode-size">预览 <b>{m().preview}</b></span>
                 <span class="mode-size">新卡 <b>{m().new}</b></span>
                 <span class="mode-size">复习 <b>{m().review}</b></span>

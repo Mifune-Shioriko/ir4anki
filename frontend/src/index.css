@@ -1081,3 +1081,205 @@ body {
   border-radius: var(--md-sys-shape-corner-small, 8px);
   padding: 8px;
 }
+
+/* ---- reading mode (渐进制卡, user spec 2026-09-19) ----
+ * The reading round reuses the study-card shell (.card-container/.card-inner)
+ * so it reads as the same product; only the chunk body, breadcrumb, status
+ * chips and the list screen get their own rules. */
+
+.reading-crumb {
+  color: var(--md-sys-color-on-surface-variant);
+  margin: 4px 0 10px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.reading-chunk-body {
+  /* the chunk IS the reading surface — cap very long sections so the action
+   * row stays reachable; the full file is always in the right panel */
+  max-height: min(52vh, 560px);
+  overflow-y: auto;
+}
+
+.reading-cards-made {
+  margin-top: 12px;
+  color: var(--md-sys-color-primary);
+}
+
+/* status chips: assist-chip is disabled (display-only), so tint via tokens.
+ * active = secondary-container (正在制卡 stands out), done/skipped = muted */
+.reading-status-chip {
+  --md-assist-chip-label-text-color: var(--md-sys-color-on-surface-variant);
+}
+.reading-status-active {
+  --md-assist-chip-label-text-color: var(--md-sys-color-on-secondary-container);
+  --md-assist-chip-container-color: var(--md-sys-color-secondary-container);
+}
+.reading-status-done {
+  --md-assist-chip-label-text-color: var(--md-sys-color-on-primary-container);
+  --md-assist-chip-container-color: var(--md-sys-color-primary-container);
+}
+
+/* plain-text status badge inside list rows (not an md chip — inline label) */
+.reading-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 8px;
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  font-size: 0.72rem;
+  vertical-align: middle;
+}
+.reading-badge--warn {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
+
+/* ---- reading list screen ---- */
+.reading-list-card {
+  width: 100%;
+}
+
+.reading-list-loading {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+}
+
+.reading-list-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 24px 12px;
+  color: var(--md-sys-color-on-surface-variant);
+  text-align: center;
+}
+
+.reading-list-empty-icon svg {
+  width: 32px;
+  height: 32px;
+}
+
+.reading-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 20px;
+  max-height: min(52vh, 520px);
+  overflow-y: auto;
+}
+
+.reading-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: var(--md-sys-shape-corner-medium, 12px);
+  background: var(--md-sys-color-surface-container-low);
+  border: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.reading-list-item--missing {
+  opacity: 0.65;
+}
+
+.reading-list-item__main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.reading-list-item__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  word-break: break-all;
+}
+
+.reading-list-item__meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--md-sys-color-on-surface-variant);
+  word-break: break-all;
+}
+
+.reading-list-item__bar {
+  width: 100%;
+}
+
+.reading-list-item__frontier {
+  color: var(--md-sys-color-on-surface-variant);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.reading-list-item__frontier .reading-status-chip {
+  padding: 1px 8px;
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.reading-frontier-done {
+  color: var(--md-sys-color-primary);
+}
+
+.reading-list-item__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  flex-shrink: 0;
+}
+
+/* ---- corpus picker dialog (添加文件) ---- */
+.reading-picker-dialog {
+  width: min(520px, calc(100vw - 48px));
+  max-width: calc(100vw - 48px);
+}
+
+.reading-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: min(50vh, 420px);
+  overflow-y: auto;
+}
+
+.reading-picker-empty {
+  padding: 16px 4px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.reading-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+}
+
+.reading-picker-item:hover {
+  background: var(--md-sys-color-surface-container-low);
+}
+
+.reading-picker-item__text {
+  min-width: 0;
+}
+
+.reading-picker-item__path {
+  color: var(--md-sys-color-on-surface-variant);
+  word-break: break-all;
+}
+
+/* file-viewer loading state (shared component) */
+.file-viewer-loading {
+  display: flex;
+  justify-content: center;
+  padding: 24px 0;
+}

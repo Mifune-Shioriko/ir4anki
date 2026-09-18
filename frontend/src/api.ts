@@ -7,6 +7,11 @@ import type {
   PreviewActResponse,
   PreviewStartResponse,
   PreviewUndoResponse,
+  ReadingActResponse,
+  ReadingCorpusFile,
+  ReadingStartResponse,
+  ReadingStateResponse,
+  ReadingStatusResponse,
   SessionStateResponse,
   StartResponse,
   UndoResponse,
@@ -66,8 +71,16 @@ export const api = {
   previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),
   previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
   addInfo: () => get<{ model_name: string; fields: string[] }>('/api/card/add/info'),
-  addCard: (fields: Record<string, string>, tags: string[]) =>
-    post<{ noteId: number; cardIds: number[]; pool: number | null }>('/api/card/add', { fields, tags }),
+  addCard: (
+    fields: Record<string, string>,
+    tags: string[],
+    readingSource?: { path: string; chunk_key: string } | null,
+  ) =>
+    post<{ noteId: number; cardIds: number[]; pool: number | null }>('/api/card/add', {
+      fields,
+      tags,
+      ...(readingSource ? { reading_source: readingSource } : {}),
+    }),
   deleteCard: (cardId: number) =>
     post<{ deleted: boolean }>(`/api/card/delete?card_id=${cardId}`),
   toPreview: (cardId: number) =>
@@ -79,4 +92,24 @@ export const api = {
       parse<{ filename: string }>(r),
     )
   },
+  // ---- reading mode (渐进制卡, 2026-09-19) ----
+  readingStatus: () => get<ReadingStatusResponse>('/api/reading/status'),
+  readingState: () => get<ReadingStateResponse>('/api/reading/state'),
+  readingCorpus: () => get<{ files: ReadingCorpusFile[] }>('/api/reading/corpus'),
+  readingFile: (path: string) =>
+    get<{ path: string; text: string }>(`/api/reading/file?path=${encodeURIComponent(path)}`),
+  readingStart: (mode?: string) =>
+    post<ReadingStartResponse>(mode ? `/api/reading/start?mode=${mode}` : '/api/reading/start'),
+  readingAct: (path: string, chunkKey: string, action: string) =>
+    post<ReadingActResponse>(
+      `/api/reading/act?path=${encodeURIComponent(path)}` +
+        `&chunk_key=${encodeURIComponent(chunkKey)}&action=${action}`,
+    ),
+  readingFinish: () => post<{ ok: boolean; stats?: object }>('/api/reading/finish'),
+  readingListAdd: (path: string) =>
+    post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
+  readingListRemove: (path: string) =>
+    post<{ ok: boolean; order: string[] }>('/api/reading/list/remove', { path }),
+  readingListReorder: (arg: { path: string; top?: boolean } | { order: string[] }) =>
+    post<{ ok: boolean; order: string[] }>('/api/reading/list/reorder', arg),
 }

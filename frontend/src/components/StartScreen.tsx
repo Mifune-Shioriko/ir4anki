@@ -1,6 +1,7 @@
 import { Component, Show } from 'solid-js'
 import { ModeSelector } from './ModeSelector'
 import type { StudyModes } from '../types'
+import { IconMenuBook } from './icons'
 
 interface Props {
   due: number | null
@@ -11,6 +12,12 @@ interface Props {
   /** preview pool size; button hidden when null or 0 */
   previewPool?: number | null
   onToPreview?: () => void
+  /** 渐进制卡 (2026-09-19): entry to the reading-list manager; hidden when
+   * reading mode is off. Shown even with 0 dealable files so the user can
+   * always add/reorder notes. */
+  readingMode?: boolean
+  readingListSize?: number
+  onToReadingList?: () => void
   /** two-tier pacing (2026-09-14): table from the wire + current selection */
   studyModes?: StudyModes | null
   mode?: string
@@ -57,6 +64,12 @@ export const StartScreen: Component<Props> = (props) => {
               去预览新卡（{props.previewPool} 张）
             </md-text-button>
           )}
+          <Show when={props.readingMode}>
+            <md-text-button onClick={() => props.onToReadingList?.()} disabled={props.busy}>
+              <md-icon><IconMenuBook /></md-icon>
+              阅读清单{props.readingListSize ? `（${props.readingListSize}）` : ''}
+            </md-text-button>
+          </Show>
         </div>
       </md-elevated-card>
     </div>

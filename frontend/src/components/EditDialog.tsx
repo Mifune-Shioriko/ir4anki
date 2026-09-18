@@ -31,6 +31,10 @@ import {
 interface Props {
   cardId?: number
   mode?: 'edit' | 'add'
+  /** 渐进制卡 provenance (2026-09-19): when adding from a reading round,
+   * {path, chunk_key} of the source chunk — rides on /api/card/add so the
+   * note id lands in the chunk's cards_created */
+  readingSource?: { path: string; chunk_key: string } | null
   onClose: () => void
   onSaved?: (question: string, answer: string) => void
   onAdded?: (noteId: number) => void
@@ -299,7 +303,7 @@ export const EditDialog: Component<Props> = (props) => {
           setSaving(false)
           return
         }
-        const res = await api.addCard(out, tags())
+        const res = await api.addCard(out, tags(), props.readingSource ?? null)
         props.onAdded?.(res.noteId)
       } else {
         const res = await api.updateNote(props.cardId!, out, tags())

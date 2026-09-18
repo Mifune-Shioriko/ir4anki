@@ -31,12 +31,24 @@ Session model:
   - every answer triggers a fire-and-forget sync to the self-hosted server
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
+  - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
+    a reading segment of {mode.read} note chunks (quick=2, focus=5,
+    ANKI_QUICK_READ / ANKI_FOCUS_READ) runs BEFORE preview+review. The user
+    reads their own markdown notes (~/anki-notes, chunked by notes-rag's
+    chunker.py) and writes cards by hand. Per chunk: todo → active(正在制卡)
+    → done(制卡完成), or skipped(无需制卡). Within a file only the frontier
+    chunk is dealt, so later chunks stay locked until the frontier is
+    finished; an `active` chunk resurfaces first every round. Files are
+    opt-in via the 阅读清单 (manual priority). State: state/reading.json.
 """
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import random
+import re
+import sys
 import uuid
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
@@ -85,11 +97,13 @@ def _env_int(name: str, default: int) -> int:
 
 STUDY_MODES: dict[str, dict[str, int]] = {
     "quick": {
+        "read": _env_int("ANKI_QUICK_READ", 2),
         "preview": _env_int("ANKI_QUICK_PREVIEW", 5),
         "new": _env_int("ANKI_QUICK_NEW", 5),
         "review": _env_int("ANKI_QUICK_REVIEW", 20),
     },
     "focus": {
+        "read": _env_int("ANKI_FOCUS_READ", 5),
         "preview": _env_int("ANKI_FOCUS_PREVIEW", 10),
         "new": _env_int("ANKI_FOCUS_NEW", 10),
         "review": _env_int("ANKI_FOCUS_REVIEW", 30),
@@ -157,6 +171,36 @@ PREVIEW_FILE = STATE_DIR / "preview.json"
 NEW_AGAIN_RETURN = os.getenv("ANKI_NEW_AGAIN_RETURN", "1").lower() in ("1", "true", "yes", "on")
 NEW_AGAIN_LIMIT = max(1, _env_int("ANKI_NEW_AGAIN_LIMIT", 2))
 NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
+
+# ---- reading mode (渐进制卡, user spec 2026-09-19) ----
+# Progressive card-making: the user reads their own markdown notes chunk by
+# chunk and writes cards by hand (AI batch card-making proved too unreliable
+# — fixing bad cards costs more than writing them). Memory scheduling stays
+# with Anki/FSRS; the reading side is a plain priority queue + a 4-state
+# machine (todo → active → done, plus skipped), NO SuperMemo-style fragment
+# rescheduling in v1.
+#
+# Ordering rule (user spec): within one .md file only the FRONTIER chunk
+# (first one not done/skipped) is ever dealt — later chunks stay locked
+# until the frontier is finished. An `active` chunk IS the frontier, so it
+# automatically resurfaces at the head of every reading round until the
+# user marks it done/skipped (decision 2026-09-19 #1).
+#
+# Files are opt-in (阅读清单): the corpus mixes study notes with misc logs,
+# so nothing is auto-queued; the user adds files and orders them by hand
+# (decision #2). Round size rides the pacing modes: STUDY_MODES[*]["read"]
+# (decision #4). Chunks come from notes-rag's chunker.py (single source of
+# truth — imported, not copied) over ~/anki-notes.
+#
+# Gated on ANKI_READING_MODE like preview: off ⇒ endpoints 404, the wire
+# reports reading_mode=false and the frontend renders the legacy UI.
+READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes", "on")
+NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
+NOTES_RAG_DIR = os.getenv("NOTES_RAG_DIR", str(Path.home() / "notes-rag"))
+READING_FILE = STATE_DIR / "reading.json"
+# same exclusion set notes-rag/sync.py uses
+NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules"}
+READING_ACTIONS = ("mark_active", "complete", "skip", "next")
 
 
 def _active_preview_per_round() -> int | None:
@@ -571,6 +615,7 @@ async def status():
             "new_total": len(new or []),
             "new_per_round": STUDY_MODES[DEFAULT_MODE]["new"],
             "preview_mode": PREVIEW_MODE,
+            "reading_mode": READING_MODE,
             # two pacing modes (user spec 2026-09-14) — the frontend renders
             # the start-screen choice from this table, never hardcoded
             "study_modes": _capped_study_modes(budget),
@@ -580,6 +625,11 @@ async def status():
         }
         if PREVIEW_MODE:
             out["preview_pool"] = len(await preview_pool_ids() or [])
+        if READING_MODE:
+            try:
+                out.update(await _reading_extras())
+            except Exception:
+                pass  # fail-soft: status must never break on reading state
         return out
     except Exception as e:
         return {"anki": "error", "detail": str(e)}
@@ -742,6 +792,14 @@ async def _session_state_impl():
             preview["preview_pool"] = None
 
     rd = current_round()
+    reading: dict = {}
+    if READING_MODE:
+        try:
+            reading = await _reading_extras()
+        except Exception:
+            reading = {"reading_mode": True}
+    else:
+        reading = {"reading_mode": False}
     if rd is None:
         return {
             "state": "none",
@@ -750,6 +808,7 @@ async def _session_state_impl():
             "new_total": new_total,
             "can_undo": False,
             **preview,
+            **reading,
         }
 
     mode = study_mode(rd.get("mode"))
@@ -765,6 +824,7 @@ async def _session_state_impl():
             "can_undo": bool((rd.get("last") or {}).get("snap")),
             "mode": mode,
             **preview,
+            **reading,
         }
 
     cards = await restore_round_cards(rd)
@@ -780,6 +840,7 @@ async def _session_state_impl():
             "can_undo": bool((rd.get("last") or {}).get("snap")),
             "mode": study_mode(rd.get("mode")),
             **preview,
+            **reading,
         }
     return {
         "state": "active",
@@ -793,6 +854,7 @@ async def _session_state_impl():
         "can_undo": bool((rd.get("last") or {}).get("snap")),
         "mode": mode,
         **preview,
+        **reading,
     }
 
 
@@ -1725,6 +1787,11 @@ async def add_info():
 class NoteAdd(BaseModel):
     fields: dict[str, str]
     tags: list[str] = []
+    # 渐进制卡 provenance (user spec 2026-09-19): when the card was written
+    # from a reading chunk, {path, chunk_key} records the source so the note
+    # id lands in that chunk's cards_created (溯源: which cards came from
+    # which fragment). Omitted for cards added outside reading rounds.
+    reading_source: dict | None = None
 
 
 @app.post("/api/card/add")
@@ -1771,6 +1838,13 @@ async def add_card(body: NoteAdd):
         await anki("changeDeck", {"cards": card_ids, "deck": PREVIEW_DECK})
         await anki("suspend", {"cards": card_ids})
         pool = await preview_pool_count()
+    # 渐进制卡 provenance: record the note id on its source chunk (fail-soft —
+    # reading bookkeeping must never break card creation)
+    if READING_MODE and body.reading_source:
+        try:
+            _reading_record_card(body.reading_source, note_id)
+        except Exception:
+            pass
     fire_and_forget_sync()
     return {"noteId": note_id, "cardIds": card_ids, "pool": pool}
 
@@ -1855,6 +1929,694 @@ async def _to_preview_pool_impl(card_id: int):
     _streak_clear(card_id)  # manual return = fresh start; drop any streak
     fire_and_forget_sync()
     return {"moved": True, "pool": await preview_pool_count()}
+
+
+# ---- reading mode (渐进制卡, user spec 2026-09-19) -------------------------
+# The user reads their own markdown notes chunk by chunk and writes cards by
+# hand. Chunk states (human-marked): todo → active(正在制卡) → done(制卡完成),
+# plus skipped(无需制卡) — done and skipped both unlock the file's next chunk.
+# Within one file only the FRONTIER chunk (first not done/skipped) is ever
+# dealt; an `active` chunk IS the frontier, so unfinished work automatically
+# resurfaces at the head of the next reading round.
+#
+# Files are opt-in via the 阅读清单 (manual priority order = list order).
+# Chunking reuses notes-rag's chunker.py (imported, NOT copied — single
+# source of truth) over the ~/anki-notes corpus.
+#
+# Chunk identity: "{line_start}:{heading_path joined by >}". File edits shift
+# line numbers, so on drift the stored states migrate: exact key first, then
+# heading-path match (split parts of one section migrate in line order),
+# anything unmatched becomes an orphan (chunk falls back to todo, old state
+# parked in entry["orphans"] and surfaced as a count for a future repair UI).
+#
+# All mutating endpoints run under _state_lock (same serialization as the
+# preview round); reads that may persist migrations take it too.
+
+def _reading_guard():
+    """Reading endpoints only exist when the feature flag is on."""
+    if not READING_MODE:
+        raise HTTPException(status_code=404, detail="reading mode disabled")
+
+
+_chunker_mod = None
+
+
+def _chunker():
+    """Lazy-import notes-rag's chunker module (env NOTES_RAG_DIR)."""
+    global _chunker_mod
+    if _chunker_mod is None:
+        if NOTES_RAG_DIR not in sys.path:
+            sys.path.insert(0, NOTES_RAG_DIR)
+        import chunker as _c
+
+        _chunker_mod = _c
+    return _chunker_mod
+
+
+def _read_note_text(path: str) -> str | None:
+    """Traversal-safe read of one corpus file (relative path under NOTES_DIR)."""
+    try:
+        root = NOTES_DIR.resolve()
+        p = (NOTES_DIR / path).resolve()
+        if not p.is_relative_to(root) or p.suffix.lower() != ".md" or not p.is_file():
+            return None
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _corpus_files() -> list[str]:
+    """All non-empty .md files under NOTES_DIR (relative paths, sorted).
+
+    Same exclusion rules as notes-rag's sync (SKIP_DIRS + empty files), so
+    the corpus view matches what the note panel can retrieve.
+    """
+    if not NOTES_DIR.is_dir():
+        return []
+    out = []
+    for p in sorted(NOTES_DIR.rglob("*.md")):
+        rel = p.relative_to(NOTES_DIR)
+        if any(part in NOTES_SKIP_DIRS for part in rel.parts):
+            continue
+        try:
+            if p.stat().st_size == 0:
+                continue
+        except OSError:
+            continue
+        out.append(str(rel))
+    return out
+
+
+# path -> (content sha, chunks); re-chunking only happens after a file edit
+_chunk_cache: dict[str, tuple[str, list[dict]]] = {}
+
+# Reading-only filter: the shared chunker keeps heading-only sections (e.g.
+# a file's top "# 标题" line before the first "## 小节") — useful anchors for
+# RAG, but a pointless "read this + make cards" step. Drop chunks whose body
+# (heading lines stripped) is shorter than this.
+MIN_READING_BODY = 10
+
+
+def _reading_worthwhile(ch: dict) -> bool:
+    body = re.sub(r"^#{1,6}\s+.*$", "", ch.get("text", ""), flags=re.M).strip()
+    return len(body) >= MIN_READING_BODY
+
+
+def _chunks_for(path: str) -> tuple[list[dict], str] | None:
+    """(chunks, content-sha) for one corpus file; None when missing/unreadable."""
+    text = _read_note_text(path)
+    if text is None:
+        return None
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    hit = _chunk_cache.get(path)
+    if hit and hit[0] == sha:
+        return hit[1], sha
+    c = _chunker()
+    chunks = [ch for ch in c.chunk_markdown(text, path, c.file_year(path))
+              if _reading_worthwhile(ch)]
+    _chunk_cache[path] = (sha, chunks)
+    return chunks, sha
+
+
+def _chunk_key(ch: dict) -> str:
+    return f'{ch["line_start"]}:{">".join(ch["heading_path"])}'
+
+
+def _migrate_entry(entry: dict, chunks: list[dict], sha: str) -> None:
+    """Re-key stored chunk states after the file changed (see header comment).
+
+    No-op when the stored file_sha matches. Mutates entry in place; the
+    CALLER persists reading.json.
+    """
+    if entry.get("file_sha") == sha:
+        return
+    states: dict = entry.get("chunks") or {}
+    new_keys = {_chunk_key(c) for c in chunks}
+    by_hp: dict[str, list[str]] = {}
+    for c in chunks:
+        by_hp.setdefault(">".join(c["heading_path"]), []).append(_chunk_key(c))
+    consumed: set[str] = set()
+    migrated: dict = {}
+    orphans = list(entry.get("orphans") or [])
+
+    def _line_of(k: str) -> int:
+        head = k.split(":", 1)[0]
+        return int(head) if head.isdigit() else 0
+
+    for key in sorted(states, key=_line_of):
+        st = states[key]
+        if key in new_keys and key not in consumed:
+            migrated[key] = st
+            consumed.add(key)
+            continue
+        hp = key.split(":", 1)[1] if ":" in key else ""
+        cand = next(
+            (k for k in by_hp.get(hp, []) if k not in consumed and k not in migrated),
+            None,
+        )
+        if cand:
+            migrated[cand] = st
+            consumed.add(cand)
+        else:
+            orphans.append({"chunk_key": key, **st})
+    entry["chunks"] = migrated
+    entry["orphans"] = orphans
+    entry["file_sha"] = sha
+
+
+def _file_view(entry: dict):
+    """(ordered, summary) for one reading-list entry.
+
+    ordered = [(chunk, key, state_dict)] in file order, or None when the file
+    vanished from the corpus. Migrates stored states on drift (caller persists).
+    """
+    loaded = _chunks_for(entry["path"])
+    if loaded is None:
+        return None, {
+            "path": entry["path"],
+            "title": Path(entry["path"]).stem,
+            "missing": True,
+            "total_chunks": 0,
+            "todo": 0,
+            "active": 0,
+            "done": 0,
+            "skipped": 0,
+            "frontier": None,
+            "orphans": len(entry.get("orphans") or []),
+            "cards_created": 0,
+        }
+    chunks, sha = loaded
+    _migrate_entry(entry, chunks, sha)
+    states = entry.get("chunks") or {}
+    ordered = [(ch, _chunk_key(ch), states.get(_chunk_key(ch)) or {}) for ch in chunks]
+    return ordered, _file_summary(entry, ordered)
+
+
+def _file_summary(entry: dict, ordered) -> dict:
+    if ordered is None:
+        return {
+            "path": entry["path"],
+            "title": Path(entry["path"]).stem,
+            "missing": True,
+            "total_chunks": 0,
+            "todo": 0,
+            "active": 0,
+            "done": 0,
+            "skipped": 0,
+            "frontier": None,
+            "orphans": len(entry.get("orphans") or []),
+            "cards_created": 0,
+        }
+    counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0}
+    cards = 0
+    frontier = None
+    for ch, key, st in ordered:
+        s = st.get("status", "todo")
+        counts[s if s in counts else "todo"] += 1
+        cards += len(st.get("cards_created") or [])
+        if frontier is None and s not in ("done", "skipped"):
+            frontier = {
+                "chunk_key": key,
+                "status": s,
+                "title": ch.get("title") or Path(entry["path"]).stem,
+                "line_start": ch["line_start"],
+            }
+    return {
+        "path": entry["path"],
+        "title": Path(entry["path"]).stem,
+        "missing": False,
+        "total_chunks": len(ordered),
+        **counts,
+        "frontier": frontier,
+        "orphans": len(entry.get("orphans") or []),
+        "cards_created": cards,
+    }
+
+
+def _chunk_payload(ch: dict, key: str, st: dict, summary: dict) -> dict:
+    return {
+        "path": ch["file"],
+        "chunk_key": key,
+        "title": ch.get("title") or Path(ch["file"]).stem,
+        "heading_path": ch.get("heading_path") or [],
+        "line_start": ch["line_start"],
+        "line_end": ch["line_end"],
+        "text": ch["text"],
+        "status": st.get("status", "todo"),
+        "cards_created": list(st.get("cards_created") or []),
+        "file_chunks": summary.get("total_chunks", 0),
+        "file_done": summary.get("done", 0),
+        "file_skipped": summary.get("skipped", 0),
+    }
+
+
+def _reading_read() -> dict:
+    STATE_DIR.mkdir(exist_ok=True)
+    if not READING_FILE.exists():
+        return {"list": [], "archive": {}}
+    try:
+        d = json.loads(READING_FILE.read_text())
+        if not isinstance(d, dict):
+            raise ValueError("bad shape")
+        d.setdefault("list", [])
+        d.setdefault("archive", {})
+        rd = d.get("round")
+        if isinstance(rd, dict) and _round_expired(rd):
+            d["round"] = None  # half-finished reading round older than 24h
+        return d
+    except Exception:
+        return {"list": [], "archive": {}}
+
+
+def _reading_write(d: dict | None):
+    STATE_DIR.mkdir(exist_ok=True)
+    if d is None:
+        READING_FILE.unlink(missing_ok=True)
+    else:
+        tmp = READING_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(d, ensure_ascii=False))
+        tmp.replace(READING_FILE)
+
+
+def _find_entry(data: dict, path: str) -> dict | None:
+    return next((e for e in data.get("list", []) if e.get("path") == path), None)
+
+
+def _deal_reading(data: dict, per_round: int) -> list[dict]:
+    """One frontier chunk per file, in 阅读清单 priority order."""
+    payloads: list[dict] = []
+    for entry in data.get("list", []):
+        if len(payloads) >= per_round:
+            break
+        ordered, summary = _file_view(entry)  # may migrate entry (caller saves)
+        if not ordered or not summary.get("frontier"):
+            continue
+        fr_key = summary["frontier"]["chunk_key"]
+        for ch, key, st in ordered:
+            if key == fr_key:
+                payloads.append(_chunk_payload(ch, key, st, summary))
+                break
+    return payloads
+
+
+def _reading_round_payload(data: dict) -> dict | None:
+    """Wire shape of the stored round; None when there is none.
+
+    An active round rehydrates its pending chunks from disk. Chunks that
+    drifted away (file edited mid-round) or whose file left the list are
+    dropped and counted as done — the round must never strand.
+    """
+    rd = data.get("round")
+    if not isinstance(rd, dict):
+        return None
+    if rd.get("status") == "complete":
+        return {
+            "status": "complete",
+            "done": rd.get("done", 0),
+            "total": rd.get("total", 0),
+            "stats": rd.get("stats", {}),
+            "mode": study_mode(rd.get("mode")),
+        }
+    pending_chunks = []
+    for item in rd.get("pending", []):
+        entry = _find_entry(data, item.get("path", ""))
+        if entry is None:
+            continue
+        ordered, summary = _file_view(entry)
+        match = next(
+            ((ch, key, st) for ch, key, st in (ordered or [])
+             if key == item.get("chunk_key")),
+            None,
+        )
+        if match is None:
+            continue
+        ch, key, st = match
+        pending_chunks.append(_chunk_payload(ch, key, st, summary))
+    dropped = len(rd.get("pending", [])) - len(pending_chunks)
+    if dropped:
+        rd["done"] = rd.get("done", 0) + dropped
+        rd["pending"] = [
+            {"path": p["path"], "chunk_key": p["chunk_key"]} for p in pending_chunks
+        ]
+        if not rd["pending"]:
+            rd["status"] = "complete"
+    if rd.get("status") == "complete":
+        return {
+            "status": "complete",
+            "done": rd.get("done", 0),
+            "total": rd.get("total", 0),
+            "stats": rd.get("stats", {}),
+            "mode": study_mode(rd.get("mode")),
+        }
+    return {
+        "status": "active",
+        "chunks": pending_chunks,
+        "done": rd.get("done", 0),
+        "total": rd.get("total", len(pending_chunks)),
+        "stats": rd.get("stats", {}),
+        "mode": study_mode(rd.get("mode")),
+    }
+
+
+def _reading_record_card(src: dict | None, note_id: int) -> None:
+    """Append a just-created note id to the source chunk's cards_created.
+
+    Fail-soft by contract (caller wraps in try): reading bookkeeping must
+    never break card creation.
+    """
+    path = (src or {}).get("path")
+    key = (src or {}).get("chunk_key")
+    if not path or not key:
+        return
+    data = _reading_read()
+    entry = _find_entry(data, path)
+    if entry is None:
+        return
+    st = entry.setdefault("chunks", {}).setdefault(key, {})
+    created = st.setdefault("cards_created", [])
+    if note_id not in created:
+        created.append(note_id)
+    _reading_write(data)
+
+
+async def _reading_extras() -> dict:
+    """Reading fields for /api/session/state (mirrors the preview extras).
+
+    reading_round rides along ONLY while active (same policy as preview_round)
+    so a page reload resumes the reading segment; the completed tombstone is
+    reachable via GET /api/reading/state.
+    """
+    out: dict = {"reading_mode": READING_MODE}
+    if not READING_MODE:
+        return out
+    try:
+        data = _reading_read()
+        summaries = []
+        for entry in data.get("list", []):
+            _, summary = _file_view(entry)
+            summaries.append(summary)
+        out["reading_list_size"] = len(data.get("list", []))
+        out["reading_available"] = sum(1 for s in summaries if s.get("frontier"))
+        out["reading_active"] = sum(s.get("active", 0) for s in summaries)
+        rp = _reading_round_payload(data)
+        if rp is not None and rp.get("status") == "active":
+            out["reading_round"] = rp
+        _reading_write(data)  # persist any drift migrations
+    except Exception:
+        pass  # fail-soft: session/state must never break on reading state
+    return out
+
+
+@app.get("/api/reading/status")
+async def reading_status():
+    """阅读清单 overview + the stored round (lock: _file_view may migrate)."""
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        summaries = []
+        for entry in data.get("list", []):
+            _, summary = _file_view(entry)
+            summaries.append(summary)
+        rp = _reading_round_payload(data)
+        _reading_write(data)
+        return {
+            "reading_mode": True,
+            "list": summaries,
+            "round": rp,
+            "available": sum(1 for s in summaries if s.get("frontier")),
+            "study_modes": STUDY_MODES,
+        }
+
+
+@app.get("/api/reading/corpus")
+async def reading_corpus():
+    """Every indexable .md in the corpus, flagged by reading-list membership."""
+    _reading_guard()
+    data = _reading_read()
+    listed = {e["path"] for e in data.get("list", [])}
+    return {
+        "files": [
+            {"path": p, "title": Path(p).stem, "in_list": p in listed}
+            for p in _corpus_files()
+        ]
+    }
+
+
+class ReadingPathBody(BaseModel):
+    path: str
+
+
+class ReadingReorderBody(BaseModel):
+    order: list[str] | None = None  # full priority rewrite
+    path: str | None = None         # …or move ONE file (top=True → to front,
+    top: bool = False               #    else one position up)
+
+
+@app.post("/api/reading/list/add")
+async def reading_list_add(body: ReadingPathBody):
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        if _find_entry(data, body.path):
+            raise HTTPException(status_code=409, detail="already in the reading list")
+        loaded = _chunks_for(body.path)
+        if loaded is None:
+            raise HTTPException(status_code=404, detail="note file not found in the corpus")
+        chunks, sha = loaded
+        if not chunks:
+            raise HTTPException(status_code=400, detail="文件里没有可读的片段")
+        # re-adding a previously removed file restores its old progress
+        archived = (data.get("archive") or {}).pop(body.path, None) or {}
+        data["list"].append(
+            {
+                "path": body.path,
+                "added_at": datetime.now().isoformat(timespec="seconds"),
+                "file_sha": archived.get("file_sha", sha),
+                "chunks": archived.get("chunks", {}),
+                "orphans": archived.get("orphans", []),
+            }
+        )
+        _reading_write(data)
+        return {"ok": True, "order": [e["path"] for e in data["list"]]}
+
+
+@app.post("/api/reading/list/remove")
+async def reading_list_remove(body: ReadingPathBody):
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        entry = _find_entry(data, body.path)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="not in the reading list")
+        data["list"] = [e for e in data["list"] if e.get("path") != body.path]
+        # park the progress so a later re-add doesn't start from scratch
+        data.setdefault("archive", {})[body.path] = {
+            "file_sha": entry.get("file_sha"),
+            "chunks": entry.get("chunks", {}),
+            "orphans": entry.get("orphans", []),
+        }
+        rd = data.get("round")
+        if isinstance(rd, dict) and rd.get("status") == "active":
+            before = len(rd.get("pending", []))
+            rd["pending"] = [p for p in rd.get("pending", []) if p.get("path") != body.path]
+            rd["done"] = rd.get("done", 0) + (before - len(rd["pending"]))
+            if not rd["pending"]:
+                rd["status"] = "complete"
+        _reading_write(data)
+        return {"ok": True, "order": [e["path"] for e in data["list"]]}
+
+
+@app.post("/api/reading/list/reorder")
+async def reading_list_reorder(body: ReadingReorderBody):
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        if body.order is not None:
+            by_path = {e["path"]: e for e in data.get("list", [])}
+            seen = set(body.order)
+            data["list"] = [by_path[p] for p in body.order if p in by_path]
+            # defensive: entries missing from `order` keep their relative
+            # spot at the end instead of vanishing
+            data["list"] += [e for e in by_path.values() if e["path"] not in seen]
+        elif body.path:
+            entry = _find_entry(data, body.path)
+            if entry is None:
+                raise HTTPException(status_code=404, detail="not in the reading list")
+            rest = [e for e in data["list"] if e.get("path") != body.path]
+            if body.top:
+                data["list"] = [entry] + rest
+            else:
+                idx = next(
+                    (i for i, e in enumerate(data["list"]) if e.get("path") == body.path),
+                    0,
+                )
+                if idx > 0:
+                    data["list"][idx - 1], data["list"][idx] = (
+                        data["list"][idx],
+                        data["list"][idx - 1],
+                    )
+        else:
+            raise HTTPException(status_code=400, detail="provide order[] or path")
+        _reading_write(data)
+        return {"ok": True, "order": [e["path"] for e in data["list"]]}
+
+
+@app.get("/api/reading/state")
+async def reading_state():
+    """Resume payload: the stored round (active OR complete tombstone) plus
+    the list overview — the reading screens' single entry point on load."""
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        summaries = []
+        for entry in data.get("list", []):
+            _, summary = _file_view(entry)
+            summaries.append(summary)
+        rp = _reading_round_payload(data)
+        _reading_write(data)
+        return {
+            "reading_mode": True,
+            "round": rp,
+            "list": summaries,
+            "available": sum(1 for s in summaries if s.get("frontier")),
+        }
+
+
+@app.post("/api/reading/start")
+async def reading_start(mode: str | None = None):
+    """Deal one reading segment: STUDY_MODES[mode]["read"] frontier chunks."""
+    async with _state_lock:
+        _reading_guard()
+        return _reading_start_impl(study_mode(mode))
+
+
+def _reading_start_impl(mode: str = DEFAULT_MODE):
+    data = _reading_read()
+    per_round = STUDY_MODES[mode].get("read", 0)
+    payloads = _deal_reading(data, per_round) if per_round > 0 else []
+    if not payloads:
+        _reading_write(data)  # persist migrations even on an empty deal
+        return {"chunks": [], "mode": mode, "empty": True, "study_modes": STUDY_MODES}
+    data["round"] = {
+        "status": "active",
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "mode": mode,
+        "total": len(payloads),
+        "done": 0,
+        "stats": {"done": 0, "skipped": 0, "next": 0},
+        "pending": [
+            {"path": p["path"], "chunk_key": p["chunk_key"]} for p in payloads
+        ],
+    }
+    _reading_write(data)
+    return {
+        "chunks": payloads,
+        "mode": mode,
+        "empty": False,
+        "study_modes": STUDY_MODES,
+    }
+
+
+@app.post("/api/reading/act")
+async def reading_act(path: str, chunk_key: str, action: str):
+    async with _state_lock:
+        _reading_guard()
+        return _reading_act_impl(path, chunk_key, action)
+
+
+def _reading_act_impl(path: str, chunk_key: str, action: str):
+    """Per-chunk decision inside a reading round.
+
+    mark_active: todo → active (正在制卡). Does NOT advance the round — the
+        user stays on the chunk making cards; it resurfaces next round until
+        completed/skipped.
+    complete: → done (制卡完成). Advances; unlocks the file's next chunk.
+    skip:     → skipped (无需制卡). Advances; unlocks the next chunk too.
+    next:     no status change (下一张, 稍后继续). Advances the round only —
+        the chunk stays frontier and comes back next round.
+    """
+    if action not in READING_ACTIONS:
+        raise HTTPException(
+            status_code=400, detail="action must be mark_active|complete|skip|next"
+        )
+    data = _reading_read()
+    rd = data.get("round")
+    if not isinstance(rd, dict) or rd.get("status") != "active":
+        raise HTTPException(status_code=409, detail="no active reading round")
+    target = {"path": path, "chunk_key": chunk_key}
+    if target not in rd.get("pending", []):
+        return {"ok": False, "reason": "stale"}
+    entry = _find_entry(data, path)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="file not in the reading list")
+    ordered, _ = _file_view(entry)
+    keys = {key for _, key, _ in ordered or []}
+
+    def _drop_and_maybe_complete() -> bool:
+        rd["pending"] = [p for p in rd.get("pending", []) if p != target]
+        rd["done"] = rd.get("done", 0) + 1
+        if not rd["pending"]:
+            rd["status"] = "complete"
+            return True
+        return False
+
+    if chunk_key not in keys:
+        # file drifted mid-round and this exact chunk is gone — don't strand
+        # the round on it; the frontier logic re-picks on the next deal
+        complete = _drop_and_maybe_complete()
+        _reading_write(data)
+        return {"ok": False, "reason": "drifted", "round_complete": complete}
+
+    states = entry.setdefault("chunks", {})
+    st = states.setdefault(chunk_key, {})
+    if action == "mark_active":
+        if st.get("status", "todo") == "todo":
+            st["status"] = "active"
+    elif action == "complete":
+        st["status"] = "done"
+    elif action == "skip":
+        st["status"] = "skipped"
+    st["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    round_complete = False
+    if action in ("complete", "skip", "next"):
+        stats_key = {"complete": "done", "skip": "skipped", "next": "next"}[action]
+        stats = rd.setdefault("stats", {})
+        stats[stats_key] = stats.get(stats_key, 0) + 1
+        round_complete = _drop_and_maybe_complete()
+    _reading_write(data)
+    return {
+        "ok": True,
+        "status": st.get("status", "todo"),
+        "round_complete": round_complete,
+        "stats": rd.get("stats", {}),
+        "done": rd.get("done", 0),
+        "total": rd.get("total", 0),
+    }
+
+
+@app.post("/api/reading/finish")
+async def reading_finish():
+    """Mid-round exit: the round is cleared, chunk states are untouched
+    (untouched chunks stay todo/active and are re-dealt next round)."""
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        stats = (data.get("round") or {}).get("stats", {})
+        data["round"] = None
+        _reading_write(data)
+        return {"ok": True, "stats": stats}
+
+
+@app.get("/api/reading/file")
+async def reading_file(path: str):
+    """Raw markdown for the reading right-hand panel (served directly from
+    the corpus — independent of the notes-rag service being up)."""
+    _reading_guard()
+    text = _read_note_text(path)
+    if text is None:
+        raise HTTPException(status_code=404, detail="note file not found")
+    return {"path": path, "text": text}
 
 
 # ---- media upload + tag helpers --------------------------------------------

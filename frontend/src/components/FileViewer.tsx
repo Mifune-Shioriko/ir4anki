@@ -1,0 +1,145 @@
+import { Component, createEffect, createSignal, onCleanup } from 'solid-js'
+import { renderMarkdown } from '../lib/markdown'
+
+// Shared whole-file markdown viewer with source-line anchoring.
+// Extracted from NotePanel (2026-09-19, 渐进制卡) so the card→note panel and
+// the reading right column (whole-file context behind the current chunk)
+// render + anchor + flash IDENTICALLY.
+//
+// Rendering: lib/markdown.ts (markdown-it + KaTeX, html:false) — headings
+// carry [data-src-line] (1-based source line), so the anchor is exact for
+// section starts; split parts / preamble fall back to the closest heading
+// at or before anchorLine (findAnchor), then to the top.
+//
+// Flash: the anchor heading + following siblings up to the next
+// [data-src-line] get .note-hl (2.8s primary fade) — same idiom as the
+// original NotePanel.
+//
+// The component is a CONTENT div (not a scroll container): whichever
+// ancestor scrolls (.note-panel-inner, .reading-note-inner) receives the
+// scrollIntoView. File texts are cached module-wide (same cache NotePanel
+// used) so tab/panel switches never re-fetch.
+
+const fileCache = new Map<string, string>()
+
+interface Props {
+  /** corpus-relative path; null renders nothing */
+  path: string | null
+  /** 1-based source line to scroll+flash; null = no anchoring */
+  anchorLine: number | null
+  /** bump to re-fire the anchor effect for the same path+line (tab switch) */
+  anchorToken?: unknown
+  /** fetcher: NotePanel → /api/notes/raw (notes-rag relay),
+   *  reading panel → /api/reading/file (corpus-direct) */
+  fetchFile: (path: string) => Promise<{ text: string }>
+  class?: string
+  onError?: () => void
+}
+
+function findAnchor(root: HTMLElement, line: number): HTMLElement | null {
+  const els = Array.from(root.querySelectorAll<HTMLElement>('[data-src-line]'))
+  let best: HTMLElement | null = null
+  let bestLine = -1
+  for (const el of els) {
+    const l = parseInt(el.dataset.srcLine || '0', 10)
+    if (l <= line && l > bestLine) {
+      best = el
+      bestLine = l
+    }
+  }
+  return best
+}
+
+export const FileViewer: Component<Props> = (props) => {
+  const [html, setHtml] = createSignal('')
+  const [loading, setLoading] = createSignal(false)
+  let rootRef: HTMLDivElement | undefined
+  // monotonic request token: a stale fetch (path swapped mid-flight) can
+  // never overwrite the newer file's state
+  let reqToken = 0
+  let flashTimer: ReturnType<typeof setTimeout> | null = null
+
+  const load = () => {
+    const path = props.path
+    const token = ++reqToken
+    if (flashTimer) {
+      clearTimeout(flashTimer)
+      flashTimer = null
+    }
+    if (!path) {
+      setHtml('')
+      setLoading(false)
+      return
+    }
+    const cached = fileCache.get(path)
+    if (cached != null) {
+      setHtml(renderMarkdown(cached))
+      setLoading(false)
+      return
+    }
+    setLoading(true)
+    props
+      .fetchFile(path)
+      .then(d => {
+        if (token !== reqToken) return
+        fileCache.set(path, d.text)
+        setHtml(renderMarkdown(d.text))
+        setLoading(false)
+      })
+      .catch(() => {
+        if (token !== reqToken) return
+        setLoading(false)
+        setHtml('')
+        props.onError?.()
+      })
+  }
+
+  createEffect(() => {
+    props.path // track
+    load()
+  })
+
+  // scroll + flash the anchored section after (re)render. Tracks html() and
+  // anchorToken: the same file+line must re-flash on a tab/panel swap.
+  createEffect(() => {
+    const h = html()
+    const line = props.anchorLine
+    const tok = props.anchorToken
+    void tok
+    if (!h || line == null) return
+    requestAnimationFrame(() => {
+      const root = rootRef
+      if (!root) return
+      root.querySelectorAll('.note-hl').forEach(el => el.classList.remove('note-hl'))
+      const anchor = findAnchor(root, line)
+      if (!anchor) return
+      anchor.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      const els: HTMLElement[] = [anchor]
+      let n = anchor.nextElementSibling as HTMLElement | null
+      while (n && !n.hasAttribute('data-src-line')) {
+        els.push(n)
+        n = n.nextElementSibling as HTMLElement | null
+      }
+      els.forEach(el => el.classList.add('note-hl'))
+      if (flashTimer) clearTimeout(flashTimer)
+      flashTimer = setTimeout(() => {
+        els.forEach(el => el.classList.remove('note-hl'))
+      }, 2800)
+    })
+  })
+
+  onCleanup(() => {
+    if (flashTimer) clearTimeout(flashTimer)
+  })
+
+  return (
+    <>
+      {loading() && (
+        <div class="file-viewer-loading">
+          <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />
+        </div>
+      )}
+      <div class={props.class ?? ''} ref={rootRef} innerHTML={html()} />
+    </>
+  )
+}

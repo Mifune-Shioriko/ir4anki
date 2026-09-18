@@ -49,8 +49,9 @@ async def main():
         st = (await c.get("/api/status")).json()
         check("status anki ok", st.get("anki") == "ok", st)
         modes = st.get("study_modes") or {}
-        check("quick = 5+5+20", modes.get("quick") == {"preview": 5, "new": 5, "review": 20}, modes)
-        check("focus = 10+10+30", modes.get("focus") == {"preview": 10, "new": 10, "review": 30}, modes)
+        # read = 渐进制卡 segment size (2026-09-19); riding the same wire table
+        check("quick = 2+5+5+20", modes.get("quick") == {"read": 2, "preview": 5, "new": 5, "review": 20}, modes)
+        check("focus = 5+10+10+30", modes.get("focus") == {"read": 5, "preview": 10, "new": 10, "review": 30}, modes)
         check("release_daily_goal = 40", st.get("release_daily_goal") == 40, st.get("release_daily_goal"))
         check("default_mode = quick", st.get("default_mode") == "quick")
         check("status still has preview_mode", st.get("preview_mode") is True)
