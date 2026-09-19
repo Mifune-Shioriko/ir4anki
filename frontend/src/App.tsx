@@ -3,6 +3,7 @@ import { api } from './api'
 import type { Card } from './types'
 import { syncThemeColor } from './theme'
 import { stripTemplateBlocks } from './lib/clean'
+import { mdToClozeText, wrapSelectionAsCloze } from './lib/cloze'
 
 import { NavRail } from './components/NavRail'
 import type { Section } from './components/NavRail'
@@ -569,14 +570,25 @@ export const App: Component = () => {
     setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
     setAddOpen(true)
   }
-  // 添加挖空 (user spec 2026-09-19 round 2): selection inside the chunk
-  // body seeds the dialog as a ready-made {{c1::…}}; no selection → the
-  // whole chunk text as the starting point.
-  const openReadingCloze = (selText: string) => {
+  // 添加挖空 (user spec 2026-09-19 round 2; CONTEXT FIX 2026-09-20): the
+  // dialog seeds from the WHOLE chunk (markdown → plain text — Anki renders
+  // fields literally, so **/## would show up as junk). A selection inside
+  // the chunk body is auto-wrapped in {{c1::…}} IN PLACE, keeping the
+  // surrounding sentence as recall context. The OLD behavior seeded with
+  // ONLY the selection — the card front became a bare "[…]" with nothing to
+  // recall from (user report). Selection can't be located in the converted
+  // text (exotic markdown) → whole chunk, user wraps manually. No selection
+  // → whole chunk as-is.
+  const openReadingCloze = (selText: string, selBlock?: string) => {
     const chunk = rdCurrent()
     if (!chunk) return
-    const base = selText ? `{{c1::${selText}}}` : chunk.text
-    setClozeInitial(base)
+    const base = mdToClozeText(chunk.text)
+    let seed = base
+    if (selText) {
+      const wrapped = wrapSelectionAsCloze(base, selText, 1, selBlock || undefined)
+      if (wrapped !== null) seed = wrapped
+    }
+    setClozeInitial(seed)
     setAddSource({ path: chunk.path, chunk_key: chunk.chunk_key })
     setClozeOpen(true)
   }
@@ -976,7 +988,7 @@ export const App: Component = () => {
       } else if (e.key === 'c' || e.key === 'C') {
         e.preventDefault()
         // keyboard path has no selection context — seed from the whole chunk
-        openReadingCloze('')
+        openReadingCloze('', '')
       } else if (e.key === 's' || e.key === 'S') {
         e.preventDefault()
         rdAct('skip')

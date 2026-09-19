@@ -47,8 +47,11 @@ interface Props {
   onSkip: () => void
   /** open the add-card dialog pre-linked to this chunk */
   onAdd: () => void
-  /** open the cloze dialog; selText = selection inside the chunk body ('' = none) */
-  onCloze: (selText: string) => void
+  /** open the cloze dialog; selText = selection inside the chunk body,
+   * selBlock = text of the block element (li/p/heading…) containing it
+   * ('' = no selection). The block disambiguates WHICH occurrence of a
+   * repeated word the user meant when wrapping in {{c1::}}. */
+  onCloze: (selText: string, selBlock: string) => void
   /** mid-round exit: untouched chunks stay todo/active */
   onExit: () => void
 }
@@ -104,19 +107,36 @@ export const ReadingCard: Component<Props> = (props) => {
     const back = fields['背面'] ?? ''
     return back ? cleanCardHtml(back) : ''
   }
-  // last non-empty selection INSIDE the chunk body. Tracked via
+  // last non-empty selection INSIDE the chunk body + its containing block
+  // element's text (disambiguation for cloze wrapping). Tracked via
   // selectionchange because clicking the toolbar button clears the live
   // selection before onClick fires (the same problem EditDialog's toolbar
   // solves with pointerdown+preventDefault — but tracking also survives
   // keyboard activation of the icon button).
   let lastSel = ''
+  let lastSelBlock = ''
   const onSelChange = () => {
     const sel = window.getSelection()
     if (!sel || sel.isCollapsed || !sel.rangeCount || !bodyRef) return
     const r = sel.getRangeAt(0)
     if (!bodyRef.contains(r.commonAncestorContainer)) return
     const text = sel.toString().trim()
-    if (text) lastSel = text
+    if (!text) return
+    lastSel = text
+    // nearest block ancestor of the selection START (li/p/h1-6/td/blockquote)
+    let node: Node | null = r.startContainer
+    let block = ''
+    while (node && node !== bodyRef) {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const el = node as HTMLElement
+        if (/^(LI|P|H[1-6]|TD|TH|BLOCKQUOTE)$/.test(el.tagName)) {
+          block = (el.textContent || '').replace(/\s+/g, ' ').trim()
+          break
+        }
+      }
+      node = node.parentNode
+    }
+    lastSelBlock = block
   }
   onMount(() => document.addEventListener('selectionchange', onSelChange))
   onCleanup(() => document.removeEventListener('selectionchange', onSelChange))
@@ -125,6 +145,7 @@ export const ReadingCard: Component<Props> = (props) => {
     props.chunk.chunk_key
     props.chunk.path
     lastSel = ''
+    lastSelBlock = ''
   })
 
   const crumb = () => {
@@ -161,7 +182,7 @@ export const ReadingCard: Component<Props> = (props) => {
               <md-icon-button
                 aria-label="添加挖空"
                 disabled={props.busy}
-                onClick={() => props.onCloze(lastSel)}
+                onClick={() => props.onCloze(lastSel, lastSelBlock)}
               >
                 <md-icon><IconPassword /></md-icon>
               </md-icon-button>

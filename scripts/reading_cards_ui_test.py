@@ -301,6 +301,60 @@ def run():
         check("new cloze rendered live",
               new_item.locator(".similar-q .cloze-q").count() == 1)
 
+        # ---- 6. CONTEXT SEED (user fix 2026-09-20): selecting text in the
+        # chunk body then 添加挖空 must seed the dialog with the WHOLE chunk
+        # (markdown → plain text) and the selection wrapped IN PLACE — not
+        # just {{c1::selection}} (which made unrecallable "[…]"-only cards).
+        # NOTE: lastSel is STICKY per chunk by design (round-2: the selection
+        # must survive the toolbar click clearing it) — so the no-selection
+        # case must be checked BEFORE any selection is made.
+
+        # ---- 6a. no selection yet → whole chunk seeded as-is ----
+        page.locator('md-icon-button[data-aria-label="添加挖空"]').click()
+        page.wait_for_selector(".cloze-dialog", timeout=10000)
+        page.wait_for_timeout(800)
+        seed2 = page.locator(".cloze-dialog textarea.cloze-field").first.input_value()
+        check("no-selection seed = whole chunk, no markers",
+              "浅筋膜内有颈阔肌" in seed2 and "{{c1::" not in seed2
+              and "## " not in seed2, repr(seed2))
+        page.get_by_text("取消", exact=True).click()
+        page.wait_for_selector(".cloze-dialog", state="detached", timeout=10000)
+
+        # ---- 6b. select 颈阔肌 → seed wraps it in place with context ----
+        sel_ok = page.evaluate("""() => {
+          const body = document.querySelector('.reading-chunk-body');
+          if (!body) return false;
+          const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+          let node;
+          while ((node = walker.nextNode())) {
+            const idx = (node.textContent || '').indexOf('颈阔肌');
+            if (idx >= 0) {
+              const r = document.createRange();
+              r.setStart(node, idx);
+              r.setEnd(node, idx + 3);
+              const sel = window.getSelection();
+              sel.removeAllRanges();
+              sel.addRange(r);
+              return true;
+            }
+          }
+          return false;
+        }""")
+        check("selection created in chunk body", sel_ok)
+        page.wait_for_timeout(300)  # selectionchange fires async
+        page.locator('md-icon-button[data-aria-label="添加挖空"]').click()
+        page.wait_for_selector(".cloze-dialog", timeout=10000)
+        page.wait_for_timeout(800)
+        seed = page.locator(".cloze-dialog textarea.cloze-field").first.input_value()
+        check("seed wraps selection IN CONTEXT",
+              "浅筋膜内有{{c1::颈阔肌}}，由面神经颈支支配" in seed, repr(seed))
+        check("seed keeps the whole chunk (not selection-only)",
+              seed != "{{c1::颈阔肌}}" and "一、浅层结构" in seed, repr(seed))
+        check("seed has markdown markers stripped",
+              "**" not in seed and "## " not in seed, repr(seed))
+        page.get_by_text("取消", exact=True).click()
+        page.wait_for_selector(".cloze-dialog", state="detached", timeout=10000)
+
         check("no JS page errors", not js_errors, js_errors[:3])
         page.screenshot(path="/tmp/reading_made_cards_after_add.png")
         browser.close()
