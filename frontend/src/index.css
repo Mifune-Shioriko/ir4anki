@@ -220,37 +220,12 @@ body {
   }
 }
 
-/* ---- round progress strip (above the two columns) ----
- * Same horizontal geometry as .columns (max-width, centered, 24px side
- * padding) so on wide screens the inner 680px bar lines up exactly with the
- * left study column. It carries the top 24px gap; the columns' own
- * padding-top then provides the gap between the bar and the boxes. */
-.round-strip {
-  width: 100%;
-  max-width: calc(var(--content-max-width) + 560px + 48px);
-  margin: 0 auto;
-  padding: var(--content-padding) var(--content-padding) 0;
-}
-
-.round-strip-inner {
-  width: 100%;
-  max-width: var(--content-max-width);
-}
-
-/* the progress block supplies its own bottom margin inside .content; here
- * the columns' padding-top is the only gap, so zero it to avoid doubling */
-.round-strip .progress-area {
-  margin-bottom: 0;
-}
-
-@media (max-width: 1179px) {
-  .round-strip {
-    max-width: none;
-  }
-  .round-strip-inner {
-    margin: 0 auto;
-  }
-}
+/* ---- round progress strip: REMOVED (user spec 2026-09-20) ----
+ * The strip (linear bar, later the ring) sat above the columns and only
+ * rendered mid-round, which is exactly why start screens misaligned while
+ * card phases didn't. The ring now lives in the nav rail's bottom-left
+ * corner (.nav-rail__footer), so the columns share a top edge on every
+ * phase. */
 
 /* ---- note panel ----
  * The panel IS a real <md-elevated-card> now (2026-09-17, user request:
@@ -496,9 +471,12 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* the strip centers the ring now (was a full-width bar) */
-.round-strip .progress-ring {
-  margin: 0 auto;
+/* the ring now sits in the nav rail's bottom-left corner (2026-09-20) */
+.nav-rail__footer {
+  margin-top: auto;
+  padding-bottom: 16px;
+  display: flex;
+  justify-content: center;
 }
 
 .progress-area {
@@ -741,6 +719,19 @@ body {
 
 .screen-title {
   color: var(--md-sys-color-on-surface);
+}
+
+/* Wide screens (note column visible): the right panel's box starts at the
+ * .content padding edge (24px), while .screen added another 40px on top of
+ * that — so start/done screens misaligned with the note panel while
+ * mid-round cards (no .screen wrapper) lined up fine (user report
+ * 2026-09-20). Drop the extra top padding here so BOTH boxes share the
+ * same top edge on every phase. Narrow screens keep the 40px breathing
+ * room (no note column to align against). */
+@media (min-width: 1180px) {
+  .columns .content > .screen {
+    padding-top: 0;
+  }
 }
 
 .screen-detail {

@@ -175,6 +175,19 @@ def run(state):
               "nav-rail__item--active" in items.nth(0).get_attribute("class"))
         title = page.locator(".screen-title").first.inner_text()
         print(f"  (study funnel landed on: {title})")
+        # top-edge alignment on START screens (user report 2026-09-20: 首页
+        # misaligned because .screen added 40px above the card while the
+        # note panel starts at the .content padding edge). Measure the CARD
+        # boxes themselves (.note-column is a wrapper with 24px padding).
+        screen_card_y = page.locator(
+            ".columns .content md-elevated-card").first.bounding_box()["y"]
+        note_card_y = page.locator(
+            ".note-column md-elevated-card").first.bounding_box()["y"]
+        check("screen card and note panel top edges aligned (start screen)",
+              abs(screen_card_y - note_card_y) <= 2,
+              f"screen_card={screen_card_y} note_card={note_card_y}")
+        check("no ring on start screens (no active round)",
+              page.locator(".progress-ring").count() == 0)
 
         # ---- 2. 文件 section: tree + read-only viewer ----
         items.nth(1).click()  # 文件
@@ -278,6 +291,10 @@ def run(state):
               "阅读 2" in tiles.nth(0).inner_text(), tiles.nth(0).inner_text())
         check("focus tile shows 阅读 5 (wire)",
               "阅读 5" in tiles.nth(1).inner_text(), tiles.nth(1).inner_text())
+        # 管理阅读清单: text only, NO leading icon (user 2026-09-20: icon
+        # broke the button alignment)
+        manage_btn = page.locator("md-text-button", has_text="管理阅读清单").first
+        check("管理阅读清单 has no icon", manage_btn.locator("md-icon").count() == 0)
         page.screenshot(path="/tmp/reading-ui-start.png")
 
         # ---- 4. reading round: two columns, round-2 action layout ----
@@ -304,6 +321,9 @@ def run(state):
             "md-text-button", has_text="无需制卡，跳过").count() == 1)
         check("bottom: 下一张（稍后继续） text", page.locator(
             "md-text-button", has_text="下一张").count() == 1)
+        # 下一张: text only, NO leading icon (user 2026-09-20)
+        check("下一张 button has no icon", page.locator(
+            "md-text-button", has_text="下一张").first.locator("md-icon").count() == 0)
         check("bottom: 结束阅读 text", page.locator(
             "md-text-button", has_text="结束阅读").count() == 1)
         check("no 添加卡片 button in bottom row", page.locator(
@@ -315,16 +335,30 @@ def run(state):
               "腋动脉" in right and "臂前区" in right, right[:100])
         anchors = page.locator(".note-panel .note-body [data-src-line]")
         check("right panel has source anchors", anchors.count() >= 2, anchors.count())
-        # progress RING (round 3): circle with done/total centered; the old
-        # linear bar + detail rows are gone
+        # progress RING (2026-09-20): moved into the nav rail's bottom-left
+        # corner; the strip above the columns is gone entirely
         check("progress ring rendered", page.locator(".progress-ring").count() == 1)
+        check("ring lives in the nav rail footer",
+              page.locator(".nav-rail__footer .progress-ring").count() == 1)
         check("ring shows 0/2", "0/2" in
               page.locator(".progress-ring__text").inner_text(),
               page.locator(".progress-ring__text").inner_text())
-        check("old linear progress bar is gone",
-              page.locator(".round-strip md-linear-progress").count() == 0)
-        check("old detail rows are gone",
-              page.locator(".round-strip .progress-split").count() == 0)
+        check("round strip is gone", page.locator(".round-strip").count() == 0)
+        # ring really sits at the bottom of the rail (viewport bottom-left)
+        ring_box = page.locator(".progress-ring").bounding_box()
+        rail_box = page.locator(".nav-rail").bounding_box()
+        check("ring near rail bottom (within 120px of rail bottom edge)",
+              rail_box["y"] + rail_box["height"] - (ring_box["y"] + ring_box["height"]) < 120,
+              f"rail={rail_box} ring={ring_box}")
+        check("ring inside rail's horizontal bounds",
+              ring_box["x"] >= rail_box["x"] and
+              ring_box["x"] + ring_box["width"] <= rail_box["x"] + rail_box["width"] + 1,
+              f"rail={rail_box} ring={ring_box}")
+        # top-edge alignment: card box and note box share the same top
+        card_top = page.locator(".flashcard-wrapper md-elevated-card").bounding_box()["y"]
+        note_top = page.locator(".note-column md-elevated-card").first.bounding_box()["y"]
+        check("card/note top edges aligned (mid-round)", abs(card_top - note_top) <= 2,
+              f"card_top={card_top} note_top={note_top}")
         page.screenshot(path="/tmp/reading-ui-card.png")
 
         # ---- 5. 制卡完成 straight from 未读 (no active gate) ----

@@ -6,7 +6,6 @@ import { stripTemplateBlocks } from './lib/clean'
 
 import { NavRail } from './components/NavRail'
 import type { Section } from './components/NavRail'
-import { ProgressRing } from './components/ProgressRing'
 import { FilesScreen } from './components/FilesScreen'
 import { Flashcard } from './components/Flashcard'
 import { ActionArea } from './components/ActionArea'
@@ -1048,12 +1047,26 @@ export const App: Component = () => {
     (phase() === 'preview' && !!previewCard() && !pvRevealed()) ||
     (phase() === 'review' && !!currentCard() && !revealed())
 
+  // Ring progress for the nav-rail footer (user spec 2026-09-20): the ring
+  // moved OUT of the strip above the columns into the rail's bottom-left
+  // corner. Derived from the ACTIVE round phase — null when no round is on
+  // screen (start/done screens have nothing to count).
+  const railRing = () => {
+    // works regardless of the visible section: mid-round browsing of
+    // 文件/阅读清单 still tracks the active round
+    if (phase() === 'review' && currentCard()) return { done: totalDone(), total: roundTotal() }
+    if (phase() === 'reading' && rdCurrent()) return { done: rdDone(), total: rdTotal() }
+    if (phase() === 'preview' && previewCard()) return { done: pvDone(), total: pvTotal() }
+    return null
+  }
+
   return (
     <div class="app-shell">
       <NavRail
         section={section()}
         onNavigate={navigate}
         readingListSize={readingMode() ? readingListSize() : 0}
+        ring={railRing()}
       />
 
       <div class="app">
@@ -1073,35 +1086,11 @@ export const App: Component = () => {
 
         {/* ---- 学习 section: the whole funnel ---- */}
         <Show when={section() === 'study'}>
-      {/* Round progress as a full-width strip ABOVE the two columns
-          (2026-09-17): it used to live inside the left column, pushing the
-          card down by its own height so the card box and the note box no
-          longer shared a top edge. Lifting it out (inner width matched to
-          the left column) makes both columns start on the same baseline.
-          2026-09-19 round 3: the strip is now a single circular indicator
-          (done/total in the ring center) — the linear bar + 复习/新卡
-          detail rows are gone, unified across review/preview/reading. */}
-      <Show
-        when={
-          (phase() === 'review' && currentCard()) ||
-          (phase() === 'preview' && previewCard()) ||
-          (phase() === 'reading' && rdCurrent())
-        }
-      >
-        <div class="round-strip">
-          <div class="round-strip-inner">
-            <Show when={phase() === 'review' && currentCard()}>
-              <ProgressRing done={totalDone()} total={roundTotal()} />
-            </Show>
-            <Show when={phase() === 'reading' && rdCurrent()}>
-              <ProgressRing done={rdDone()} total={rdTotal()} />
-            </Show>
-            <Show when={phase() === 'preview' && previewCard()}>
-              <ProgressRing done={pvDone()} total={pvTotal()} />
-            </Show>
-          </div>
-        </div>
-      </Show>
+      {/* Round progress used to sit in a full-width strip here (2026-09-17
+          alignment fix); the user asked for it in the nav rail's bottom-left
+          corner instead (2026-09-20), so the strip is gone — the columns now
+          share a top edge on EVERY phase (the strip only rendered mid-round,
+          which is why start screens used to misalign). */}
 
       <div class="columns">
       <div class="content">

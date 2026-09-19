@@ -1,7 +1,6 @@
 import { Component, Show } from 'solid-js'
 import { ModeSelector } from './ModeSelector'
 import type { StudyModes } from '../types'
-import { IconMenuBook } from './icons'
 
 // Reading-mode start screen (渐进制卡, user spec 2026-09-19). Top of the
 // funnel when the 阅读清单 has dealable chunks: one round = 阅读 N 片段 →
@@ -87,7 +86,6 @@ export const ReadingStartScreen: Component<Props> = (props) => {
           </div>
           <div class="screen-actions">
             <md-text-button onClick={() => props.onManageList()} disabled={props.busy}>
-              <md-icon><IconMenuBook /></md-icon>
               管理阅读清单
             </md-text-button>
           </div>

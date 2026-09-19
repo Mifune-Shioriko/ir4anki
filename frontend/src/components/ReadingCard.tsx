@@ -1,7 +1,7 @@
 import { Component, Show, createEffect, onCleanup, onMount } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import type { ReadingChunk, ReadingChunkStatus } from '../types'
-import { IconAdd, IconPassword, IconSkipNext } from './icons'
+import { IconAdd, IconPassword } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign 2026-09-19
 // round 2). One note chunk to read and turn into cards BY HAND. No reveal
@@ -138,7 +138,6 @@ export const ReadingCard: Component<Props> = (props) => {
             {props.chunk.status === 'active' ? '跳过' : '无需制卡，跳过'}
           </md-text-button>
           <md-text-button onClick={() => props.onNext()} disabled={props.busy}>
-            <md-icon><IconSkipNext /></md-icon>
             下一张（稍后继续）
           </md-text-button>
           <md-filled-button onClick={() => props.onComplete()} disabled={props.busy}>
