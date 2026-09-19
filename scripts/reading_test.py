@@ -68,6 +68,7 @@ class FakeAnki:
         self.notes = {}
         self.next_note = 900001
         self.calls = []
+        self.added_models = []  # modelName of every addNotes call
 
     async def __call__(self, action, params=None, timeout=30):
         params = params or {}
@@ -75,13 +76,17 @@ class FakeAnki:
         if action == "addNotes":
             nid = self.next_note
             self.next_note += 1
-            self.notes[nid] = {"tags": list(params["notes"][0].get("tags") or [])}
+            note = params["notes"][0]
+            self.added_models.append(note.get("modelName"))
+            self.notes[nid] = {"tags": list(note.get("tags") or []),
+                               "fields": dict(note.get("fields") or {}),
+                               "modelName": note.get("modelName")}
             self.cards[nid * 10] = {
                 "cardId": nid * 10, "note": nid, "type": 0, "queue": 0,
                 "deckName": "2026", "due": 0, "interval": 0, "factor": 0,
                 "reps": 0, "lapses": 0, "left": 0,
                 "question": "<p>Q</p>", "answer": "<p>A</p>", "css": "",
-                "modelName": "问答题",
+                "modelName": note.get("modelName") or "问答题",
             }
             return [nid]
         if action == "findCards":
@@ -97,6 +102,9 @@ class FakeAnki:
                       "addTags", "removeTags"):
             return None
         if action == "modelFieldNames":
+            model = params.get("modelName")
+            if model == "填空题":
+                return ["文字", "背面额外"]
             return ["正面", "背面"]
         if action == "cardsInfo":
             return [dict(self.cards[c]) for c in params.get("cards", [])
@@ -229,6 +237,55 @@ async def main():
         check("status todo", a0["status"] == "todo")
         A_KEYS = [a0["chunk_key"], d["chunks"][1]["chunk_key"]]
 
+        print("== 5b. single-file depth dealing (2026-09-19 round 2) ==")
+        # user complaint: 1 file in the list → every round dealt exactly 1
+        # chunk. New rule: read = CHUNK budget; the same file deepens until
+        # the round is full. Clear the list, leave only A (3 chunks).
+        await c.post("/api/reading/finish")
+        for p in (B_PATH, C_PATH):
+            await c.post("/api/reading/list/remove", json={"path": p})
+        r = await c.post("/api/reading/start?mode=quick")
+        d1 = r.json()["chunks"]
+        check("single file: quick deals 2 chunks", len(d1) == 2, len(d1))
+        check("single file: both from A", all(ch["path"] == A_PATH for ch in d1),
+              [ch["path"] for ch in d1])
+        check("single file: first two sections in order",
+              d1[0]["chunk_key"] == A_KEYS[0]
+              and d1[1]["heading_path"] == ["颈部", "二、颈筋膜"],
+              [(ch["chunk_key"], ch["heading_path"]) for ch in d1])
+        await c.post("/api/reading/finish")
+        r = await c.post("/api/reading/start?mode=focus")
+        d1f = r.json()["chunks"]
+        check("single file: focus deals all 3 remaining", len(d1f) == 3, len(d1f))
+        # complete the first → next round re-deals the other 2 + nothing more
+        r = await c.post("/api/reading/act", params={
+            "path": A_PATH, "chunk_key": d1f[0]["chunk_key"], "action": "complete"})
+        r = await c.post("/api/reading/act", params={
+            "path": A_PATH, "chunk_key": d1f[1]["chunk_key"], "action": "skip"})
+        r = await c.post("/api/reading/act", params={
+            "path": A_PATH, "chunk_key": d1f[2]["chunk_key"], "action": "complete"})
+        check("single file drained → round complete", r.json()["round_complete"] is True)
+        r = await c.post("/api/reading/start?mode=focus")
+        check("all done → empty deal", r.json()["empty"] is True
+              and r.json()["chunks"] == [], r.json())
+        # restore the section-6 fixture: reset A's progress by remove+re-add
+        # (archive restore keeps states — so instead rewrite the state file)
+        data = json.loads((Path(STATE) / "reading.json").read_text())
+        entry = next(e for e in data["list"] if e["path"] == A_PATH)
+        entry["chunks"] = {}
+        data["round"] = None
+        (Path(STATE) / "reading.json").write_text(json.dumps(data, ensure_ascii=False))
+        await c.post("/api/reading/list/add", json={"path": B_PATH})
+        await c.post("/api/reading/list/add", json={"path": C_PATH})
+        r = await c.post("/api/reading/list/reorder",
+                         json={"order": [A_PATH, B_PATH, C_PATH]})
+        check("fixture restored", r.json()["order"] == [A_PATH, B_PATH, C_PATH],
+              r.json()["order"])
+        r = await c.post("/api/reading/start?mode=quick")
+        d = r.json()
+        A_KEYS = [ch["chunk_key"] for ch in d["chunks"] if ch["path"] == A_PATH]
+        check("quick deals 2 after restore", len(d["chunks"]) == 2, d["chunks"])
+
         print("== 6. state machine + frontier lock ==")
         r = await c.post("/api/reading/act", params={
             "path": A_PATH, "chunk_key": A_KEYS[0], "action": "mark_active"})
@@ -284,10 +341,12 @@ async def main():
         check("next: no status change", r.json()["status"] == "todo", r.json()["status"])
         check("next: advances round", r.json()["done"] == 1, r.json()["done"])
         check("stats.next 1", r.json()["stats"]["next"] == 1, r.json()["stats"])
-        # complete the rest of the round to clear it
+        # drain the round with `next` (NOT complete): multi-chunk dealing
+        # (2026-09-19 round 2) would otherwise burn the whole 6-chunk test
+        # corpus before section 10 needs dealable chunks
         for ch in d3["chunks"]:
             await c.post("/api/reading/act", params={
-                "path": ch["path"], "chunk_key": ch["chunk_key"], "action": "complete"})
+                "path": ch["path"], "chunk_key": ch["chunk_key"], "action": "next"})
         r = await c.post("/api/reading/start?mode=focus")
         check("C dealt after A/B sections done", any(
             ch["path"] == C_PATH for ch in r.json()["chunks"]) or
@@ -312,7 +371,7 @@ async def main():
             check("bad action 400", r.status_code == 400, r.status_code)
         await c.post("/api/reading/finish")
 
-        print("== 9. card/add provenance ==")
+        print("== 9. card/add provenance + cloze (挖空卡, 2026-09-19 round 2) ==")
         r = await c.get("/api/reading/state")
         st = r.json()
         r = await c.post("/api/reading/start?mode=quick")
@@ -330,6 +389,43 @@ async def main():
         stt = entry["chunks"].get(tgt["chunk_key"], {})
         check("cards_created recorded", note_id in (stt.get("cards_created") or []),
               stt)
+        check("auto mark_active on card add (开始制卡 replacement)",
+              stt.get("status") == "active", stt)
+
+        # ---- cloze add: 填空题 model, {{c1::}} required, provenance too ----
+        r = await c.get("/api/card/add/info", params={"kind": "cloze"})
+        info = r.json()
+        check("cloze add/info: model 填空题", info["model_name"] == "填空题", info)
+        check("cloze add/info: fields 文字/背面额外",
+              info["fields"] == ["文字", "背面额外"], info)
+        r = await c.get("/api/card/add/info")
+        check("qa add/info unchanged", r.json()["model_name"] == "问答题", r.json())
+        # missing cloze marker → 400 (would create a note with zero cards)
+        r = await c.post("/api/card/add", json={
+            "fields": {"文字": "没有挖空的正文"}, "tags": [], "kind": "cloze"})
+        check("cloze without {{c}} 400", r.status_code == 400, r.status_code)
+        # empty fields still rejected
+        r = await c.post("/api/card/add", json={
+            "fields": {"文字": "  "}, "tags": [], "kind": "cloze"})
+        check("empty cloze 400", r.status_code == 400, r.status_code)
+        # a real cloze card linked to the SAME chunk
+        r = await c.post("/api/card/add", json={
+            "fields": {"文字": "浅筋膜内有{{c1::颈阔肌}}，由{{c2::面神经}}支配。",
+                       "背面额外": ""},
+            "tags": ["cloze-test"], "kind": "cloze",
+            "reading_source": {"path": tgt["path"], "chunk_key": tgt["chunk_key"]},
+        })
+        check("cloze added", r.status_code == 200, r.status_code)
+        cloze_note = r.json()["noteId"]
+        check("cloze used the 填空题 model",
+              fake.added_models[-1] == "填空题", fake.added_models)
+        data = json.loads((Path(STATE) / "reading.json").read_text())
+        entry = next(e for e in data["list"] if e["path"] == A_PATH)
+        stt = entry["chunks"].get(tgt["chunk_key"], {})
+        check("cloze provenance recorded", cloze_note in (stt.get("cards_created") or []),
+              stt)
+        check("chunk still active after 2nd card", stt.get("status") == "active", stt)
+
         r = await c.post("/api/card/add", json={
             "fields": {"正面": "Q2", "背面": "A2"}, "tags": [],
             "reading_source": {"path": "gone.md", "chunk_key": "1:x"},

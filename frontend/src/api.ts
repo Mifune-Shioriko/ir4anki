@@ -70,15 +70,20 @@ export const api = {
     post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
   previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),
   previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
-  addInfo: () => get<{ model_name: string; fields: string[] }>('/api/card/add/info'),
+  addInfo: (kind?: 'qa' | 'cloze') =>
+    get<{ model_name: string; fields: string[]; kind?: string }>(
+      kind === 'cloze' ? '/api/card/add/info?kind=cloze' : '/api/card/add/info',
+    ),
   addCard: (
     fields: Record<string, string>,
     tags: string[],
     readingSource?: { path: string; chunk_key: string } | null,
+    kind?: 'qa' | 'cloze',
   ) =>
     post<{ noteId: number; cardIds: number[]; pool: number | null }>('/api/card/add', {
       fields,
       tags,
+      ...(kind === 'cloze' ? { kind: 'cloze' } : {}),
       ...(readingSource ? { reading_source: readingSource } : {}),
     }),
   deleteCard: (cardId: number) =>

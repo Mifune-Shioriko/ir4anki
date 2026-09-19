@@ -13,6 +13,7 @@ import { DoneScreen } from './components/DoneScreen'
 import { EmptyScreen } from './components/EmptyScreen'
 import { FinishedScreen } from './components/FinishedScreen'
 import { EditDialog } from './components/EditDialog'
+import { ClozeDialog } from './components/ClozeDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { Loading } from './components/Loading'
 import { PreviewCard } from './components/PreviewCard'
@@ -235,6 +236,11 @@ export const App: Component = () => {
   // which chunk the add dialog is open FOR (provenance link); null = plain add
   const [addSource, setAddSource] = createSignal<{ path: string; chunk_key: string } | null>(null)
   const rdCurrent = () => rdChunks()[0] ?? null
+  // 挖空卡 dialog (user spec 2026-09-19 round 2): clozeInitial is the
+  // textarea seed — the chunk-body selection wrapped in {{c1::}} when the
+  // user selected text first, else the whole chunk text.
+  const [clozeOpen, setClozeOpen] = createSignal(false)
+  const [clozeInitial, setClozeInitial] = createSignal('')
 
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
@@ -532,6 +538,17 @@ export const App: Component = () => {
     setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
     setAddOpen(true)
   }
+  // 添加挖空 (user spec 2026-09-19 round 2): selection inside the chunk
+  // body seeds the dialog as a ready-made {{c1::…}}; no selection → the
+  // whole chunk text as the starting point.
+  const openReadingCloze = (selText: string) => {
+    const chunk = rdCurrent()
+    if (!chunk) return
+    const base = selText ? `{{c1::${selText}}}` : chunk.text
+    setClozeInitial(base)
+    setAddSource({ path: chunk.path, chunk_key: chunk.chunk_key })
+    setClozeOpen(true)
+  }
 
   const onCardAdded = () => {
     // the new card lands suspended in the preview pool — reflect in chips
@@ -539,17 +556,23 @@ export const App: Component = () => {
       setPreviewPool(p => (p == null ? p : p + 1))
       setPreviewAvailable(p => (p == null ? p : p + 1))
     }
-    // 渐进制卡: the backend recorded the note id on the source chunk —
-    // mirror it locally so 「已从本片段制卡 N 张」 updates without a reload
+    // 渐进制卡: the backend recorded the note id on the source chunk AND
+    // auto-marked a todo chunk as active — mirror both locally so 「已从本
+    // 片段制卡 N 张」 and the 正在制卡 chip update without a reload
     const src = addSource()
     if (src) {
       setRdChunks(prev =>
         prev.map(c =>
           c.path === src.path && c.chunk_key === src.chunk_key
-            ? { ...c, cards_created: [...c.cards_created, 0] }
+            ? {
+                ...c,
+                cards_created: [...c.cards_created, 0],
+                status: c.status === 'todo' ? 'active' : c.status,
+              }
             : c,
         ),
       )
+      if (readingMode()) rdRefreshCounts()
     }
     setAddSource(null)
   }
@@ -897,17 +920,23 @@ export const App: Component = () => {
     if (isTypingTarget(e.target)) return
     if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
     if (phase() === 'reading') {
-      // Space = primary action (开始制卡 / 制卡完成), A = add card,
-      // S = skip, N = 下一张 (稍后继续) — window-level like preview's
+      // any dialog open (add / cloze): Space is typing there, never complete
+      if (clozeOpen()) return
+      // 2026-09-19 round 2: 开始制卡 is gone — Space = 制卡完成 (primary),
+      // A = add card, C = add cloze, S = skip, N = 下一张 (稍后继续)
       if (rdBusy()) return
       const chunk = rdCurrent()
       if (!chunk) return
       if (e.key === ' ') {
         e.preventDefault()
-        rdAct(chunk.status === 'active' ? 'complete' : 'mark_active')
+        rdAct('complete')
       } else if (e.key === 'a' || e.key === 'A') {
         e.preventDefault()
         openReadingAdd()
+      } else if (e.key === 'c' || e.key === 'C') {
+        e.preventDefault()
+        // keyboard path has no selection context — seed from the whole chunk
+        openReadingCloze('')
       } else if (e.key === 's' || e.key === 'S') {
         e.preventDefault()
         rdAct('skip')
@@ -1076,11 +1105,11 @@ export const App: Component = () => {
           <ReadingCard
             chunk={rdCurrent()!}
             busy={rdBusy()}
-            onMarkActive={() => rdAct('mark_active')}
             onComplete={() => rdAct('complete')}
             onNext={() => rdAct('next')}
             onSkip={() => rdAct('skip')}
             onAdd={openReadingAdd}
+            onCloze={openReadingCloze}
             onExit={rdFinish}
           />
         </Show>
@@ -1288,6 +1317,15 @@ export const App: Component = () => {
           mode="add"
           readingSource={addSource()}
           onClose={() => { setAddOpen(false); setAddSource(null) }}
+          onAdded={() => onCardAdded()}
+        />
+      </Show>
+
+      <Show when={clozeOpen()}>
+        <ClozeDialog
+          initialText={clozeInitial()}
+          readingSource={addSource()}
+          onClose={() => { setClozeOpen(false); setAddSource(null) }}
           onAdded={() => onCardAdded()}
         />
       </Show>

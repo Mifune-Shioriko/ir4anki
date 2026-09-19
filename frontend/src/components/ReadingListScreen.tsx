@@ -2,7 +2,8 @@ import { Component, For, Show, createSignal, onMount } from 'solid-js'
 import { api } from '../api'
 import type { ReadingCorpusFile, ReadingFileSummary } from '../types'
 import {
-  IconArrowUpward, IconClose, IconMenuBook, IconVerticalAlignTop,
+  IconArrowUpward, IconChevronRight, IconClose, IconDescription, IconFolder,
+  IconMenuBook, IconVerticalAlignTop,
 } from './icons'
 
 // 阅读清单 management screen (渐进制卡, user spec 2026-09-19): files are
@@ -12,8 +13,12 @@ import {
 // frontier status, a drift warning badge and a remove button (progress is
 // archived server-side, so re-adding restores it).
 //
-// 「添加文件」 opens a corpus picker dialog listing every .md not yet in the
-// list. All mutations go through /api/reading/list/* and re-read the status
+// 「添加文件」 opens a corpus picker rendered as a FOLDER TREE (user spec
+// 2026-09-19 round 2 — 像正经的文件管理器: 文件夹可展开，里面是子文件夹
+// 或文件). The tree is built client-side from the flat /api/reading/corpus
+// paths (year/科目/文件.md). The dialog STAYS OPEN across adds for batch
+// adding; files already in the list render as 已加入 (disabled). All
+// mutations go through /api/reading/list/* and re-read the status
 // afterwards (single source of truth = the backend's list order).
 
 interface Props {
@@ -28,6 +33,61 @@ const FRONTIER_LABEL: Record<string, string> = {
   skipped: '已跳过',
 }
 
+// ---- folder tree (built from flat corpus paths) ----
+interface TreeNode {
+  /** display name: folder segment or file title (without .md) */
+  name: string
+  /** full relative path for FILES; joined dir path for folders */
+  path: string
+  kind: 'dir' | 'file'
+  file?: ReadingCorpusFile
+  dirs: TreeNode[]
+  files: TreeNode[]
+}
+
+function buildTree(files: ReadingCorpusFile[]): TreeNode[] {
+  const roots: TreeNode[] = []
+  const dirIndex = new Map<string, TreeNode>()
+  for (const f of files) {
+    const parts = f.path.split('/')
+    let container = roots
+    let prefix = ''
+    for (let i = 0; i < parts.length - 1; i++) {
+      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i]
+      let dir = dirIndex.get(prefix)
+      if (!dir) {
+        dir = { name: parts[i], path: prefix, kind: 'dir', dirs: [], files: [] }
+        dirIndex.set(prefix, dir)
+        container.push(dir)
+      }
+      container = dir.dirs
+    }
+    const fileNode: TreeNode = {
+      name: parts[parts.length - 1].replace(/\.md$/, ''),
+      path: f.path,
+      kind: 'file',
+      file: f,
+      dirs: [],
+      files: [],
+    }
+    // a file lives in its parent dir's `files` list; top-level files in roots
+    const parentDir = parts.length > 1 ? dirIndex.get(parts.slice(0, -1).join('/')) : undefined
+    if (parentDir) parentDir.files.push(fileNode)
+    else roots.push(fileNode)
+  }
+  const sortRec = (nodes: TreeNode[]) => {
+    nodes.sort((a, b) =>
+      a.kind !== b.kind
+        ? a.kind === 'dir' ? -1 : 1
+        : a.name.localeCompare(b.name, 'zh-Hans-CN'),
+    )
+    nodes.forEach(n => { if (n.kind === 'dir') { sortRec(n.dirs); sortRec(n.files) } })
+  }
+  sortRec(roots)
+  dirIndex.forEach(d => { sortRec(d.dirs); sortRec(d.files) })
+  return roots
+}
+
 export const ReadingListScreen: Component<Props> = (props) => {
   const [list, setList] = createSignal<ReadingFileSummary[]>([])
   const [corpus, setCorpus] = createSignal<ReadingCorpusFile[]>([])
@@ -35,6 +95,8 @@ export const ReadingListScreen: Component<Props> = (props) => {
   const [removeTarget, setRemoveTarget] = createSignal<ReadingFileSummary | null>(null)
   const [loading, setLoading] = createSignal(true)
   const [actionBusy, setActionBusy] = createSignal(false)
+  // expanded folders in the picker tree (by dir path); root dirs start open
+  const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
 
   const reload = async () => {
     try {
@@ -83,7 +145,85 @@ export const ReadingListScreen: Component<Props> = (props) => {
   }
 
   const progress = (s: ReadingFileSummary) => s.done + s.skipped
-  const notListed = () => corpus().filter(f => !f.in_list)
+  // tree over the WHOLE corpus; files already in the list show as 已加入
+  const tree = () => buildTree(corpus())
+  const isOpen = (path: string) => expanded().has(path)
+  const toggleDir = (path: string) =>
+    setExpanded(prev => {
+      const next = new Set(prev)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  // open the picker with every folder pre-expanded (small corpus — showing
+  // the whole tree beats making the user click into each folder)
+  const openPicker = () => {
+    const all = new Set<string>()
+    const collect = (nodes: TreeNode[]) =>
+      nodes.forEach(n => { if (n.kind === 'dir') { all.add(n.path); collect(n.dirs) } })
+    collect(tree())
+    setExpanded(all)
+    setPickerOpen(true)
+  }
+  const pendingInTree = () => {
+    let n = 0
+    const count = (nodes: TreeNode[]) =>
+      nodes.forEach(x => {
+        if (x.kind === 'dir') { count(x.dirs); count(x.files) }
+        else if (x.file && !x.file.in_list) n++
+      })
+    count(tree())
+    return n
+  }
+
+  // recursive tree rows (depth → indent)
+  const TreeRows: Component<{ nodes: TreeNode[]; depth: number }> = (tp) => (
+    <For each={tp.nodes}>
+      {node =>
+        node.kind === 'dir' ? (
+          <>
+            <div
+              class="reading-tree-dir"
+              style={{ 'padding-left': `${tp.depth * 18 + 4}px` }}
+              onClick={() => toggleDir(node.path)}
+            >
+              <span class={`reading-tree-chevron${isOpen(node.path) ? ' reading-tree-chevron--open' : ''}`}>
+                <IconChevronRight size={18} />
+              </span>
+              <md-icon class="reading-tree-icon"><IconFolder /></md-icon>
+              <span class="md-typescale-title-small">{node.name}</span>
+            </div>
+            <Show when={isOpen(node.path)}>
+              <TreeRows nodes={node.dirs} depth={tp.depth + 1} />
+              <TreeRows nodes={node.files} depth={tp.depth + 1} />
+            </Show>
+          </>
+        ) : (
+          <div
+            class="reading-tree-file"
+            classList={{ 'reading-tree-file--added': !!node.file?.in_list }}
+            style={{ 'padding-left': `${tp.depth * 18 + 4}px` }}
+          >
+            <md-icon class="reading-tree-icon"><IconDescription /></md-icon>
+            <div class="reading-tree-file__text">
+              <div class="md-typescale-title-small">{node.name}</div>
+            </div>
+            <Show
+              when={!node.file?.in_list}
+              fallback={<span class="reading-tree-added md-typescale-label-small">已加入</span>}
+            >
+              <md-text-button
+                disabled={busyNow()}
+                onClick={() => node.file && addFile(node.file)}
+              >
+                加入清单
+              </md-text-button>
+            </Show>
+          </div>
+        )
+      }
+    </For>
+  )
 
   return (
     <div class="screen">
@@ -181,7 +321,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
           </div>
 
           <div class="screen-actions">
-            <md-filled-tonal-button onClick={() => setPickerOpen(true)} disabled={busyNow()}>
+            <md-filled-tonal-button onClick={openPicker} disabled={busyNow()}>
               添加文件
             </md-filled-tonal-button>
           </div>
@@ -195,26 +335,17 @@ export const ReadingListScreen: Component<Props> = (props) => {
         <md-dialog class="reading-picker-dialog" open onClose={() => setPickerOpen(false)}>
           <div slot="headline">选择要读的文件</div>
           <div slot="content" class="reading-picker-list">
-            <Show when={notListed().length === 0}>
+            <div class="reading-picker-hint md-typescale-label-small">
+              待加入 {pendingInTree()} 个文件 · 点文件夹展开/收起 · 可连续添加
+            </div>
+            <Show when={corpus().length === 0}>
               <div class="reading-picker-empty md-typescale-body-medium">
-                语料里的文件都已经在清单里了。
+                语料库里没有找到可读的 .md 文件。
               </div>
             </Show>
-            <For each={notListed()}>
-              {f => (
-                <div class="reading-picker-item">
-                  <div class="reading-picker-item__text">
-                    <div class="md-typescale-title-small">{f.title}</div>
-                    <div class="md-typescale-label-small reading-picker-item__path">
-                      {f.path.replace(/^\d{4}\//, '')}
-                    </div>
-                  </div>
-                  <md-text-button disabled={busyNow()} onClick={() => addFile(f)}>
-                    加入清单
-                  </md-text-button>
-                </div>
-              )}
-            </For>
+            <div class="reading-tree">
+              <TreeRows nodes={tree()} depth={0} />
+            </div>
           </div>
           <div slot="actions">
             <md-text-button onClick={() => setPickerOpen(false)}>关闭</md-text-button>

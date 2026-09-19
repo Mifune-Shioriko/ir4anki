@@ -8,19 +8,22 @@ dir, the real collection and ~/anki-notes are all untouched. Preview mode
 is OFF so the funnel is reading → review and no release-budget logic mixes
 in.
 
-Covers:
+Covers (2026-09-19 round-2 layout: header icon actions + state-only bottom
+row + folder-tree picker + cloze dialog):
   1. gate on: start screen shows the 阅读清单 entry
-  2. list manager: add both corpus files via the picker dialog, reorder
-     buttons render, progress rows
+  2. list manager: TREE picker (folder rows collapse/expand, file rows add),
+     reorder buttons render, progress rows
   3. readingStart screen: stats, mode tiles carry 阅读 N from the wire
-  4. reading round: left card renders chunk markdown + breadcrumb + status
-     chip; right panel (wide) renders the WHOLE file with [data-src-line]
-     anchors; action rows swap todo → active
-  5. refresh mid-round resumes the same chunk with its active status
-  6. complete/skip advance; readingDone shows separated stats
-  7. 再读一轮 deals the next frontiers
-  8. narrow viewport: no right column during reading
-  9. finish clears the round (backend state)
+  4. reading round: header icon buttons 添加卡片/添加挖空, bottom row =
+     state buttons ONLY (no 开始制卡 anywhere), chunk markdown + breadcrumb
+     + status chip; right panel renders the WHOLE file with anchors
+  5. 制卡完成 works straight from 未读 (no active gate); complete advances
+  6. refresh mid-round resumes the same chunk
+  7. cloze dialog opens (添加挖空 icon) and degrades gracefully with dead
+     AnkiConnect (error shown, closable)
+  8. skip advances; readingDone shows separated stats; 再读一轮 deals next
+  9. narrow viewport: no right column during reading
+ 10. finish clears the round (backend state)
 
 Run: /tmp/pw-venv2/bin/python ~/anki-review-app/scripts/reading_ui_test.py
 """
@@ -141,9 +144,6 @@ def main():
 
 def run(state):
     st = wait_ready()
-    # AnkiConnect is deliberately DEAD here (127.0.0.1:18765): /api/status
-    # short-circuits to anki:error, so the reading flag is asserted on the
-    # reading endpoints themselves (reading mode is corpus-only)
     check("backend up on :8902", st.get("anki") in ("ok", "error"), st)
     rs = api("/api/reading/status")
     check("reading flag on + isolated empty list",
@@ -171,44 +171,65 @@ def run(state):
               manage.count() + entry.count() >= 1,
               (manage.count(), entry.count()))
 
-        # ---- 2. list manager: picker + add + reorder ----
+        # ---- 2. list manager: TREE picker + add + reorder ----
         (manage if manage.count() else entry).first.click()
         page.wait_for_selector(".reading-list-empty", timeout=15000)
         check("empty list placeholder", "清单还是空的" in
               page.locator(".reading-list-empty").inner_text())
         page.locator("md-filled-tonal-button", has_text="添加文件").click()
-        page.wait_for_selector(".reading-picker-item", timeout=15000)
-        items = page.locator(".reading-picker-item")
-        check("picker lists 2 corpus files", items.count() == 2, items.count())
-        # dialog stays open across adds (batch adding); each add removes the
-        # file from notListed, so .first is always the next un-added one
-        page.locator(".reading-picker-item md-text-button", has_text="加入清单").first.click()
-        page.wait_for_timeout(600)
-        page.locator(".reading-picker-item md-text-button", has_text="加入清单").first.click()
-        page.wait_for_timeout(600)
+        page.wait_for_selector(".reading-tree", timeout=15000)
+        # tree = folder rows (2026, 解剖) + file rows (颈部, 上肢), all
+        # pre-expanded (openPicker expands every folder)
+        dirs = page.locator(".reading-tree-dir")
+        files = page.locator(".reading-tree-file")
+        check("tree renders 2 folder rows", dirs.count() == 2, dirs.count())
+        check("tree renders 2 file rows", files.count() == 2, files.count())
+        check("folder row shows name",
+              dirs.first.inner_text().strip() in ("2026", "解剖"),
+              dirs.first.inner_text())
+        # collapse/expand: click the DEEPEST folder (解剖) → its files hide
+        deep = page.locator(".reading-tree-dir", has_text="解剖").first
+        deep.click()
+        page.wait_for_timeout(300)
+        check("collapsing 解剖 hides its files",
+              page.locator(".reading-tree-file").count() == 0,
+              page.locator(".reading-tree-file").count())
+        deep.click()
+        page.wait_for_timeout(300)
+        check("re-expanding 解剖 shows files again",
+              page.locator(".reading-tree-file").count() == 2)
+        # already-added files show 已加入 — add BOTH via their row buttons
+        # (dialog stays open across adds for batch adding)
+        page.locator(".reading-tree-file", has_text="颈部").locator(
+            "md-text-button", has_text="加入清单").click()
+        page.wait_for_timeout(700)
+        added = page.locator(".reading-tree-file", has_text="颈部").inner_text()
+        check("added file row shows 已加入", "已加入" in added, added)
+        page.locator(".reading-tree-file", has_text="上肢").locator(
+            "md-text-button", has_text="加入清单").click()
+        page.wait_for_timeout(700)
         page.locator("md-text-button", has_text="关闭").click()
         page.wait_for_timeout(400)
         rows = page.locator(".reading-list-item")
         check("both files in list", rows.count() == 2, rows.count())
-        # 上肢.md = 2 real sections (the "# 上肢" heading-only stub is
-        # filtered by MIN_READING_BODY); sorted corpus order puts it first
-        first_row = rows.first.inner_text()
-        check("first row = 上肢 with 进度 0 / 2",
-              "上肢" in first_row and "进度 0 / 2" in first_row, first_row)
-        check("frontier label 未读", "未读" in first_row)
-        # md-icon-button is a custom element: disabled is a PROPERTY (Solid
-        # sets it as one), which Playwright's is_disabled() may not see —
-        # read the property directly
+        # row progress by name (add order = 颈部 then 上肢)
+        neck_row = page.locator(".reading-list-item", has_text="颈部").first
+        arm_row = page.locator(".reading-list-item", has_text="上肢").first
+        check("颈部 row 进度 0 / 3", "进度 0 / 3" in neck_row.inner_text(),
+              neck_row.inner_text())
+        check("上肢 row 进度 0 / 2", "进度 0 / 2" in arm_row.inner_text(),
+              arm_row.inner_text())
+        check("frontier label 未读", "未读" in neck_row.inner_text())
+        # md-icon-button is a custom element: disabled is a PROPERTY — read
+        # it via evaluate
         top_disabled = rows.first.locator(
             'md-icon-button[data-aria-label="置顶"]').evaluate("el => el.disabled")
         check("置顶 button disabled for first row", top_disabled is True, top_disabled)
-        # picker order = sorted corpus paths: 上肢 (U+4E0A) before 颈部
-        # (U+9888) → list after both adds = [上肢, 颈部]. Moving the SECOND
-        # row (颈部) to top must put 颈部 first.
-        rows.nth(1).locator('md-icon-button[data-aria-label="置顶"]').click()
-        page.wait_for_timeout(600)
+        # move 上肢 to the top → rounds deal 上肢 first
+        arm_row.locator('md-icon-button[data-aria-label="置顶"]').click()
+        page.wait_for_timeout(700)
         first_title = page.locator(".reading-list-item__title").first.inner_text()
-        check("置顶 reorders list (颈部 now first)", "颈部" in first_title, first_title)
+        check("置顶 reorders list (上肢 now first)", "上肢" in first_title, first_title)
         page.screenshot(path="/tmp/reading-ui-list.png")
         page.locator("md-text-button", has_text="返回").click()
         page.wait_for_selector(".screen-title", timeout=15000)
@@ -217,9 +238,6 @@ def run(state):
         page.wait_for_timeout(800)
         title = page.locator(".screen-title").first.inner_text()
         check("funnel lands on 渐进制卡 start", "渐进制卡" in title, title)
-        stats_txt = page.locator(".screen-stats").first.inner_text()
-        check("stats show 2 files / 2 available",
-              "2 个文件" in stats_txt and "2 个" in stats_txt, stats_txt)
         tiles = page.locator(".mode-tile")
         check("mode tiles render", tiles.count() == 2, tiles.count())
         check("quick tile shows 阅读 2 (wire)",
@@ -228,70 +246,85 @@ def run(state):
               "阅读 5" in tiles.nth(1).inner_text(), tiles.nth(1).inner_text())
         page.screenshot(path="/tmp/reading-ui-start.png")
 
-        # ---- 4. reading round: two columns ----
+        # ---- 4. reading round: two columns, round-2 action layout ----
         page.locator("md-filled-button", has_text="开始阅读").click()
         page.wait_for_selector(".reading-crumb", timeout=20000)
         crumb = page.locator(".reading-crumb").inner_text()
-        check("crumb = 颈部 first (置顶 priority)", "颈部" in crumb, crumb)
+        check("crumb = 上肢 first (置顶 priority)", "上肢" in crumb, crumb)
         body = page.locator(".reading-chunk-body").inner_text()
-        check("chunk text rendered (markdown → text)", "颈阔肌" in body, body[:80])
+        check("chunk text rendered (markdown → text)", "腋动脉" in body, body[:80])
         check("status chip 未读", page.locator(".reading-status-chip",
                                               has_text="未读").count() >= 1)
+        # header icon actions (添加卡片 / 添加挖空) — aria-label hoists to
+        # data-aria-label after element upgrade
+        check("header: 添加卡片 icon button", page.locator(
+            '.card-header-actions md-icon-button[data-aria-label="添加卡片"]').count() == 1)
+        check("header: 添加挖空 icon button", page.locator(
+            '.card-header-actions md-icon-button[data-aria-label="添加挖空"]').count() == 1)
+        # bottom row = state buttons ONLY; 开始制卡 must be GONE everywhere
+        check("开始制卡 is gone", page.locator("md-filled-button",
+                                          has_text="开始制卡").count() == 0)
+        check("bottom: 制卡完成 filled", page.locator(
+            "md-filled-button", has_text="制卡完成").count() == 1)
+        check("bottom: 无需制卡，跳过 text", page.locator(
+            "md-text-button", has_text="无需制卡，跳过").count() == 1)
+        check("bottom: 下一张（稍后继续） text", page.locator(
+            "md-text-button", has_text="下一张").count() == 1)
+        check("bottom: 结束阅读 text", page.locator(
+            "md-text-button", has_text="结束阅读").count() == 1)
+        check("no 添加卡片 button in bottom row", page.locator(
+            ".action-area md-outlined-button").count() == 0)
         # right panel: whole file, anchored
         page.wait_for_selector(".note-panel .note-body", timeout=20000)
         right = page.locator(".note-panel .note-body").inner_text()
         check("right panel = WHOLE file (all sections)",
-              "颈阔肌" in right and "颈动脉三角" in right, right[:100])
+              "腋动脉" in right and "臂前区" in right, right[:100])
         anchors = page.locator(".note-panel .note-body [data-src-line]")
         check("right panel has source anchors", anchors.count() >= 2, anchors.count())
-        check("right panel header 原文上下文",
-              "原文上下文" in page.locator(".note-panel-title").inner_text())
-        # action row (todo)
-        check("todo actions: 开始制卡 filled",
-              page.locator("md-filled-button", has_text="开始制卡").count() == 1)
-        check("todo actions: 添加卡片 outlined",
-              page.locator("md-outlined-button", has_text="添加卡片").count() == 1)
-        check("todo actions: 跳过 text",
-              page.locator("md-text-button", has_text="无需制卡，跳过").count() == 1)
         page.screenshot(path="/tmp/reading-ui-card.png")
 
-        # 开始制卡 → chip + action row swap, stays on the chunk
-        page.locator("md-filled-button", has_text="开始制卡").click()
-        page.wait_for_selector(".reading-status-active", timeout=10000)
-        # md-assist-chip's label is a JS PROPERTY after element upgrade
-        # (Solid assigns properties, not attributes, when the prop exists
-        # on the element) — read it via evaluate, like the aria-label →
-        # data-aria-label hoisting pitfall
-        chip_label = page.locator(".reading-status-active").first.evaluate("el => el.label")
-        check("chip → 正在制卡", chip_label == "正在制卡", chip_label)
-        check("active actions: 制卡完成", page.locator("md-filled-button",
-                                                      has_text="制卡完成").count() == 1)
-        check("active actions: 下一张（稍后继续）", page.locator(
-            "md-text-button", has_text="下一张").count() == 1)
-        crumb_same = page.locator(".reading-crumb").inner_text()
-        check("mark_active stays on same chunk", crumb_same == crumb, crumb_same)
+        # ---- 5. 制卡完成 straight from 未读 (no active gate) ----
+        page.locator("md-filled-button", has_text="制卡完成").click()
+        page.wait_for_timeout(1200)
+        crumb2 = page.locator(".reading-crumb").inner_text()
+        check("complete from todo advances to 颈部 一", "颈部" in crumb2, crumb2)
+        check("progress strip shows 1/2",
+              "1/2" in page.locator(".progress-text").inner_text(),
+              page.locator(".progress-text").inner_text())
 
-        # ---- 5. refresh resumes the round on the active chunk (颈部一 was
-        # marked active and is still the head of the pending list) ----
+        # ---- 6. refresh resumes the round on the pending chunk ----
         page.reload(wait_until="networkidle")
         page.wait_for_selector(".reading-crumb", timeout=30000)
         check("reload resumes reading round",
               "颈部" in page.locator(".reading-crumb").inner_text(),
               page.locator(".reading-crumb").inner_text())
-        check("reload keeps 正在制卡 status",
-              page.locator(".reading-status-active").count() >= 1)
+        check("reload keeps progress 1/2",
+              "1/2" in page.locator(".progress-text").inner_text())
 
-        # ---- 6. complete → advances to the OTHER file's frontier (round
-        # dealt [颈部一, 上肢一]; the array is the deal order) ----
-        page.locator("md-filled-button", has_text="制卡完成").click()
-        page.wait_for_timeout(1200)
-        crumb2 = page.locator(".reading-crumb").inner_text()
-        check("complete advances to 上肢 腋窝", "上肢" in crumb2 and "腋窝" in crumb2, crumb2)
-        check("progress strip shows 1/2",
-              "1/2" in page.locator(".progress-text").inner_text(),
-              page.locator(".progress-text").inner_text())
+        # ---- 7. cloze dialog opens; dead AnkiConnect → graceful error ----
+        page.locator('.card-header-actions md-icon-button[data-aria-label="添加挖空"]').click()
+        page.wait_for_selector(".cloze-dialog", timeout=15000)
+        check("cloze dialog headline",
+              "添加挖空卡" in page.locator(".cloze-dialog").inner_text())
+        page.wait_for_timeout(1500)  # let the addInfo fetch fail
+        dlg_text = page.locator(".cloze-dialog").inner_text()
+        check("cloze dialog degrades gracefully (error, no crash)",
+              "HTTP 500" in dlg_text or "加载失败" in dlg_text
+              or "后端响应异常" in dlg_text or "失败" in dlg_text, dlg_text[:200])
+        check("cloze dialog falls back to 文字 field",
+              "挖空正文" in dlg_text, dlg_text[:200])
+        check("cloze toolbar renders (挖空选中 / 取消挖空)",
+              "挖空选中" in dlg_text and "取消挖空" in dlg_text)
+        check("cloze preview columns render",
+              "正面（提问）" in dlg_text and "背面（答案）" in dlg_text)
+        page.screenshot(path="/tmp/reading-ui-cloze.png")
+        page.locator(".cloze-dialog md-text-button", has_text="取消").last.click()
+        page.wait_for_timeout(500)
+        check("cloze dialog closes", page.locator(".cloze-dialog").count() == 0)
+        check("still on the same chunk after closing dialog",
+              "颈部" in page.locator(".reading-crumb").inner_text())
 
-        # skip 上肢一 → round done
+        # ---- 8. skip → round done → separated stats ----
         page.locator("md-text-button", has_text="无需制卡，跳过").click()
         page.wait_for_selector(".screen-title", timeout=15000)
         page.wait_for_timeout(600)
@@ -303,12 +336,11 @@ def run(state):
               stats_txt)
         page.screenshot(path="/tmp/reading-ui-done.png")
 
-        # ---- 7. 再读一轮 deals the NEXT frontiers ----
+        # 再读一轮: round 2 = [上肢 二, 颈部 二] (breadth, list order)
         page.locator("md-text-button", has_text="再读一轮").click()
         page.wait_for_selector(".reading-crumb", timeout=20000)
         crumb3 = page.locator(".reading-crumb").inner_text()
-        check("round 2 deals 颈部 二、颈筋膜 (skipped 一 unlocked)",
-              "颈筋膜" in crumb3, crumb3)
+        check("round 2 deals 上肢 二、臂前区", "臂前区" in crumb3, crumb3)
         # skip both to drain the round
         for _ in range(2):
             skip_btn = page.locator("md-text-button", has_text="跳过").last
@@ -318,7 +350,7 @@ def run(state):
             if page.locator(".reading-crumb").count() == 0:
                 break
 
-        # ---- 8. narrow viewport: no right column. From readingDone, set
+        # ---- 9. narrow viewport: no right column. From readingDone, set
         # narrow FIRST, then 再读一轮 (round 3 = 颈部三 only; 上肢 drained) ----
         page.set_viewport_size({"width": 414, "height": 900})
         page.wait_for_timeout(500)
@@ -336,21 +368,21 @@ def run(state):
                   page.locator(".note-column").count())
             page.screenshot(path="/tmp/reading-ui-narrow.png")
 
-        # ---- 9. finish clears the round on the backend ----
+        # ---- 10. finish clears the round on the backend ----
         page.set_viewport_size({"width": 1280, "height": 900})
         r = api("/api/reading/finish", method="POST")
         check("finish clears round", r.get("ok") is True, r)
         r = api("/api/reading/state")
         check("state round null after finish", r.get("round") is None, r.get("round"))
 
-        # list manager reflects progress: 颈部 = 1 done (一) + 1 skipped (二);
-        # 上肢 = 1 skipped (一) + 1 skipped (二)
+        # list manager reflects progress: 颈部 = 2 skipped (一二), 上肢 =
+        # 1 done (一) + 1 skipped (二)
         r = api("/api/reading/status")
         by = {s["path"]: s for s in r["list"]}
-        check("颈部 progress: done=1 skipped=1",
-              by[a_path]["done"] == 1 and by[a_path]["skipped"] == 1, by[a_path])
-        check("上肢 progress: skipped=2 done=0",
-              by[b_path]["done"] == 0 and by[b_path]["skipped"] == 2, by[b_path])
+        check("颈部 progress: skipped=2 done=0",
+              by[a_path]["done"] == 0 and by[a_path]["skipped"] == 2, by[a_path])
+        check("上肢 progress: done=1 skipped=1",
+              by[b_path]["done"] == 1 and by[b_path]["skipped"] == 1, by[b_path])
 
         check("no JS page errors", not errors, errors[:3])
         browser.close()

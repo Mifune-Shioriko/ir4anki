@@ -180,11 +180,19 @@ NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
 # machine (todo → active → done, plus skipped), NO SuperMemo-style fragment
 # rescheduling in v1.
 #
-# Ordering rule (user spec): within one .md file only the FRONTIER chunk
-# (first one not done/skipped) is ever dealt — later chunks stay locked
-# until the frontier is finished. An `active` chunk IS the frontier, so it
-# automatically resurfaces at the head of every reading round until the
-# user marks it done/skipped (decision 2026-09-19 #1).
+# Ordering rule (user spec, updated 2026-09-19 round 2): a round deals up
+# to STUDY_MODES[mode]["read"] CHUNKS — active chunks first (resurface until
+# done/skipped), then one frontier chunk per file (breadth, 阅读清单
+# priority), then — while the budget isn't filled — the same files' NEXT
+# dealable chunks in file order (depth). A single-file list therefore still
+# gets a full round instead of exactly one chunk. Within a file, chunks
+# before the frontier are done/skipped by definition; done/skipped chunks
+# are never dealt. An `active` chunk IS dealable, so it automatically
+# resurfaces every round until the user marks it done/skipped.
+#
+# 开始制卡 is GONE from the UI (2026-09-19 round 2): chunks auto-mark
+# `active` when a card or cloze is created from them (_reading_record_card).
+# The mark_active API action remains (harmless, used by tests/scripts).
 #
 # Files are opt-in (阅读清单): the corpus mixes study notes with misc logs,
 # so nothing is auto-queued; the user adds files and orders them by hand
@@ -1744,6 +1752,10 @@ async def update_note(body: NoteUpdate):
 # when it targeted the removed card (undo cannot resurrect what's gone).
 
 ADD_MODEL = os.getenv("ANKI_ADD_MODEL", "问答题")
+# 挖空卡 (user spec 2026-09-19): cloze notes use Anki's 填空题 model —
+# fields are data-driven via modelFieldNames, so a renamed collection model
+# only needs the env var. Cloze markers {{cN::…}} are validated before add.
+ADD_CLOZE_MODEL = os.getenv("ANKI_ADD_CLOZE_MODEL", "填空题")
 
 
 def _round_remove_card(rd: dict | None, card_id: int) -> None:
@@ -1778,15 +1790,22 @@ def _preview_round_remove_card(rd: dict | None, card_id: int) -> None:
 
 
 @app.get("/api/card/add/info")
-async def add_info():
-    """Note type + field names for the add-card dialog (data-driven labels)."""
-    names = await anki("modelFieldNames", {"modelName": ADD_MODEL})
-    return {"model_name": ADD_MODEL, "fields": names or []}
+async def add_info(kind: str = "qa"):
+    """Note type + field names for the add-card dialog (data-driven labels).
+
+    kind=cloze returns the 挖空 model (填空题) instead of the default 问答题.
+    """
+    model = ADD_CLOZE_MODEL if kind == "cloze" else ADD_MODEL
+    names = await anki("modelFieldNames", {"modelName": model})
+    return {"model_name": model, "fields": names or [], "kind": kind}
 
 
 class NoteAdd(BaseModel):
     fields: dict[str, str]
     tags: list[str] = []
+    # 挖空卡 (user spec 2026-09-19): kind="cloze" creates a 填空题 note
+    # instead of the default 问答题 — same preview-pool routing.
+    kind: str = "qa"
     # 渐进制卡 provenance (user spec 2026-09-19): when the card was written
     # from a reading chunk, {path, chunk_key} records the source so the note
     # id lands in that chunk's cards_created (溯源: which cards came from
@@ -1796,7 +1815,8 @@ class NoteAdd(BaseModel):
 
 @app.post("/api/card/add")
 async def add_card(body: NoteAdd):
-    """Create one card (ADD_MODEL) and route it into the preview pool.
+    """Create one card (ADD_MODEL, or ADD_CLOZE_MODEL when kind=cloze) and
+    route it into the preview pool.
 
     Preview mode on: lands in PREVIEW_DECK suspended — invisible to the
     scheduler until a preview round approves it (先看后考, same route as
@@ -1805,6 +1825,13 @@ async def add_card(body: NoteAdd):
     """
     if not any(html_to_text(v) for v in body.fields.values()):
         raise HTTPException(status_code=400, detail="卡片内容不能为空")
+    model = ADD_CLOZE_MODEL if body.kind == "cloze" else ADD_MODEL
+    # 挖空卡 must carry at least one cloze marker — otherwise Anki creates a
+    # note with ZERO cards and findCards below returns [] (a confusing 502).
+    if body.kind == "cloze":
+        joined = " ".join(body.fields.values())
+        if "{{c" not in joined:
+            raise HTTPException(status_code=400, detail="挖空卡至少要有一个 {{c1::…}} 挖空")
     try:
         note_ids = await anki(
             "addNotes",
@@ -1812,7 +1839,7 @@ async def add_card(body: NoteAdd):
                 "notes": [
                     {
                         "deckName": RELEASE_DECK,
-                        "modelName": ADD_MODEL,
+                        "modelName": model,
                         "fields": body.fields,
                         "tags": body.tags,
                         # collection-wide duplicate check (防呆)
@@ -2203,19 +2230,60 @@ def _find_entry(data: dict, path: str) -> dict | None:
 
 
 def _deal_reading(data: dict, per_round: int) -> list[dict]:
-    """One frontier chunk per file, in 阅读清单 priority order."""
+    """Deal up to `per_round` CHUNKS (not files) — user decision 2026-09-19.
+
+    Three phases, files always in 阅读清单 priority order:
+      0. every `active` chunk resurfaces first (design rule: 正在制卡
+         chunks come back every round until done/skipped — with multi-chunk
+         rounds a deep active chunk could otherwise fall outside the window);
+      1. breadth: each file's frontier (first not-done/skipped) chunk;
+      2. depth: while the budget isn't filled (fewer files than per_round),
+         the same files contribute their NEXT dealable chunks in file order,
+         so a single-file reading list still gets a full round (quick=2 /
+         focus=5) instead of exactly one chunk.
+    Done/skipped chunks are never dealt.
+    """
     payloads: list[dict] = []
+    dealt: set[tuple[str, str]] = set()
+    # views = [path, ordered, summary] per dealable file
+    views: list[list] = []
     for entry in data.get("list", []):
-        if len(payloads) >= per_round:
-            break
         ordered, summary = _file_view(entry)  # may migrate entry (caller saves)
         if not ordered or not summary.get("frontier"):
             continue
-        fr_key = summary["frontier"]["chunk_key"]
+        views.append([entry.get("path", ""), ordered, summary])
+
+    def _dealable(st: dict) -> bool:
+        return st.get("status", "todo") not in ("done", "skipped")
+
+    def _take(path: str, ch: dict, key: str, st: dict, summary: dict) -> None:
+        payloads.append(_chunk_payload(ch, key, st, summary))
+        dealt.add((path, key))
+
+    for path, ordered, summary in views:  # phase 0: active resurfaces first
         for ch, key, st in ordered:
-            if key == fr_key:
-                payloads.append(_chunk_payload(ch, key, st, summary))
+            if len(payloads) >= per_round:
                 break
+            if st.get("status", "todo") == "active" and (path, key) not in dealt:
+                _take(path, ch, key, st, summary)
+    for path, ordered, summary in views:  # phase 1: frontier per file
+        if len(payloads) >= per_round:
+            break
+        for ch, key, st in ordered:
+            if not _dealable(st):
+                continue
+            # the frontier is dealt exactly once — if phase 0 already took
+            # it (active), this file contributes nothing to the breadth pass
+            if (path, key) not in dealt:
+                _take(path, ch, key, st, summary)
+            break
+    for path, ordered, summary in views:  # phase 2: deepen, priority order
+        for ch, key, st in ordered:
+            if len(payloads) >= per_round:
+                return payloads
+            if (path, key) in dealt or not _dealable(st):
+                continue
+            _take(path, ch, key, st, summary)
     return payloads
 
 
@@ -2281,6 +2349,11 @@ def _reading_round_payload(data: dict) -> dict | None:
 def _reading_record_card(src: dict | None, note_id: int) -> None:
     """Append a just-created note id to the source chunk's cards_created.
 
+    ALSO auto-marks a `todo` chunk as `active` (user decision 2026-09-19:
+    the 开始制卡 button is gone — making a card/cloze from a chunk IS the
+    declaration that you're working on it; the chip shows 正在制卡 and the
+    chunk resurfaces first next round). done/skipped chunks are left alone.
+
     Fail-soft by contract (caller wraps in try): reading bookkeeping must
     never break card creation.
     """
@@ -2293,6 +2366,9 @@ def _reading_record_card(src: dict | None, note_id: int) -> None:
     if entry is None:
         return
     st = entry.setdefault("chunks", {}).setdefault(key, {})
+    if st.get("status", "todo") == "todo":
+        st["status"] = "active"
+        st["updated_at"] = datetime.now().isoformat(timespec="seconds")
     created = st.setdefault("cards_created", [])
     if note_id not in created:
         created.append(note_id)

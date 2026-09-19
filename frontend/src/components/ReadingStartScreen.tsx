@@ -27,13 +27,15 @@ interface Props {
 }
 
 export const ReadingStartScreen: Component<Props> = (props) => {
+  const studyModes = () => props.studyModes
+  const mode = () => props.mode ?? 'quick'
   return (
     <div class="screen">
       <md-elevated-card class="screen-card">
         <div class="screen-content">
           <h1 class="screen-title md-typescale-headline-small">渐进制卡</h1>
           <p class="screen-detail md-typescale-body-medium">
-            先读自己的笔记，读到值得记的地方就动手写卡——同一段没读完，后面的不会推给你。
+            先读自己的笔记，读到值得记的地方就动手写卡——每轮推 {studyModes() ? (studyModes()![mode()]?.read ?? 2) : 2} 段（按清单顺序，同一文件可连读多段）。
             本轮先读片段，然后进入预览和复习。
           </p>
 

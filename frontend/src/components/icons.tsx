@@ -36,6 +36,12 @@ const P_ArrowUpward = ['M450-160v-526L202-438l-42-42 320-320 320 320-42 42-248-2
 const P_VerticalAlignTop = ['M160-780v-60h640v60H160Zm290 660v-484L329-483l-43-43 194-194 190 190-43 43-117-117v484h-60Z']
 const P_SkipNext = ['M680-240v-480h60v480h-60Zm-460 0v-480l346 240-346 240Zm60-240Zm0 125 181-125-181-125v250Z']
 const P_Close = ['m249-207-42-42 231-231-231-231 42-42 231 231 231-231 42 42-231 231 231 231-42 42-231-231-231 231Z']
+// 挖空卡 (user spec 2026-09-19): password = the classic "redacted/cloze"
+// mark; folder / description / chevron_right = tree file-picker icons.
+const P_Password = ['M80-200v-61h800v61H80Zm38-254-40-22 40-68H40v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 22-38-67-38 67Zm324 0-40-24 40-68h-78v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 24-38-67-38 67Zm324 0-40-24 40-68h-78v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 24-38-67-38 67Z']
+const P_Folder = ['M140-160q-24 0-42-18.5T80-220v-520q0-23 18-41.5t42-18.5h281l60 60h339q23 0 41.5 18.5T880-680v460q0 23-18.5 41.5T820-160H140Zm0-60h680v-460H456l-60-60H140v520Zm0 0v-520 520Z']
+const P_Description = ['M319-250h322v-60H319v60Zm0-170h322v-60H319v60ZM220-80q-24 0-42-18t-18-42v-680q0-24 18-42t42-18h361l219 219v521q0 24-18 42t-42 18H220Zm331-554v-186H220v680h520v-494H551ZM220-820v186-186 680-680Z']
+const P_ChevronRight = ['M530-481 332-679l43-43 241 241-241 241-43-43 198-198Z']
 
 export interface IconProps { size?: number }
 
@@ -73,3 +79,7 @@ export const IconArrowUpward = (props: IconProps) => <Svg paths={P_ArrowUpward} 
 export const IconVerticalAlignTop = (props: IconProps) => <Svg paths={P_VerticalAlignTop} {...props} />
 export const IconSkipNext = (props: IconProps) => <Svg paths={P_SkipNext} {...props} />
 export const IconClose = (props: IconProps) => <Svg paths={P_Close} {...props} />
+export const IconPassword = (props: IconProps) => <Svg paths={P_Password} {...props} />
+export const IconFolder = (props: IconProps) => <Svg paths={P_Folder} {...props} />
+export const IconDescription = (props: IconProps) => <Svg paths={P_Description} {...props} />
+export const IconChevronRight = (props: IconProps) => <Svg paths={P_ChevronRight} {...props} />
