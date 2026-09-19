@@ -1222,6 +1222,27 @@ body {
   color: var(--md-sys-color-primary);
 }
 
+/* 已制卡片 list (user spec 2026-09-20): same look as the review UI's
+ * 相关卡片 (.similar-*) — flat inline list, surface-container items, small
+ * corner radius. The section sits right under the count line, so shave the
+ * similar-section's 20px top margin down. */
+.reading-made-section {
+  margin-top: 10px;
+}
+
+.reading-made-item .similar-q span:first-child {
+  /* cloze/qa HTML can be long — let it wrap and shrink instead of pushing
+   * the kind badge out of the row */
+  min-width: 0;
+  word-break: break-word;
+}
+
+.reading-made-tags {
+  margin-top: 6px;
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.8;
+}
+
 /* status chips: assist-chip is disabled (display-only), so tint via tokens.
  * active = secondary-container (正在制卡 stands out), done/skipped = muted */
 .reading-status-chip {

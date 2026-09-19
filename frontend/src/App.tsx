@@ -581,7 +581,7 @@ export const App: Component = () => {
     setClozeOpen(true)
   }
 
-  const onCardAdded = () => {
+  const onCardAdded = (noteId?: number) => {
     // the new card lands suspended in the preview pool — reflect in chips
     if (previewMode()) {
       setPreviewPool(p => (p == null ? p : p + 1))
@@ -589,7 +589,9 @@ export const App: Component = () => {
     }
     // 渐进制卡: the backend recorded the note id on the source chunk AND
     // auto-marked a todo chunk as active — mirror both locally so 「已从本
-    // 片段制卡 N 张」 and the 正在制卡 chip update without a reload
+    // 片段制卡 N 张」/已制卡片列表 and the 正在制卡 chip update without a
+    // reload. Pass the REAL note id so ReadingCard can fetch its content
+    // (placeholder 0 would only bump the count).
     const src = addSource()
     if (src) {
       setRdChunks(prev =>
@@ -597,7 +599,7 @@ export const App: Component = () => {
           c.path === src.path && c.chunk_key === src.chunk_key
             ? {
                 ...c,
-                cards_created: [...c.cards_created, 0],
+                cards_created: [...c.cards_created, noteId || 0],
                 status: c.status === 'todo' ? 'active' : c.status,
               }
             : c,
@@ -1323,7 +1325,7 @@ export const App: Component = () => {
           mode="add"
           readingSource={addSource()}
           onClose={() => { setAddOpen(false); setAddSource(null) }}
-          onAdded={() => onCardAdded()}
+          onAdded={(nid) => onCardAdded(nid)}
         />
       </Show>
 
@@ -1332,7 +1334,7 @@ export const App: Component = () => {
           initialText={clozeInitial()}
           readingSource={addSource()}
           onClose={() => { setClozeOpen(false); setAddSource(null) }}
-          onAdded={() => onCardAdded()}
+          onAdded={(nid) => onCardAdded(nid)}
         />
       </Show>
 

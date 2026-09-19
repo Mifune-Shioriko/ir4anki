@@ -1,7 +1,7 @@
 import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
 import { applyBottomSheetAnimation } from '../lib/bottom-sheet'
-import { textWithMath } from '../lib/math'
+import { clozeRanges, renderCloze } from '../lib/cloze'
 import { IconPassword } from './icons'
 
 // 挖空卡编辑框 (user spec 2026-09-19, round 2). Anki-native cloze: the
@@ -10,46 +10,14 @@ import { IconPassword } from './icons'
 // serialization to get wrong. Select text → 挖空选中 (or Ctrl/⌘+Shift+C)
 // wraps it in the next {{cN::}}; 取消挖空 unwraps the marker around the
 // cursor. Live 正面/背面 preview parses the markers (正面 shows […]/hint,
-// 背面 reveals the content), math-rendered via KaTeX.
+// 背面 reveals the content), math-rendered via KaTeX. Marker parsing lives
+// in lib/cloze.ts — shared with the reading page's 已制卡片 list.
 //
 // Model + field names are data-driven from /api/card/add/info?kind=cloze
 // (填空题: 文字 + 背面额外). The FIRST field is the cloze editor; any
 // remaining fields render as plain textareas. Save → /api/card/add kind=cloze
 // → preview pool suspended (same route as 问答题), provenance-linked to the
 // reading chunk when opened from a reading round.
-
-const CLOZE_RE = /\{\{c(\d+)::([\s\S]*?)(?:::([\s\S]*?))?\}\}/g
-
-interface ClozeRange { start: number; end: number; content: string; n: number }
-
-function clozeRanges(text: string): ClozeRange[] {
-  const out: ClozeRange[] = []
-  CLOZE_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = CLOZE_RE.exec(text))) {
-    out.push({ start: m.index, end: m.index + m[0].length, content: m[2] ?? '', n: parseInt(m[1]) })
-  }
-  return out
-}
-
-/** mode 'q' = 正面 (cloze hidden as […]/hint), 'a' = 背面 (content shown). */
-function renderCloze(text: string, mode: 'q' | 'a'): string {
-  let out = ''
-  let last = 0
-  CLOZE_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = CLOZE_RE.exec(text))) {
-    out += textWithMath(text.slice(last, m.index))
-    const content = m[2] ?? ''
-    const hint = m[3]
-    out += mode === 'q'
-      ? `<span class="cloze-q">[${hint ? textWithMath(hint) : '…'}]</span>`
-      : `<span class="cloze-a">${textWithMath(content)}</span>`
-    last = m.index + m[0].length
-  }
-  out += textWithMath(text.slice(last))
-  return out
-}
 
 interface Props {
   /** plain-text base for the 文字 field (whole chunk, selection pre-cloze'd) */

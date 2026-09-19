@@ -3161,6 +3161,57 @@ async def reading_file(path: str):
     return {"path": path, "text": text}
 
 
+def _field_value(v) -> str:
+    """AnkiConnect notesInfo fields are {value, order} dicts; the fake-Anki
+    test harness stores plain strings — accept both."""
+    if isinstance(v, dict):
+        return v.get("value", "") or ""
+    return v or ""
+
+
+@app.get("/api/reading/cards")
+async def reading_cards(notes: str):
+    """Card details behind a chunk's cards_created note ids (user spec
+    2026-09-20: 阅读页左栏显示本片段已制的卡片, styled like the review UI's
+    相关卡片). Lazy per-chunk fetch — dealing payloads stay light.
+
+    Read-only over AnkiConnect notesInfo. Deleted notes are silently
+    skipped (AnkiConnect returns {} rows for unknown ids). Order follows
+    the request order (provenance order = creation order).
+    """
+    _reading_guard()
+    try:
+        note_ids = [int(x) for x in notes.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="notes must be comma-separated ids")
+    note_ids = [n for n in note_ids if n > 0][:100]
+    if not note_ids:
+        return {"cards": []}
+    try:
+        rows = await anki("notesInfo", {"notes": note_ids})
+    except Exception:
+        # dead AnkiConnect must not break the reading page — the frontend
+        # falls back to the plain count line
+        return {"cards": [], "degraded": True}
+    by_id = {n["noteId"]: n for n in rows or [] if n.get("noteId")}
+    out = []
+    for nid in note_ids:
+        n = by_id.get(nid)
+        if n is None:
+            continue  # deleted note
+        model = n.get("modelName") or ""
+        fields = {k: _field_value(v) for k, v in (n.get("fields") or {}).items()}
+        out.append({
+            "noteId": nid,
+            "model": model,
+            "kind": "cloze" if model == ADD_CLOZE_MODEL else "qa",
+            "fields": fields,
+            "tags": n.get("tags") or [],
+            "numCards": len(n.get("cards") or []),
+        })
+    return {"cards": out}
+
+
 # ---- media upload + tag helpers --------------------------------------------
 
 ALLOWED_MEDIA_EXT = {

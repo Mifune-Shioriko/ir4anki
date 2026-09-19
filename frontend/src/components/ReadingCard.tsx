@@ -1,6 +1,12 @@
-import { Component, Show, createEffect, onCleanup, onMount } from 'solid-js'
+import { Component, For, Show, createEffect, createSignal, onCleanup, onMount } from 'solid-js'
+import renderMathInElement from 'katex/contrib/auto-render'
+import 'katex/dist/katex.min.css'
+import { api } from '../api'
+import { cleanCardHtml } from '../lib/clean'
+import { renderCloze } from '../lib/cloze'
 import { renderMarkdown } from '../lib/markdown'
-import type { ReadingChunk, ReadingChunkStatus } from '../types'
+import { KATEX_OPTS } from '../lib/math'
+import type { ReadingChunk, ReadingChunkStatus, ReadingCreatedCard } from '../types'
 import { IconAdd, IconPassword } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign 2026-09-19
@@ -49,6 +55,55 @@ interface Props {
 
 export const ReadingCard: Component<Props> = (props) => {
   let bodyRef: HTMLDivElement | undefined
+  // ---- 本片段已制卡片 (user spec 2026-09-20): cards_created holds note
+  // ids; fetch their content lazily and render as a 相关卡片-styled list.
+  // A placeholder id 0 = card added THIS session before the fetch round-trip
+  // (App.onCardAdded appends 0) — skipped; the real id arrives via refetch
+  // on chunk reload. Fail-soft: dead backend → count line only.
+  const [madeCards, setMadeCards] = createSignal<ReadingCreatedCard[] | null>(null)
+  let madeRef: HTMLDivElement | undefined
+  // render \(…\)/$$…$$ math in the fetched card HTML (same pattern as
+  // Flashcard's innerHTML zones)
+  createEffect(() => {
+    madeCards()
+    requestAnimationFrame(() => {
+      if (madeRef) renderMathInElement(madeRef, KATEX_OPTS)
+    })
+  })
+  let fetchToken = 0
+  createEffect(() => {
+    const ids = props.chunk.cards_created.filter(id => id > 0)
+    const token = ++fetchToken
+    if (ids.length === 0) {
+      setMadeCards(null)
+      return
+    }
+    setMadeCards(null)
+    api.readingCards(ids).then(res => {
+      if (token !== fetchToken) return // chunk moved on
+      setMadeCards(res.cards && res.cards.length > 0 ? res.cards : null)
+    }).catch(() => {
+      if (token === fetchToken) setMadeCards(null)
+    })
+  })
+  // first field's content per note kind: qa → 正面, cloze → cloze-rendered 文字
+  const cardQuestion = (c: ReadingCreatedCard): string => {
+    const fields = c.fields || {}
+    if (c.kind === 'cloze') {
+      const clozeField = fields['文字'] ?? Object.values(fields)[0] ?? ''
+      return renderCloze(clozeField, 'q')
+    }
+    return cleanCardHtml(fields['正面'] ?? Object.values(fields)[0] ?? '')
+  }
+  const cardAnswer = (c: ReadingCreatedCard): string => {
+    const fields = c.fields || {}
+    if (c.kind === 'cloze') {
+      const clozeField = fields['文字'] ?? Object.values(fields)[0] ?? ''
+      return renderCloze(clozeField, 'a')
+    }
+    const back = fields['背面'] ?? ''
+    return back ? cleanCardHtml(back) : ''
+  }
   // last non-empty selection INSIDE the chunk body. Tracked via
   // selectionchange because clicking the toolbar button clears the live
   // selection before onClick fires (the same problem EditDialog's toolbar
@@ -121,10 +176,42 @@ export const ReadingCard: Component<Props> = (props) => {
             innerHTML={renderMarkdown(props.chunk.text)}
           />
 
+          {/* 本片段已制卡片 (user spec 2026-09-20): styled like the review
+              UI's 相关卡片 — flat inline list, not collapsible. Count line
+              doubles as the fetch fallback (dead AnkiConnect / placeholder
+              ids only). */}
           <Show when={props.chunk.cards_created.length > 0}>
             <div class="reading-cards-made md-typescale-label-small">
               已从本片段制卡 {props.chunk.cards_created.length} 张
             </div>
+            <Show when={madeCards()}>
+              <div class="similar-section reading-made-section" ref={madeRef}>
+                <div class="similar-title md-typescale-label-medium">已制卡片</div>
+                <For each={madeCards() ?? []}>
+                  {c => (
+                    <div class="similar-item reading-made-item">
+                      <div class="similar-q md-typescale-body-medium">
+                        <span innerHTML={cardQuestion(c)} />
+                        <span class="similar-score md-typescale-label-small">
+                          {c.kind === 'cloze' ? `挖空 ×${c.numCards}` : '问答'}
+                        </span>
+                      </div>
+                      <Show when={cardAnswer(c)}>
+                        <div
+                          class="similar-a md-typescale-body-small"
+                          innerHTML={cardAnswer(c)}
+                        />
+                      </Show>
+                      <Show when={c.tags.length > 0}>
+                        <div class="reading-made-tags md-typescale-label-small">
+                          {c.tags.map(t => `#${t}`).join(' ')}
+                        </div>
+                      </Show>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </Show>
           </Show>
         </div>
       </md-elevated-card>

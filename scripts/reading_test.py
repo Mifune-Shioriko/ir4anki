@@ -470,6 +470,35 @@ async def main():
               stt)
         check("chunk still active after 2nd card", stt.get("status") == "active", stt)
 
+        # ---- /api/reading/cards: 已制卡片 details (2026-09-20) ----
+        r = await c.get("/api/reading/cards", params={"notes": f"{note_id},{cloze_note}"})
+        check("reading/cards 200", r.status_code == 200, r.status_code)
+        rc = r.json()
+        check("reading/cards returns both", len(rc.get("cards", [])) == 2, rc)
+        by_nid = {x["noteId"]: x for x in rc["cards"]}
+        check("order follows request", [x["noteId"] for x in rc["cards"]] ==
+              [note_id, cloze_note], rc)
+        qa = by_nid.get(note_id) or {}
+        check("qa card: kind/model", qa.get("kind") == "qa" and qa.get("model") == "问答题", qa)
+        check("qa card: fields carried", (qa.get("fields") or {}).get("正面") == "颈阔肌位于哪里？",
+              qa.get("fields"))
+        cl = by_nid.get(cloze_note) or {}
+        check("cloze card: kind/model", cl.get("kind") == "cloze" and cl.get("model") == "填空题", cl)
+        check("cloze card: fields carried",
+              "颈阔肌" in ((cl.get("fields") or {}).get("文字") or ""), cl.get("fields"))
+        check("cloze card: tags", cl.get("tags") == ["cloze-test"], cl.get("tags"))
+        check("cloze card: numCards 1", cl.get("numCards") == 1, cl)
+        # deleted note is skipped, not an error
+        fake.notes.pop(note_id, None)
+        r = await c.get("/api/reading/cards", params={"notes": f"{note_id},{cloze_note}"})
+        check("deleted note skipped", r.status_code == 200 and
+              [x["noteId"] for x in r.json()["cards"]] == [cloze_note], r.json())
+        # placeholder id 0 filtered, empty → empty list
+        r = await c.get("/api/reading/cards", params={"notes": "0"})
+        check("id 0 filtered → empty", r.status_code == 200 and r.json()["cards"] == [], r.json())
+        r = await c.get("/api/reading/cards", params={"notes": "abc"})
+        check("garbage notes → 400", r.status_code == 400, r.status_code)
+
         r = await c.post("/api/card/add", json={
             "fields": {"正面": "Q2", "背面": "A2"}, "tags": [],
             "reading_source": {"path": "gone.md", "chunk_key": "1:x"},

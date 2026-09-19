@@ -251,6 +251,16 @@ export interface ReadingRoundStats {
   next?: number
 }
 
+/** One card created from a reading chunk (/api/reading/cards). */
+export interface ReadingCreatedCard {
+  noteId: number
+  model: string
+  kind: 'qa' | 'cloze'
+  fields: Record<string, string>
+  tags: string[]
+  numCards: number
+}
+
 /** Active round: chunks to render. Complete tombstone: stats only. */
 export interface ReadingRound {
   status: 'active' | 'complete'

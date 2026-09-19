@@ -9,6 +9,7 @@ import type {
   PreviewUndoResponse,
   ReadingActResponse,
   ReadingCorpusFile,
+  ReadingCreatedCard,
   ReadingStartResponse,
   ReadingStateResponse,
   ReadingStatusResponse,
@@ -115,6 +116,10 @@ export const api = {
         `&chunk_key=${encodeURIComponent(chunkKey)}&action=${action}`,
     ),
   readingFinish: () => post<{ ok: boolean; stats?: object }>('/api/reading/finish'),
+  readingCards: (noteIds: number[]) =>
+    get<{ cards: ReadingCreatedCard[]; degraded?: boolean }>(
+      `/api/reading/cards?notes=${noteIds.join(',')}`,
+    ),
   readingListAdd: (path: string) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
   readingListRemove: (path: string) =>
