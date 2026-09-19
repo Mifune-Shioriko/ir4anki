@@ -301,22 +301,39 @@ def run():
         check("new cloze rendered live",
               new_item.locator(".similar-q .cloze-q").count() == 1)
 
+        # ---- 5. STORED FIELD IS HTML (markdown preservation 2026-09-20):
+        # the dialog converts md → HTML on save (Anki renders fields
+        # natively) — the fake AnkiConnect echoes stored fields verbatim,
+        # so /api/reading/cards must show <p>…</p> + the marker inside.
+        rc3 = api("/api/reading/state")
+        chunk3 = (rc3.get("round") or {}).get("chunks", [{}])[0]
+        ids3 = chunk3.get("cards_created") or []
+        rcards = api(f"/api/reading/cards?notes={','.join(str(i) for i in ids3 if i)}")
+        stored = [x for x in rcards.get("cards", [])
+                  if x["kind"] == "cloze" and "胸锁乳突肌" in (x["fields"].get("文字") or "")]
+        check("dialog-saved cloze field stored as HTML",
+              stored and stored[0]["fields"]["文字"].startswith("<p>")
+              and "{{c1::胸锁乳突肌}}" in stored[0]["fields"]["文字"],
+              stored[0]["fields"] if stored else rcards)
+
         # ---- 6. CONTEXT SEED (user fix 2026-09-20): selecting text in the
-        # chunk body then 添加挖空 must seed the dialog with the WHOLE chunk
-        # (markdown → plain text) and the selection wrapped IN PLACE — not
-        # just {{c1::selection}} (which made unrecallable "[…]"-only cards).
+        # chunk body then 添加挖空 must seed the dialog with the WHOLE chunk's
+        # RAW MARKDOWN (tables/bold preserved — the field is HTML-converted
+        # on SAVE, user spec "卡片看起来就是直接在 chunk 上挖空") and the
+        # selection wrapped IN PLACE — not just {{c1::selection}} (which
+        # made unrecallable "[…]"-only cards).
         # NOTE: lastSel is STICKY per chunk by design (round-2: the selection
         # must survive the toolbar click clearing it) — so the no-selection
         # case must be checked BEFORE any selection is made.
 
-        # ---- 6a. no selection yet → whole chunk seeded as-is ----
+        # ---- 6a. no selection yet → whole chunk seeded as raw markdown ----
         page.locator('md-icon-button[data-aria-label="添加挖空"]').click()
         page.wait_for_selector(".cloze-dialog", timeout=10000)
         page.wait_for_timeout(800)
         seed2 = page.locator(".cloze-dialog textarea.cloze-field").first.input_value()
-        check("no-selection seed = whole chunk, no markers",
+        check("no-selection seed = whole raw chunk, no auto-cloze",
               "浅筋膜内有颈阔肌" in seed2 and "{{c1::" not in seed2
-              and "## " not in seed2, repr(seed2))
+              and seed2.lstrip().startswith("#"), repr(seed2))
         page.get_by_text("取消", exact=True).click()
         page.wait_for_selector(".cloze-dialog", state="detached", timeout=10000)
 
@@ -350,8 +367,8 @@ def run():
               "浅筋膜内有{{c1::颈阔肌}}，由面神经颈支支配" in seed, repr(seed))
         check("seed keeps the whole chunk (not selection-only)",
               seed != "{{c1::颈阔肌}}" and "一、浅层结构" in seed, repr(seed))
-        check("seed has markdown markers stripped",
-              "**" not in seed and "## " not in seed, repr(seed))
+        check("seed KEEPS raw markdown (## header) — converted on save",
+              "## 一、浅层结构" in seed, repr(seed))
         page.get_by_text("取消", exact=True).click()
         page.wait_for_selector(".cloze-dialog", state="detached", timeout=10000)
 

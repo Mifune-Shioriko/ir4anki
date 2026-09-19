@@ -3,7 +3,7 @@ import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
 import { api } from '../api'
 import { cleanCardHtml } from '../lib/clean'
-import { renderCloze } from '../lib/cloze'
+import { renderClozeField } from '../lib/cloze'
 import { renderMarkdown } from '../lib/markdown'
 import { KATEX_OPTS } from '../lib/math'
 import type { ReadingChunk, ReadingChunkStatus, ReadingCreatedCard } from '../types'
@@ -89,12 +89,14 @@ export const ReadingCard: Component<Props> = (props) => {
       if (token === fetchToken) setMadeCards(null)
     })
   })
-  // first field's content per note kind: qa → 正面, cloze → cloze-rendered 文字
+  // first field's content per note kind: qa → 正面, cloze → cloze-rendered
+  // 文字. renderClozeField sniffs new HTML-stored fields vs legacy plain
+  // text and takes the right path.
   const cardQuestion = (c: ReadingCreatedCard): string => {
     const fields = c.fields || {}
     if (c.kind === 'cloze') {
       const clozeField = fields['文字'] ?? Object.values(fields)[0] ?? ''
-      return renderCloze(clozeField, 'q')
+      return renderClozeField(clozeField, 'q')
     }
     return cleanCardHtml(fields['正面'] ?? Object.values(fields)[0] ?? '')
   }
@@ -102,7 +104,7 @@ export const ReadingCard: Component<Props> = (props) => {
     const fields = c.fields || {}
     if (c.kind === 'cloze') {
       const clozeField = fields['文字'] ?? Object.values(fields)[0] ?? ''
-      return renderCloze(clozeField, 'a')
+      return renderClozeField(clozeField, 'a')
     }
     const back = fields['背面'] ?? ''
     return back ? cleanCardHtml(back) : ''

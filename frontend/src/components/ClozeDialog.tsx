@@ -1,7 +1,8 @@
 import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
 import { applyBottomSheetAnimation } from '../lib/bottom-sheet'
-import { clozeRanges, renderCloze } from '../lib/cloze'
+import { clozeMdToHtml, clozeRanges, renderClozeMd } from '../lib/cloze'
+import { renderMarkdown } from '../lib/markdown'
 import { IconPassword } from './icons'
 
 // 挖空卡编辑框 (user spec 2026-09-19, round 2). Anki-native cloze: the
@@ -163,6 +164,18 @@ export const ClozeDialog: Component<Props> = (props) => {
         setSaving(false)
         return
       }
+      // STORE HTML (user spec 2026-09-20): Anki renders fields natively, so
+      // the markdown source is converted (markers protected through the
+      // conversion, $math$ → \(…\)) — the card looks exactly like the chunk
+      // with a hole punched in it. The cloze field goes through
+      // clozeMdToHtml; extra fields through plain markdown conversion (same
+      // reason: literal \n and ** would show as junk otherwise).
+      const clozeFieldName = names[0] ?? '文字'
+      fields[clozeFieldName] = clozeMdToHtml(clozeText())
+      names.slice(1).forEach((n, i) => {
+        const v = vals[i + 1] ?? ''
+        fields[n] = v.trim() ? renderMarkdown(v) : ''
+      })
       const res = await api.addCard(fields, tags(), props.readingSource ?? null, 'cloze')
       props.onAdded?.(res.noteId)
       props.onClose()
@@ -222,14 +235,14 @@ export const ClozeDialog: Component<Props> = (props) => {
               <div class="cloze-preview-label md-typescale-label-medium">正面（提问）</div>
               <div
                 class="cloze-preview-box note-body md-typescale-body-medium"
-                innerHTML={renderCloze(clozeText(), 'q')}
+                innerHTML={renderClozeMd(clozeText(), 'q')}
               />
             </div>
             <div class="cloze-preview-col">
               <div class="cloze-preview-label md-typescale-label-medium">背面（答案）</div>
               <div
                 class="cloze-preview-box note-body md-typescale-body-medium"
-                innerHTML={renderCloze(clozeText(), 'a')}
+                innerHTML={renderClozeMd(clozeText(), 'a')}
               />
             </div>
           </div>
@@ -285,7 +298,7 @@ export const ClozeDialog: Component<Props> = (props) => {
           </div>
 
           <div class="edit-hint md-typescale-body-small">
-            挖空标记 {'{{c1::答案}}'} 直接写在正文里（和 Anki 一样）；可加提示 {'{{c1::答案::提示}}'}。
+            正文支持 markdown（表格、加粗、$公式$），保存时自动转成 Anki 卡片格式；挖空标记 {'{{c1::答案}}'} 直接写在正文里（和 Anki 一样），可加提示 {'{{c1::答案::提示}}'}。
             同一编号的多处挖空会一起考。新卡进入预览池（挂起），预览放行后进入复习队列。
           </div>
         </Show>

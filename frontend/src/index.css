@@ -1243,6 +1243,35 @@ body {
   opacity: 0.8;
 }
 
+/* stored cloze fields are HTML now (2026-09-20) — a table chunk renders a
+ * real <table> inside the list item; give it the note-body treatment */
+.reading-made-item table {
+  border-collapse: collapse;
+  margin: 6px 0;
+  font-size: 0.92em;
+  display: block;
+  overflow-x: auto;
+}
+.reading-made-item th,
+.reading-made-item td {
+  border: 1px solid var(--md-sys-color-outline-variant);
+  padding: 4px 8px;
+  text-align: left;
+  vertical-align: top;
+}
+.reading-made-item th {
+  background: var(--md-sys-color-surface-container);
+  font-weight: 600;
+}
+.reading-made-item :is(h1, h2, h3, h4, h5, h6) {
+  font-size: 1em;
+  font-weight: 600;
+  margin: 4px 0;
+}
+.reading-made-item p {
+  margin: 2px 0;
+}
+
 /* status chips: assist-chip is disabled (display-only), so tint via tokens.
  * active = secondary-container (正在制卡 stands out), done/skipped = muted */
 .reading-status-chip {

@@ -3,7 +3,7 @@ import { api } from './api'
 import type { Card } from './types'
 import { syncThemeColor } from './theme'
 import { stripTemplateBlocks } from './lib/clean'
-import { mdToClozeText, wrapSelectionAsCloze } from './lib/cloze'
+import { wrapSelectionAsCloze } from './lib/cloze'
 
 import { NavRail } from './components/NavRail'
 import type { Section } from './components/NavRail'
@@ -570,19 +570,20 @@ export const App: Component = () => {
     setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
     setAddOpen(true)
   }
-  // 添加挖空 (user spec 2026-09-19 round 2; CONTEXT FIX 2026-09-20): the
-  // dialog seeds from the WHOLE chunk (markdown → plain text — Anki renders
-  // fields literally, so **/## would show up as junk). A selection inside
-  // the chunk body is auto-wrapped in {{c1::…}} IN PLACE, keeping the
+  // 添加挖空 (user spec 2026-09-19 round 2; CONTEXT FIX 2026-09-20; MARKDOWN
+  // PRESERVATION 2026-09-20): the dialog seeds from the WHOLE chunk's RAW
+  // MARKDOWN (tables/bold/$math$ stay visible while editing; the field is
+  // converted to HTML on save — Anki renders HTML natively, so the card
+  // looks exactly like the chunk with a hole punched in it). A selection
+  // inside the chunk body is auto-wrapped in {{c1::…}} IN PLACE, keeping the
   // surrounding sentence as recall context. The OLD behavior seeded with
   // ONLY the selection — the card front became a bare "[…]" with nothing to
-  // recall from (user report). Selection can't be located in the converted
-  // text (exotic markdown) → whole chunk, user wraps manually. No selection
-  // → whole chunk as-is.
+  // recall from (user report). Selection can't be located (exotic markdown)
+  // → whole chunk, user wraps manually. No selection → whole chunk as-is.
   const openReadingCloze = (selText: string, selBlock?: string) => {
     const chunk = rdCurrent()
     if (!chunk) return
-    const base = mdToClozeText(chunk.text)
+    const base = chunk.text
     let seed = base
     if (selText) {
       const wrapped = wrapSelectionAsCloze(base, selText, 1, selBlock || undefined)
