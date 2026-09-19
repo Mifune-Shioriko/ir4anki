@@ -1,7 +1,6 @@
 import { Component, Show } from 'solid-js'
 import { ModeSelector } from './ModeSelector'
 import type { StudyModes } from '../types'
-import { IconMenuBook } from './icons'
 
 // Preview-mode start screen (先想后看). Shown instead of the study start
 // screen when preview mode is on: its job is to make the zero-stakes nature
@@ -22,10 +21,6 @@ interface Props {
   busy: boolean
   onStart: () => void
   onSkipToReview: () => void
-  /** 渐进制卡 (2026-09-19): reading-list manager entry (hidden when off) */
-  readingMode?: boolean
-  readingListSize?: number
-  onToReadingList?: () => void
   /** two-tier pacing (2026-09-14): table from the wire + current selection */
   studyModes?: StudyModes | null
   mode?: string
@@ -138,17 +133,6 @@ export const PreviewScreen: Component<Props> = (props) => {
               跳过，直接复习
             </md-text-button>
           </div>
-          {/* 渐进制卡 (2026-09-19): list manager entry — the funnel lands
-              here only when nothing is dealable, but files can still be
-              added/reordered any time */}
-          <Show when={props.readingMode}>
-            <div class="screen-actions">
-              <md-text-button onClick={() => props.onToReadingList?.()} disabled={props.busy}>
-                <md-icon><IconMenuBook /></md-icon>
-                阅读清单{props.readingListSize ? `（${props.readingListSize}）` : ''}
-              </md-text-button>
-            </div>
-          </Show>
         </div>
       </md-elevated-card>
     </div>

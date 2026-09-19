@@ -98,8 +98,45 @@ class FakeAnki:
                 return [c for c, i in self.cards.items()
                         if i["type"] == 0 and "-is:suspended" not in q or i["queue"] != -1]
             return []
-        if action in ("changeDeck", "suspend", "unsuspend", "sync",
-                      "addTags", "removeTags"):
+        if action == "changeDeck":
+            for cid in params.get("cards", []):
+                if cid in self.cards:
+                    self.cards[cid]["deckName"] = params.get("deck", "")
+            return None
+        if action == "suspend":
+            for cid in params.get("cards", []):
+                if cid in self.cards:
+                    self.cards[cid]["queue"] = -1
+            return None
+        if action == "unsuspend":
+            for cid in params.get("cards", []):
+                if cid in self.cards and self.cards[cid]["queue"] == -1:
+                    self.cards[cid]["queue"] = 0
+            return None
+        if action == "deleteNotes":
+            for nid in params.get("notes", []):
+                self.notes.pop(nid, None)
+                for cid in [c for c, i in self.cards.items() if i["note"] == nid]:
+                    self.cards.pop(cid)
+            return None
+        if action == "notesInfo":
+            # AnkiConnect convention: unknown note ids come back as {} rows
+            out = []
+            for nid in params.get("notes", []):
+                n = self.notes.get(nid)
+                if n is None:
+                    out.append({})
+                else:
+                    out.append({
+                        "noteId": nid,
+                        "tags": n["tags"],
+                        "modelName": n["modelName"],
+                        "fields": n["fields"],
+                        "cards": [c for c, i in self.cards.items()
+                                  if i["note"] == nid],
+                    })
+            return out
+        if action in ("sync", "addTags", "removeTags"):
             return None
         if action == "modelFieldNames":
             model = params.get("modelName")
@@ -115,6 +152,13 @@ class FakeAnki:
 fake = FakeAnki()
 backend.anki = fake
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")  # keep the SPA mount away
+
+
+def _state_data() -> dict:
+    """Current reading state via the app's own SQLite loader (round 3:
+    reading.json is gone — reading.db is the store; reading through
+    _reading_read also verifies the dict-assembly path)."""
+    return backend._reading_read()
 
 
 # ---- temporary markdown corpus ----------------------------------------------
@@ -269,12 +313,12 @@ async def main():
         check("all done → empty deal", r.json()["empty"] is True
               and r.json()["chunks"] == [], r.json())
         # restore the section-6 fixture: reset A's progress by remove+re-add
-        # (archive restore keeps states — so instead rewrite the state file)
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        # (archive restore keeps states — so instead rewrite the state store)
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         entry["chunks"] = {}
         data["round"] = None
-        (Path(STATE) / "reading.json").write_text(json.dumps(data, ensure_ascii=False))
+        backend._reading_write(data)
         await c.post("/api/reading/list/add", json={"path": B_PATH})
         await c.post("/api/reading/list/add", json={"path": C_PATH})
         r = await c.post("/api/reading/list/reorder",
@@ -384,7 +428,7 @@ async def main():
         })
         check("card added", r.status_code == 200, r.status_code)
         note_id = r.json()["noteId"]
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         stt = entry["chunks"].get(tgt["chunk_key"], {})
         check("cards_created recorded", note_id in (stt.get("cards_created") or []),
@@ -419,7 +463,7 @@ async def main():
         cloze_note = r.json()["noteId"]
         check("cloze used the 填空题 model",
               fake.added_models[-1] == "填空题", fake.added_models)
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         stt = entry["chunks"].get(tgt["chunk_key"], {})
         check("cloze provenance recorded", cloze_note in (stt.get("cards_created") or []),
@@ -460,13 +504,13 @@ async def main():
         # drift: edit A — insert lines above, rename nothing. heading_path
         # migration must carry the `done` states to shifted line numbers.
         done_keys_before = {k for k, v in
-                            (next(e for e in json.loads((Path(STATE) / "reading.json").read_text())
+                            (next(e for e in _state_data()
                                   ["list"] if e["path"] == A_PATH)["chunks"]).items()
                             if v.get("status") in ("done", "skipped")}
         write_note(A_PATH, "前言一行。\n\n另一行。\n" + NOTE_A)
         r = await c.get("/api/reading/status")
         a_sum = next(s for s in r.json()["list"] if s["path"] == A_PATH)
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         done_after = {k for k, v in entry["chunks"].items()
                       if v.get("status") in ("done", "skipped")}
@@ -491,7 +535,7 @@ async def main():
         await c.post("/api/reading/finish")
 
         print("== 11. remove + re-add restores progress ==")
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         n_states = len(entry.get("chunks") or {})
         r = await c.post("/api/reading/list/remove", json={"path": A_PATH})
@@ -500,7 +544,7 @@ async def main():
         check("remove twice 404", r.status_code == 404, r.status_code)
         r = await c.post("/api/reading/list/add", json={"path": A_PATH})
         check("re-add ok", r.json()["ok"] is True)
-        data = json.loads((Path(STATE) / "reading.json").read_text())
+        data = _state_data()
         entry = next(e for e in data["list"] if e["path"] == A_PATH)
         check("progress restored on re-add", len(entry.get("chunks") or {}) == n_states,
               (len(entry.get("chunks") or {}), n_states))
@@ -516,6 +560,103 @@ async def main():
         check("status reading_available int", isinstance(d.get("reading_available"), int), d.get("reading_available"))
         check("study_modes has read", "read" in d["study_modes"]["quick"]
               and d["study_modes"]["quick"]["read"] == 2, d["study_modes"]["quick"])
+
+        print("== 13. preview-pool gate (B·二段重推, round 3) ==")
+        # Fixture: fresh file D with 2 sections. Make a card from D's first
+        # chunk (auto-active + provenance) — the card lands in the preview
+        # pool suspended (PREVIEW_MODE=1). The chunk must then be HELD:
+        # not dealt, frontier blocked, gated counters up. Thawing the card
+        # (unsuspend + move out of the pool = next-day release) lifts the
+        # gate and the chunk resurfaces.
+        write_note("2026/局部解剖学/盆部.md",
+                   "# 盆部\n\n## 一、盆腔壁\n\n由髋骨、骶尾骨及盆壁肌共同围成，内衬盆壁筋膜。\n\n## 二、盆筋膜\n\n分为壁层与脏层两部分，脏层包裹盆腔脏器形成筋膜鞘。\n")
+        D_PATH = "2026/局部解剖学/盆部.md"
+        r = await c.post("/api/reading/list/add", json={"path": D_PATH})
+        check("add D ok", r.json().get("ok") is True)
+        r = await c.post("/api/reading/list/reorder", json={"path": D_PATH, "top": True})
+        check("D to top", r.json()["order"][0] == D_PATH, r.json()["order"])
+        r = await c.post("/api/reading/start?mode=quick")
+        dealt = r.json()["chunks"]
+        d_chunk = next((ch for ch in dealt if ch["path"] == D_PATH), None)
+        check("D frontier dealt", d_chunk is not None, [ch["path"] for ch in dealt])
+        r = await c.post("/api/card/add", json={
+            "fields": {"正面": "盆筋膜分几层？", "背面": "脏壁两层"},
+            "tags": [],
+            "reading_source": {"path": D_PATH, "chunk_key": d_chunk["chunk_key"]},
+        })
+        d_note = r.json()["noteId"]
+        d_card = fake.cards[d_note * 10]["cardId"]
+        check("D card in preview pool suspended",
+              fake.cards[d_card]["deckName"] == "预览池"
+              and fake.cards[d_card]["queue"] == -1, fake.cards[d_card])
+        # round still open on the D chunk — finish/next it away, then a
+        # fresh deal must HOLD it (cards not thawed yet)
+        for ch in dealt:
+            await c.post("/api/reading/act", params={
+                "path": ch["path"], "chunk_key": ch["chunk_key"], "action": "next"})
+        r = await c.post("/api/reading/start?mode=quick")
+        dealt2 = r.json()["chunks"]
+        check("gated chunk NOT re-dealt",
+              not any(ch["path"] == D_PATH for ch in dealt2),
+              [(ch["path"], ch["heading_path"]) for ch in dealt2])
+        r = await c.get("/api/reading/status")
+        d_sum = next(s for s in r.json()["list"] if s["path"] == D_PATH)
+        check("gated summary: frontier None + gated_frontier set",
+              d_sum["frontier"] is None and d_sum.get("gated_frontier") is not None,
+              d_sum)
+        check("gated summary: gated count 1", d_sum.get("gated") == 1, d_sum)
+        check("gated summary: second chunk locked (still todo)",
+              d_sum["todo"] == 1 and d_sum["active"] == 1, d_sum)
+        r = await c.get("/api/session/state")
+        check("session/state carries reading_gated",
+              r.json().get("reading_gated", 0) >= 1, r.json().get("reading_gated"))
+        # empty-deal reason when ONLY gated chunks remain
+        r = await c.post("/api/reading/list/remove", json={"path": A_PATH})
+        r = await c.post("/api/reading/list/remove", json={"path": B_PATH})
+        r = await c.post("/api/reading/list/remove", json={"path": C_PATH})
+        await c.post("/api/reading/finish")
+        r = await c.post("/api/reading/start?mode=quick")
+        check("all-held deal: empty + all_gated",
+              r.json()["empty"] is True and r.json().get("all_gated") is True,
+              r.json())
+        # approval alone does NOT lift the gate: released-same-day cards sit
+        # in 2026 SUSPENDED until the next-day release (user decision:
+        # 真正解冻 = out of the pool AND unsuspended)
+        fake.cards[d_card]["deckName"] = "2026"  # approve = changeDeck
+        fake.cards[d_card]["queue"] = -1  # approved but still suspended
+        r = await c.post("/api/reading/start?mode=quick")
+        check("approved-but-suspended still gated",
+              r.json()["empty"] is True, r.json())
+        # thaw = unsuspend (the next-day release path)
+        fake.cards[d_card]["queue"] = 0
+        r = await c.post("/api/reading/start?mode=quick")
+        dealt3 = r.json()["chunks"]
+        check("thawed → chunk re-dealt (二段重推)",
+              any(ch["path"] == D_PATH for ch in dealt3), dealt3)
+        d_chunk2 = next(ch for ch in dealt3 if ch["path"] == D_PATH)
+        check("re-dealt chunk keeps its provenance",
+              d_note in d_chunk2["cards_created"], d_chunk2["cards_created"])
+        check("re-dealt chunk status still active",
+              d_chunk2["status"] == "active", d_chunk2["status"])
+        # completing the held chunk unlocks the file's next section
+        r = await c.post("/api/reading/act", params={
+            "path": D_PATH, "chunk_key": d_chunk2["chunk_key"], "action": "complete"})
+        check("complete gated chunk ok", r.json()["status"] == "done")
+        r = await c.post("/api/reading/start?mode=quick")
+        dealt4 = r.json()["chunks"]
+        d_next = next((ch for ch in dealt4 if ch["path"] == D_PATH), None)
+        check("next section unlocked after complete",
+              d_next is not None and d_next["heading_path"] == ["盆部", "二、盆筋膜"],
+              d_next and d_next["heading_path"])
+        await c.post("/api/reading/finish")
+        # deleting the card's note lifts the gate (never strand on a
+        # deleted note)
+        r = await c.post("/api/reading/act", params={
+            "path": D_PATH, "chunk_key": d_next["chunk_key"], "action": "next"})
+        await c.post("/api/reading/finish")
+        r = await c.get("/api/reading/status")
+        check("gate cleared state consistent (D active count)",
+              any(s["path"] == D_PATH for s in r.json()["list"]))
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

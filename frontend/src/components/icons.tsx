@@ -40,6 +40,9 @@ const P_Close = ['m249-207-42-42 231-231-231-231 42-42 231 231 231-231 42 42-231
 // mark; folder / description / chevron_right = tree file-picker icons.
 const P_Password = ['M80-200v-61h800v61H80Zm38-254-40-22 40-68H40v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 22-38-67-38 67Zm324 0-40-24 40-68h-78v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 24-38-67-38 67Zm324 0-40-24 40-68h-78v-45h78l-40-68 40-22 38 67 38-67 40 22-40 68h78v45h-78l40 68-40 24-38-67-38 67Z']
 const P_Folder = ['M140-160q-24 0-42-18.5T80-220v-520q0-23 18-41.5t42-18.5h281l60 60h339q23 0 41.5 18.5T880-680v460q0 23-18.5 41.5T820-160H140Zm0-60h680v-460H456l-60-60H140v520Zm0 0v-520 520Z']
+// nav rail (user spec 2026-09-19 round 3): school = 学习 destination
+// (official Material Symbols outlined, @material-symbols/svg-400)
+const P_School = ['M479-120 189-279v-240L40-600l439-240 441 240v317h-60v-282l-91 46v240L479-120Zm0-308 315-172-315-169-313 169 313 172Zm0 240 230-127v-168L479-360 249-485v170l230 127Zm1-240Zm-1 74Zm0 0Z']
 const P_Description = ['M319-250h322v-60H319v60Zm0-170h322v-60H319v60ZM220-80q-24 0-42-18t-18-42v-680q0-24 18-42t42-18h361l219 219v521q0 24-18 42t-42 18H220Zm331-554v-186H220v680h520v-494H551ZM220-820v186-186 680-680Z']
 const P_ChevronRight = ['M530-481 332-679l43-43 241 241-241 241-43-43 198-198Z']
 
@@ -83,3 +86,4 @@ export const IconPassword = (props: IconProps) => <Svg paths={P_Password} {...pr
 export const IconFolder = (props: IconProps) => <Svg paths={P_Folder} {...props} />
 export const IconDescription = (props: IconProps) => <Svg paths={P_Description} {...props} />
 export const IconChevronRight = (props: IconProps) => <Svg paths={P_ChevronRight} {...props} />
+export const IconSchool = (props: IconProps) => <Svg paths={P_School} {...props} />

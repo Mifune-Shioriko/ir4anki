@@ -231,6 +231,16 @@ export interface ReadingFileSummary {
     title: string
     line_start: number
   } | null
+  /** chunks held by the preview-pool gate (cards not all released yet) —
+   * B·二段重推, user spec 2026-09-19 round 3. `gated_frontier` is the held
+   * chunk that blocks this file (null when frontier exists normally). */
+  gated?: number
+  gated_frontier?: {
+    chunk_key: string
+    status: ReadingChunkStatus
+    title: string
+    line_start: number
+  } | null
   orphans: number
   cards_created: number
 }
@@ -256,6 +266,9 @@ export interface ReadingStartResponse {
   mode: string
   empty: boolean
   study_modes?: StudyModes
+  /** empty deal only: chunks held by the preview-pool gate (round 3) */
+  gated?: number
+  all_gated?: boolean
 }
 
 export interface ReadingActResponse {
@@ -295,6 +308,8 @@ export interface ReadingExtras {
   reading_list_size?: number
   reading_available?: number
   reading_active?: number
+  /** chunks held by the preview-pool gate (B·二段重推, round 3) */
+  reading_gated?: number
   /** active reading round only (resume after refresh) — the completed
    * tombstone is fetched via GET /api/reading/state */
   reading_round?: ReadingRound

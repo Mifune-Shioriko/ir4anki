@@ -4,8 +4,10 @@ import type { Card } from './types'
 import { syncThemeColor } from './theme'
 import { stripTemplateBlocks } from './lib/clean'
 
-import { TopAppBar } from './components/TopAppBar'
-import { ProgressBar } from './components/ProgressBar'
+import { NavRail } from './components/NavRail'
+import type { Section } from './components/NavRail'
+import { ProgressRing } from './components/ProgressRing'
+import { FilesScreen } from './components/FilesScreen'
 import { Flashcard } from './components/Flashcard'
 import { ActionArea } from './components/ActionArea'
 import { StartScreen } from './components/StartScreen'
@@ -68,10 +70,38 @@ type Phase =
   | 'readingStart'
   | 'reading'
   | 'readingDone'
-  | 'readingList'
 
 export const App: Component = () => {
   createEffect(() => syncThemeColor())
+
+  // ---- left nav rail section (user spec 2026-09-19 round 3) ----
+  // The old "Anki" top bar became a left icon rail with three destinations:
+  // 学习 (the whole funnel below), 文件 (read-only note browser) and
+  // 阅读清单 (list manager — used to be a phase). Section is NOT persisted
+  // across reloads: a page load always lands on 学习 so an active round
+  // resumes where it left off.
+  const [section, setSection] = createSignal<Section>('study')
+  // reading-list membership for the 文件 browser's 清单 badges — fetched
+  // lazily when the section opens (cheap; the list is small)
+  const [listedPaths, setListedPaths] = createSignal<Set<string>>(new Set())
+  const refreshListedPaths = async () => {
+    if (!readingMode()) {
+      setListedPaths(new Set<string>())
+      return
+    }
+    try {
+      const st = await api.readingStatus()
+      setListedPaths(new Set(st.list.map(s => s.path)))
+    } catch { /* badges are decorative */ }
+  }
+  const navigate = (s: Section) => {
+    if (s === section()) return
+    setSection(s)
+    // returning to the study section re-reads server state (list edits in
+    // the 阅读清单 section can change the funnel, e.g. adding files)
+    if (s === 'study') resync()
+    if (s === 'files') refreshListedPaths()
+  }
 
   // ---- wide-screen detection (note panel gate) ----
   const mq = window.matchMedia(WIDE_QUERY)
@@ -228,6 +258,7 @@ export const App: Component = () => {
   const [readingListSize, setReadingListSize] = createSignal(0)
   const [readingAvailable, setReadingAvailable] = createSignal(0)
   const [readingActive, setReadingActive] = createSignal(0)
+  const [readingGated, setReadingGated] = createSignal(0)
   const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
   const [rdDone, setRdDone] = createSignal(0)
   const [rdTotal, setRdTotal] = createSignal(0)
@@ -314,6 +345,7 @@ export const App: Component = () => {
         setReadingListSize(d.reading_list_size ?? 0)
         setReadingAvailable(d.reading_available ?? 0)
         setReadingActive(d.reading_active ?? 0)
+        setReadingGated(d.reading_gated ?? 0)
       }
       if (d.state === 'active') {
         // a normal review round in progress always wins — finish it first
@@ -801,6 +833,7 @@ export const App: Component = () => {
         setReadingListSize(d.reading_list_size ?? 0)
         setReadingAvailable(d.reading_available ?? 0)
         setReadingActive(d.reading_active ?? 0)
+        setReadingGated(d.reading_gated ?? 0)
       }
     } catch { /* counts are decorative; next resync fixes them */ }
   }
@@ -814,8 +847,14 @@ export const App: Component = () => {
       const d = await api.readingStart(selectedMode())
       if (d.study_modes) setStudyModes(d.study_modes)
       if (!d.chunks.length) {
-        // nothing dealable (list empty or all done) — fall through the funnel
-        showSnack('阅读清单暂时没有可推进的片段')
+        // nothing dealable — distinguish the round-3 gate (every remaining
+        // chunk is waiting on its cards to clear the preview pipeline) from
+        // a plain empty/done list
+        showSnack(
+          d.all_gated
+            ? '正在制卡的片段都在等卡片过预览池——先去预览放行，明天它们会重新推送'
+            : '阅读清单暂时没有可推进的片段',
+        )
         await resync()
         return
       }
@@ -904,7 +943,7 @@ export const App: Component = () => {
     rdNext()
   }
 
-  const openReadingList = () => setPhase('readingList')
+  const openReadingList = () => setSection('readingList')
 
   // ---- keyboard shortcuts ----
   // Attached at WINDOW level (2026-09-07 fix): the old div-level onKeyDown
@@ -1010,14 +1049,38 @@ export const App: Component = () => {
     (phase() === 'review' && !!currentCard() && !revealed())
 
   return (
-    <div class="app">
-      <TopAppBar />
+    <div class="app-shell">
+      <NavRail
+        section={section()}
+        onNavigate={navigate}
+        readingListSize={readingMode() ? readingListSize() : 0}
+      />
 
+      <div class="app">
+        {/* ---- 文件 section: read-only corpus browser (tree + viewer) ---- */}
+        <Show when={section() === 'files'}>
+          <div class="files-page">
+            <FilesScreen listedPaths={listedPaths} />
+          </div>
+        </Show>
+
+        {/* ---- 阅读清单 section: the list manager (was a phase) ---- */}
+        <Show when={section() === 'readingList'}>
+          <div class="content reading-list-page">
+            <ReadingListScreen busy={false} onListChange={rdRefreshCounts} />
+          </div>
+        </Show>
+
+        {/* ---- 学习 section: the whole funnel ---- */}
+        <Show when={section() === 'study'}>
       {/* Round progress as a full-width strip ABOVE the two columns
           (2026-09-17): it used to live inside the left column, pushing the
           card down by its own height so the card box and the note box no
           longer shared a top edge. Lifting it out (inner width matched to
-          the left column) makes both columns start on the same baseline. */}
+          the left column) makes both columns start on the same baseline.
+          2026-09-19 round 3: the strip is now a single circular indicator
+          (done/total in the ring center) — the linear bar + 复习/新卡
+          detail rows are gone, unified across review/preview/reading. */}
       <Show
         when={
           (phase() === 'review' && currentCard()) ||
@@ -1028,48 +1091,13 @@ export const App: Component = () => {
         <div class="round-strip">
           <div class="round-strip-inner">
             <Show when={phase() === 'review' && currentCard()}>
-              <ProgressBar
-                done={totalDone()}
-                total={roundTotal()}
-                reviewDone={reviewDone()}
-                reviewTotal={reviewTotal()}
-                newDone={newDone()}
-                newTotal={newInBatch()}
-              />
+              <ProgressRing done={totalDone()} total={roundTotal()} />
             </Show>
             <Show when={phase() === 'reading' && rdCurrent()}>
-              <div class="progress-area">
-                <div class="progress-row">
-                  <md-linear-progress
-                    class="progress-bar"
-                    value={rdTotal() > 0 ? Math.min(rdDone() / rdTotal(), 1) : 0}
-                  />
-                  <span class="progress-text md-typescale-label-large">
-                    {rdDone()}/{rdTotal()}
-                  </span>
-                </div>
-                <div class="progress-split md-typescale-label-medium">
-                  <span>阅读 · 渐进制卡</span>
-                  <span>已完成 {rdStats().done ?? 0} · 跳过 {rdStats().skipped ?? 0}</span>
-                </div>
-              </div>
+              <ProgressRing done={rdDone()} total={rdTotal()} />
             </Show>
             <Show when={phase() === 'preview' && previewCard()}>
-              <div class="progress-area">
-                <div class="progress-row">
-                  <md-linear-progress
-                    class="progress-bar"
-                    value={pvTotal() > 0 ? Math.min(pvDone() / pvTotal(), 1) : 0}
-                  />
-                  <span class="progress-text md-typescale-label-large">
-                    {pvDone()}/{pvTotal()}
-                  </span>
-                </div>
-                <div class="progress-split md-typescale-label-medium">
-                  <span>已放行 {pvApproved()}</span>
-                  <span>明天再看 {pvDeferred()}</span>
-                </div>
-              </div>
+              <ProgressRing done={pvDone()} total={pvTotal()} />
             </Show>
           </div>
         </div>
@@ -1090,6 +1118,7 @@ export const App: Component = () => {
             listSize={readingListSize()}
             available={readingAvailable()}
             active={readingActive()}
+            gated={readingGated()}
             busy={rdBusy()}
             onStart={rdStart}
             onSkip={rdSkip}
@@ -1126,13 +1155,6 @@ export const App: Component = () => {
           />
         </Show>
 
-        <Show when={phase() === 'readingList'}>
-          <ReadingListScreen
-            busy={false}
-            onBack={() => resync()}
-          />
-        </Show>
-
         <Show when={phase() === 'previewStart'}>
           <PreviewScreen
             pool={previewPool()}
@@ -1144,9 +1166,6 @@ export const App: Component = () => {
             busy={pvBusy()}
             onStart={pvStart}
             onSkipToReview={pvToReview}
-            readingMode={readingMode()}
-            readingListSize={readingListSize()}
-            onToReadingList={openReadingList}
             studyModes={studyModes()}
             mode={selectedMode()}
             onModeChange={chooseMode}
@@ -1203,9 +1222,6 @@ export const App: Component = () => {
             onBegin={startNewRound}
             previewPool={previewMode() ? previewPool() : null}
             onToPreview={pvToPreview}
-            readingMode={readingMode()}
-            readingListSize={readingListSize()}
-            onToReadingList={openReadingList}
             studyModes={studyModes()}
             mode={selectedMode()}
             onModeChange={chooseMode}
@@ -1283,6 +1299,7 @@ export const App: Component = () => {
         </div>
       </Show>
       </div>{/* /columns */}
+        </Show>{/* /study section */}
 
       <Show when={editOpen() && currentCard()}>
         <EditDialog
@@ -1351,6 +1368,7 @@ export const App: Component = () => {
       />
 
       <Snackbar open={snackText() !== null} label={snackText() ?? ''} />
+      </div>{/* /.app */}
     </div>
   )
 }

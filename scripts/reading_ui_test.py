@@ -8,22 +8,25 @@ dir, the real collection and ~/anki-notes are all untouched. Preview mode
 is OFF so the funnel is reading → review and no release-budget logic mixes
 in.
 
-Covers (2026-09-19 round-2 layout: header icon actions + state-only bottom
+Covers (round-3 layout: LEFT NAV RAIL + progress RING + 文件 browser;
+round-2 features still asserted: header icon actions + state-only bottom
 row + folder-tree picker + cloze dialog):
-  1. gate on: start screen shows the 阅读清单 entry
-  2. list manager: TREE picker (folder rows collapse/expand, file rows add),
-     reorder buttons render, progress rows
-  3. readingStart screen: stats, mode tiles carry 阅读 N from the wire
-  4. reading round: header icon buttons 添加卡片/添加挖空, bottom row =
+  1. nav rail: three destinations (学习/文件/阅读清单), NO old top bar
+  2. 阅读清单 section: TREE picker (folder rows collapse/expand, file rows
+     add), reorder buttons render, progress rows
+  3. 文件 section: folder tree + read-only file viewer (markdown renders)
+  4. readingStart screen: stats, mode tiles carry 阅读 N from the wire
+  5. reading round: header icon buttons 添加卡片/添加挖空, bottom row =
      state buttons ONLY (no 开始制卡 anywhere), chunk markdown + breadcrumb
-     + status chip; right panel renders the WHOLE file with anchors
-  5. 制卡完成 works straight from 未读 (no active gate); complete advances
-  6. refresh mid-round resumes the same chunk
-  7. cloze dialog opens (添加挖空 icon) and degrades gracefully with dead
+     + status chip; right panel renders the WHOLE file with anchors;
+     progress shown as a RING with done/total centered (no detail rows)
+  6. 制卡完成 works straight from 未读 (no active gate); complete advances
+  7. refresh mid-round resumes the same chunk
+  8. cloze dialog opens (添加挖空 icon) and degrades gracefully with dead
      AnkiConnect (error shown, closable)
-  8. skip advances; readingDone shows separated stats; 再读一轮 deals next
-  9. narrow viewport: no right column during reading
- 10. finish clears the round (backend state)
+  9. skip advances; readingDone shows separated stats; 再读一轮 deals next
+ 10. narrow viewport: no right column during reading
+ 11. finish clears the round (backend state)
 
 Run: /tmp/pw-venv2/bin/python ~/anki-review-app/scripts/reading_ui_test.py
 """
@@ -159,23 +162,49 @@ def run(state):
         page.on("pageerror", lambda e: errors.append(str(e)))
         page.goto(BASE, wait_until="networkidle")
 
-        # ---- 1. landing screen (dead AnkiConnect → preview shows as the
-        # default entry; the 阅读清单 entry lives on start/previewStart, the
-        # 管理阅读清单 button on readingStart) ----
-        page.wait_for_selector(".screen-title", timeout=30000)
+        # ---- 1. nav rail (round 3): three destinations, old top bar gone ----
+        page.wait_for_selector(".nav-rail", timeout=30000)
+        items = page.locator(".nav-rail__item")
+        check("nav rail renders 3 destinations", items.count() == 3, items.count())
+        rail_text = page.locator(".nav-rail").inner_text()
+        check("rail labels 学习/文件/阅读清单",
+              "学习" in rail_text and "文件" in rail_text and "阅读清单" in rail_text,
+              rail_text)
+        check("old Anki top bar is gone", page.locator(".top-bar").count() == 0)
+        check("学习 destination starts active",
+              "nav-rail__item--active" in items.nth(0).get_attribute("class"))
         title = page.locator(".screen-title").first.inner_text()
-        print(f"  (landed on: {title})")
-        manage = page.locator("md-text-button", has_text="管理阅读清单")
-        entry = page.locator("md-text-button", has_text="阅读清单")
-        check("阅读清单 entry rendered somewhere",
-              manage.count() + entry.count() >= 1,
-              (manage.count(), entry.count()))
+        print(f"  (study funnel landed on: {title})")
 
-        # ---- 2. list manager: TREE picker + add + reorder ----
-        (manage if manage.count() else entry).first.click()
+        # ---- 2. 文件 section: tree + read-only viewer ----
+        items.nth(1).click()  # 文件
+        page.wait_for_selector(".files-tree", timeout=15000)
+        fdirs = page.locator(".files-tree-dir")
+        ffiles = page.locator(".files-tree-file")
+        check("files tree renders folders", fdirs.count() >= 2, fdirs.count())
+        check("files tree renders 2 notes", ffiles.count() == 2, ffiles.count())
+        check("viewer starts empty (no file selected)",
+              page.locator(".files-viewer-empty").count() == 1)
+        page.locator(".files-tree-file", has_text="颈部").click()
+        page.wait_for_selector(".files-viewer-body", timeout=15000)
+        viewer = page.locator(".files-viewer-body").inner_text()
+        check("viewer renders the WHOLE file",
+              "颈阔肌" in viewer and "颈动脉三角" in viewer, viewer[:100])
+        check("viewer markdown → headings rendered",
+              page.locator(".files-viewer-body h2").count() >= 2)
+        check("viewer crumb shows the path",
+              "颈部" in page.locator(".files-viewer-crumb").inner_text())
+        check("文件 destination now active",
+              "nav-rail__item--active" in items.nth(1).get_attribute("class"))
+        page.screenshot(path="/tmp/reading-ui-files.png")
+
+        # ---- 3. 阅读清单 section: TREE picker + add + reorder ----
+        items.nth(2).click()  # 阅读清单
         page.wait_for_selector(".reading-list-empty", timeout=15000)
         check("empty list placeholder", "清单还是空的" in
               page.locator(".reading-list-empty").inner_text())
+        check("no 返回 button (rail section, not a phase)",
+              page.locator("md-text-button", has_text="返回").count() == 0)
         page.locator("md-filled-tonal-button", has_text="添加文件").click()
         page.wait_for_selector(".reading-tree", timeout=15000)
         # tree = folder rows (2026, 解剖) + file rows (颈部, 上肢), all
@@ -212,6 +241,10 @@ def run(state):
         page.wait_for_timeout(400)
         rows = page.locator(".reading-list-item")
         check("both files in list", rows.count() == 2, rows.count())
+        # rail badge shows the list size (round 3)
+        check("rail 阅读清单 badge shows (2)",
+              "(2)" in page.locator(".nav-rail").inner_text(),
+              page.locator(".nav-rail").inner_text())
         # row progress by name (add order = 颈部 then 上肢)
         neck_row = page.locator(".reading-list-item", has_text="颈部").first
         arm_row = page.locator(".reading-list-item", has_text="上肢").first
@@ -231,7 +264,8 @@ def run(state):
         first_title = page.locator(".reading-list-item__title").first.inner_text()
         check("置顶 reorders list (上肢 now first)", "上肢" in first_title, first_title)
         page.screenshot(path="/tmp/reading-ui-list.png")
-        page.locator("md-text-button", has_text="返回").click()
+        # back to the study funnel via the rail (the old 返回 button is gone)
+        items.nth(0).click()  # 学习
         page.wait_for_selector(".screen-title", timeout=15000)
 
         # ---- 3. readingStart screen ----
@@ -281,6 +315,16 @@ def run(state):
               "腋动脉" in right and "臂前区" in right, right[:100])
         anchors = page.locator(".note-panel .note-body [data-src-line]")
         check("right panel has source anchors", anchors.count() >= 2, anchors.count())
+        # progress RING (round 3): circle with done/total centered; the old
+        # linear bar + detail rows are gone
+        check("progress ring rendered", page.locator(".progress-ring").count() == 1)
+        check("ring shows 0/2", "0/2" in
+              page.locator(".progress-ring__text").inner_text(),
+              page.locator(".progress-ring__text").inner_text())
+        check("old linear progress bar is gone",
+              page.locator(".round-strip md-linear-progress").count() == 0)
+        check("old detail rows are gone",
+              page.locator(".round-strip .progress-split").count() == 0)
         page.screenshot(path="/tmp/reading-ui-card.png")
 
         # ---- 5. 制卡完成 straight from 未读 (no active gate) ----
@@ -288,9 +332,9 @@ def run(state):
         page.wait_for_timeout(1200)
         crumb2 = page.locator(".reading-crumb").inner_text()
         check("complete from todo advances to 颈部 一", "颈部" in crumb2, crumb2)
-        check("progress strip shows 1/2",
-              "1/2" in page.locator(".progress-text").inner_text(),
-              page.locator(".progress-text").inner_text())
+        check("progress ring shows 1/2",
+              "1/2" in page.locator(".progress-ring__text").inner_text(),
+              page.locator(".progress-ring__text").inner_text())
 
         # ---- 6. refresh resumes the round on the pending chunk ----
         page.reload(wait_until="networkidle")
@@ -299,7 +343,7 @@ def run(state):
               "颈部" in page.locator(".reading-crumb").inner_text(),
               page.locator(".reading-crumb").inner_text())
         check("reload keeps progress 1/2",
-              "1/2" in page.locator(".progress-text").inner_text())
+              "1/2" in page.locator(".progress-ring__text").inner_text())
 
         # ---- 7. cloze dialog opens; dead AnkiConnect → graceful error ----
         page.locator('.card-header-actions md-icon-button[data-aria-label="添加挖空"]').click()

@@ -39,7 +39,16 @@ Session model:
     → done(制卡完成), or skipped(无需制卡). Within a file only the frontier
     chunk is dealt, so later chunks stay locked until the frontier is
     finished; an `active` chunk resurfaces first every round. Files are
-    opt-in via the 阅读清单 (manual priority). State: state/reading.json.
+    opt-in via the 阅读清单 (manual priority). State: state/reading.db
+    (SQLite; migrated automatically from the legacy reading.json).
+
+    Reading gate (user spec 2026-09-19 round 3): an `active` chunk whose
+    created cards have NOT all left the preview pool yet (still in 预览池
+    or still suspended = not truly released) is HELD — it is not dealt and
+    blocks its file's frontier until every one of its cards is thawed
+    (out of the pool AND unsuspended, i.e. the next-day release happened).
+    Chunks without cards are never gated. AnkiConnect errors fail OPEN
+    (reading must never be blocked by a dead backend).
 """
 import asyncio
 import base64
@@ -48,7 +57,9 @@ import json
 import os
 import random
 import re
+import sqlite3
 import sys
+import time
 import uuid
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
@@ -205,7 +216,8 @@ NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
 READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes", "on")
 NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
 NOTES_RAG_DIR = os.getenv("NOTES_RAG_DIR", str(Path.home() / "notes-rag"))
-READING_FILE = STATE_DIR / "reading.json"
+READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
+READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
 # same exclusion set notes-rag/sync.py uses
 NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next")
@@ -2111,17 +2123,25 @@ def _migrate_entry(entry: dict, chunks: list[dict], sha: str) -> None:
     entry["file_sha"] = sha
 
 
-def _file_view(entry: dict):
+def _file_view(entry: dict, gated: set | None = None):
     """(ordered, summary) for one reading-list entry.
 
     ordered = [(chunk, key, state_dict)] in file order, or None when the file
     vanished from the corpus. Migrates stored states on drift (caller persists).
+
+    `gated` = set of (path, chunk_key) pairs whose created cards have not all
+    left the preview pool yet (user spec 2026-09-19 round 3, B·二段重推):
+    a gated chunk is NOT the frontier — it blocks its file (later chunks stay
+    locked behind it) and is excluded from dealing until its cards are
+    truly released (out of 预览池 AND unsuspended = next-day release done).
     """
-    loaded = _chunks_for(entry["path"])
+    gated = gated or set()
+    path = entry.get("path", "")
+    loaded = _chunks_for(path)
     if loaded is None:
         return None, {
-            "path": entry["path"],
-            "title": Path(entry["path"]).stem,
+            "path": path,
+            "title": Path(path).stem,
             "missing": True,
             "total_chunks": 0,
             "todo": 0,
@@ -2129,6 +2149,8 @@ def _file_view(entry: dict):
             "done": 0,
             "skipped": 0,
             "frontier": None,
+            "gated": 0,
+            "gated_frontier": None,
             "orphans": len(entry.get("orphans") or []),
             "cards_created": 0,
         }
@@ -2136,14 +2158,16 @@ def _file_view(entry: dict):
     _migrate_entry(entry, chunks, sha)
     states = entry.get("chunks") or {}
     ordered = [(ch, _chunk_key(ch), states.get(_chunk_key(ch)) or {}) for ch in chunks]
-    return ordered, _file_summary(entry, ordered)
+    return ordered, _file_summary(entry, ordered, gated)
 
 
-def _file_summary(entry: dict, ordered) -> dict:
+def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
+    gated = gated or set()
+    path = entry.get("path", "")
     if ordered is None:
         return {
-            "path": entry["path"],
-            "title": Path(entry["path"]).stem,
+            "path": path,
+            "title": Path(path).stem,
             "missing": True,
             "total_chunks": 0,
             "todo": 0,
@@ -2151,30 +2175,52 @@ def _file_summary(entry: dict, ordered) -> dict:
             "done": 0,
             "skipped": 0,
             "frontier": None,
+            "gated": 0,
+            "gated_frontier": None,
             "orphans": len(entry.get("orphans") or []),
             "cards_created": 0,
         }
     counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0}
     cards = 0
     frontier = None
+    gated_count = 0
+    gated_frontier = None
+    blocked = False  # a gated chunk in dealable territory locks the file
     for ch, key, st in ordered:
         s = st.get("status", "todo")
         counts[s if s in counts else "todo"] += 1
         cards += len(st.get("cards_created") or [])
-        if frontier is None and s not in ("done", "skipped"):
-            frontier = {
+        if s in ("done", "skipped"):
+            continue
+        is_gated = (path, key) in gated
+        if is_gated:
+            gated_count += 1
+        if frontier is not None or blocked:
+            continue  # frontier already found / file already held
+        if is_gated:
+            blocked = True
+            gated_frontier = {
                 "chunk_key": key,
                 "status": s,
-                "title": ch.get("title") or Path(entry["path"]).stem,
+                "title": ch.get("title") or Path(path).stem,
                 "line_start": ch["line_start"],
             }
+            continue  # held: later chunks stay locked behind it
+        frontier = {
+            "chunk_key": key,
+            "status": s,
+            "title": ch.get("title") or Path(path).stem,
+            "line_start": ch["line_start"],
+        }
     return {
-        "path": entry["path"],
-        "title": Path(entry["path"]).stem,
+        "path": path,
+        "title": Path(path).stem,
         "missing": False,
         "total_chunks": len(ordered),
         **counts,
         "frontier": frontier,
+        "gated": gated_count,
+        "gated_frontier": gated_frontier,
         "orphans": len(entry.get("orphans") or []),
         "cards_created": cards,
     }
@@ -2197,39 +2243,408 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict) -> dict:
     }
 
 
-def _reading_read() -> dict:
-    STATE_DIR.mkdir(exist_ok=True)
-    if not READING_FILE.exists():
-        return {"list": [], "archive": {}}
+# ---- reading state store (SQLite, user spec 2026-09-19 round 3) ------------
+# The user asked to move reading state off a single reading.json blob (dozens
+# of files × dozens of chunks would rewrite the whole document on every
+# action). Tables:
+#   rfiles  — one row per reading-list file AND per archived file
+#             (in_list=1 listed / 0 archived; pos = priority order)
+#   rchunks — per-chunk state (status, updated_at)
+#   rcards  — provenance: note ids created from a chunk (ordered by rowid)
+#   rorphans— drift-parked chunk states (JSON payload per orphan)
+#   rround  — single row (id=1): the active/complete round as JSON (the round
+#             is a small ephemeral document — keeping it as one JSON row
+#             avoids a 6th table for pending items)
+# All access goes through _reading_read/_reading_write which assemble/
+# disassemble the SAME dict shape the old JSON file had, so the dealing and
+# summary logic is untouched. Every call is a fresh short-lived connection
+# (stdlib sqlite3 is thread-safe this way; the app serializes mutations with
+# _state_lock anyway). WAL mode keeps readers (status endpoints) snappy.
+# First run migrates reading.json → tables once (renamed reading.json.bak
+# afterwards, so it can never migrate twice).
+
+def _reading_conn() -> sqlite3.Connection:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(READING_DB_FILE, timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    _reading_ensure_schema(conn)
+    return conn
+
+
+def _reading_ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS rfiles (
+            path      TEXT PRIMARY KEY,
+            in_list   INTEGER NOT NULL DEFAULT 1,
+            pos       INTEGER NOT NULL DEFAULT 0,
+            added_at  TEXT,
+            file_sha  TEXT
+        );
+        CREATE TABLE IF NOT EXISTS rchunks (
+            path       TEXT NOT NULL,
+            chunk_key  TEXT NOT NULL,
+            status     TEXT,
+            updated_at TEXT,
+            PRIMARY KEY (path, chunk_key)
+        );
+        CREATE TABLE IF NOT EXISTS rcards (
+            path      TEXT NOT NULL,
+            chunk_key TEXT NOT NULL,
+            note_id   INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_rcards_chunk ON rcards(path, chunk_key);
+        CREATE TABLE IF NOT EXISTS rorphans (
+            path      TEXT NOT NULL,
+            chunk_key TEXT NOT NULL,
+            data      TEXT
+        );
+        CREATE TABLE IF NOT EXISTS rround (
+            id   INTEGER PRIMARY KEY CHECK (id = 1),
+            data TEXT
+        );
+        CREATE TABLE IF NOT EXISTS rmeta (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """
+    )
+
+
+def _store_entry(
+    conn: sqlite3.Connection,
+    path: str,
+    in_list: int,
+    pos: int,
+    added_at: str | None,
+    file_sha: str | None,
+    chunks: dict,
+    orphans: list,
+) -> None:
+    """Upsert one file entry (listed or archived) with its chunks/cards/
+    orphans. Caller runs inside a transaction (`with conn:`)."""
+    conn.execute(
+        "INSERT INTO rfiles(path, in_list, pos, added_at, file_sha) "
+        "VALUES(?,?,?,?,?) "
+        "ON CONFLICT(path) DO UPDATE SET in_list=excluded.in_list, "
+        "pos=excluded.pos, added_at=excluded.added_at, "
+        "file_sha=excluded.file_sha",
+        (path, in_list, pos, added_at, file_sha),
+    )
+    conn.execute("DELETE FROM rchunks WHERE path = ?", (path,))
+    conn.execute("DELETE FROM rcards WHERE path = ?", (path,))
+    conn.execute("DELETE FROM rorphans WHERE path = ?", (path,))
+    chunk_rows = []
+    card_rows = []
+    for key, st in (chunks or {}).items():
+        st = st or {}
+        chunk_rows.append((path, key, st.get("status"), st.get("updated_at")))
+        for nid in st.get("cards_created") or []:
+            card_rows.append((path, key, nid))
+    if chunk_rows:
+        conn.executemany(
+            "INSERT OR REPLACE INTO rchunks(path, chunk_key, status, updated_at) "
+            "VALUES(?,?,?,?)",
+            chunk_rows,
+        )
+    if card_rows:
+        conn.executemany(
+            "INSERT INTO rcards(path, chunk_key, note_id) VALUES(?,?,?)",
+            card_rows,
+        )
+    orphan_rows = []
+    for o in orphans or []:
+        o = dict(o or {})
+        key = o.pop("chunk_key", "")
+        orphan_rows.append((path, key, json.dumps(o, ensure_ascii=False)))
+    if orphan_rows:
+        conn.executemany(
+            "INSERT INTO rorphans(path, chunk_key, data) VALUES(?,?,?)",
+            orphan_rows,
+        )
+
+
+def _reading_migrate_json() -> None:
+    """One-time migration of the legacy reading.json into the SQLite store.
+
+    Runs only when the DB is brand new (no rmeta 'migrated' marker) AND a
+    readable reading.json exists. The JSON is renamed to reading.json.bak
+    afterwards so the legacy file never shadows the DB again.
+    """
     try:
-        d = json.loads(READING_FILE.read_text())
-        if not isinstance(d, dict):
-            raise ValueError("bad shape")
-        d.setdefault("list", [])
-        d.setdefault("archive", {})
-        rd = d.get("round")
-        if isinstance(rd, dict) and _round_expired(rd):
-            d["round"] = None  # half-finished reading round older than 24h
-        return d
+        conn = _reading_conn()
     except Exception:
-        return {"list": [], "archive": {}}
+        return
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT value FROM rmeta WHERE key = 'migrated'"
+            ).fetchone()
+            if row is not None:
+                return
+            conn.execute(
+                "INSERT OR REPLACE INTO rmeta(key, value) VALUES('migrated', ?)",
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+        if not READING_FILE.exists():
+            return
+        try:
+            d = json.loads(READING_FILE.read_text())
+        except Exception:
+            return
+        if not isinstance(d, dict):
+            return
+        with conn:
+            for i, e in enumerate(d.get("list") or []):
+                _store_entry(
+                    conn, e.get("path", ""), 1, i,
+                    e.get("added_at"), e.get("file_sha"),
+                    e.get("chunks") or {}, e.get("orphans") or [],
+                )
+            for i, (p, a) in enumerate(sorted((d.get("archive") or {}).items())):
+                _store_entry(
+                    conn, p, 0, i, None, (a or {}).get("file_sha"),
+                    (a or {}).get("chunks") or {}, (a or {}).get("orphans") or [],
+                )
+            rd = d.get("round")
+            if isinstance(rd, dict):
+                conn.execute(
+                    "INSERT INTO rround(id, data) VALUES(1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                    (json.dumps(rd, ensure_ascii=False),),
+                )
+    finally:
+        conn.close()
+    try:
+        READING_FILE.replace(READING_FILE.with_suffix(".json.bak"))
+    except OSError:
+        pass
+
+
+if READING_MODE:
+    _reading_migrate_json()
+
+
+def _reading_read() -> dict:
+    """Assemble the working state dict from the SQLite store.
+
+    Shape is IDENTICAL to the legacy reading.json document (list/archive/
+    round) so every consumer (dealing, summaries, drift migration, round
+    rehydration) is unchanged; only persistence moved to rows.
+    """
+    conn = _reading_conn()
+    try:
+        files = conn.execute(
+            "SELECT path, in_list, pos, added_at, file_sha FROM rfiles "
+            "ORDER BY in_list DESC, pos, path"
+        ).fetchall()
+        chunk_rows = conn.execute(
+            "SELECT path, chunk_key, status, updated_at FROM rchunks"
+        ).fetchall()
+        card_rows = conn.execute(
+            "SELECT path, chunk_key, note_id FROM rcards ORDER BY rowid"
+        ).fetchall()
+        orphan_rows = conn.execute(
+            "SELECT path, chunk_key, data FROM rorphans ORDER BY rowid"
+        ).fetchall()
+        rd_row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+
+    chunks_by_path: dict[str, dict] = {}
+    for path, key, status, updated in chunk_rows:
+        st: dict = {}
+        if status is not None:
+            st["status"] = status
+        if updated is not None:
+            st["updated_at"] = updated
+        chunks_by_path.setdefault(path, {})[key] = st
+    for path, key, note_id in card_rows:
+        st = chunks_by_path.get(path, {}).get(key)
+        if st is not None:
+            st.setdefault("cards_created", []).append(note_id)
+    orphans_by_path: dict[str, list] = {}
+    for path, key, data in orphan_rows:
+        try:
+            payload = json.loads(data) if data else {}
+        except Exception:
+            payload = {}
+        orphans_by_path.setdefault(path, []).append({"chunk_key": key, **payload})
+
+    def _entry(path: str, added_at: str | None, file_sha: str | None) -> dict:
+        e = {
+            "path": path,
+            "file_sha": file_sha,
+            "chunks": chunks_by_path.get(path, {}),
+            "orphans": orphans_by_path.get(path, []),
+        }
+        if added_at is not None:
+            e["added_at"] = added_at
+        return e
+
+    listed = [
+        _entry(path, added_at, file_sha)
+        for path, in_list, _pos, added_at, file_sha in files
+        if in_list
+    ]
+    archive = {
+        path: {
+            "file_sha": file_sha,
+            "chunks": chunks_by_path.get(path, {}),
+            "orphans": orphans_by_path.get(path, []),
+        }
+        for path, in_list, _pos, _added, file_sha in files
+        if not in_list
+    }
+    d: dict = {"list": listed, "archive": archive}
+    rd = None
+    if rd_row and rd_row[0]:
+        try:
+            parsed = json.loads(rd_row[0])
+            if isinstance(parsed, dict):
+                rd = parsed
+        except Exception:
+            rd = None
+    if isinstance(rd, dict) and _round_expired(rd):
+        rd = None  # half-finished reading round older than 24h
+    d["round"] = rd
+    return d
 
 
 def _reading_write(d: dict | None):
-    STATE_DIR.mkdir(exist_ok=True)
-    if d is None:
-        READING_FILE.unlink(missing_ok=True)
-    else:
-        tmp = READING_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(d, ensure_ascii=False))
-        tmp.replace(READING_FILE)
+    """Persist the working state dict back to SQLite (one transaction).
+
+    Row-level upserts keep the store structured (queryable, indexable, no
+    single-blob rewrite); at reading-list scale (dozens of files, hundreds
+    of chunks) a full sync per action is sub-millisecond and runs under
+    _state_lock, so dict → tables can never race itself.
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    conn = _reading_conn()
+    try:
+        with conn:
+            if d is None:
+                for t in ("rfiles", "rchunks", "rcards", "rorphans", "rround"):
+                    conn.execute(f"DELETE FROM {t}")
+                return
+            listed = d.get("list") or []
+            archive = d.get("archive") or {}
+            keep = [e.get("path", "") for e in listed] + list(archive.keys())
+            marks = ",".join("?" * len(keep)) if keep else "''"
+            for t in ("rfiles", "rchunks", "rcards", "rorphans"):
+                conn.execute(
+                    f"DELETE FROM {t} WHERE path NOT IN ({marks})", keep
+                )
+            for i, e in enumerate(listed):
+                _store_entry(
+                    conn, e.get("path", ""), 1, i,
+                    e.get("added_at"), e.get("file_sha"),
+                    e.get("chunks") or {}, e.get("orphans") or [],
+                )
+            for i, (p, a) in enumerate(sorted(archive.items())):
+                _store_entry(
+                    conn, p, 0, i, None, (a or {}).get("file_sha"),
+                    (a or {}).get("chunks") or {}, (a or {}).get("orphans") or [],
+                )
+            rd = d.get("round")
+            if isinstance(rd, dict):
+                conn.execute(
+                    "INSERT INTO rround(id, data) VALUES(1, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                    (json.dumps(rd, ensure_ascii=False),),
+                )
+            else:
+                conn.execute("DELETE FROM rround")
+    finally:
+        conn.close()
 
 
 def _find_entry(data: dict, path: str) -> dict | None:
     return next((e for e in data.get("list", []) if e.get("path") == path), None)
 
 
-def _deal_reading(data: dict, per_round: int) -> list[dict]:
+async def _reading_gates(data: dict) -> set[tuple[str, str]]:
+    """(path, chunk_key) pairs currently HELD by the preview-pool gate.
+
+    B·二段重推 (user spec 2026-09-19 round 3): a chunk whose created cards
+    have not ALL left the preview pipeline is not re-dealt, and it blocks
+    its file's frontier until they have. 「过了预览池」= truly thawed:
+    NOT in 预览池 AND NOT suspended — approval alone (which parks the card
+    in 2026 suspended with a released-YYYYMMDD stamp) does not lift the
+    gate; the next-day unsuspend does. A card sent BACK to the pool
+    (double-Again auto-return / manual 移回预览池) closes the gate again.
+
+    Only each file's frontier chunk is checked (a deeper chunk can't be
+    dealt while the frontier stands, so gating it would be dead work).
+    Notes that no longer exist (user deleted the card) never hold —
+    a chunk must not be gated forever by a deleted note. AnkiConnect
+    errors fail OPEN (empty set): reading is never blocked by a dead
+    backend. Preview mode off → no pool → nothing can be held.
+    """
+    if not PREVIEW_MODE:
+        return set()
+    targets: list[tuple[str, str, list[int]]] = []
+    for entry in data.get("list", []):
+        path = entry.get("path", "")
+        ordered, _ = _file_view(entry)
+        if not ordered:
+            continue
+        states = entry.get("chunks") or {}
+        for _ch, key, _st in ordered:
+            st = states.get(key) or {}
+            if st.get("status", "todo") in ("done", "skipped"):
+                continue
+            notes = st.get("cards_created") or []
+            if notes:
+                # EVERY live chunk with cards is a gate candidate, not just
+                # the frontier: with depth dealing a deeper chunk can hold
+                # cards while an earlier todo chunk is the frontier (user
+                # made cards for chunk 3, pressed 下一张 on chunk 2).
+                targets.append((path, key, list(notes)))
+    note_ids = sorted({n for _, _, notes in targets for n in notes})
+    if not note_ids:
+        return set()
+    try:
+        infos = await anki("notesInfo", {"notes": note_ids})
+        by_note: dict[int, list[int]] = {}
+        card_ids: list[int] = []
+        for n in infos or []:
+            nid = n.get("noteId")
+            if not nid:
+                continue  # AnkiConnect returns [{}] for deleted notes
+            cids = n.get("cards") or []
+            by_note[nid] = cids
+            card_ids += cids
+        if not card_ids:
+            return set()
+        cinfos = [
+            i for i in await anki("cardsInfo", {"cards": card_ids}) or []
+            if i.get("cardId")
+        ]
+    except Exception:
+        return set()  # fail OPEN — never strand reading on a backend error
+    released: dict[int, bool] = {
+        i["cardId"]: PREVIEW_DECK not in i.get("deckName", "")
+        and i.get("queue") != -1
+        for i in cinfos
+    }
+    gated: set[tuple[str, str]] = set()
+    for path, key, notes in targets:
+        held = False
+        for nid in notes:
+            cids = by_note.get(nid)
+            if cids is None or not cids:
+                continue  # deleted note / note without cards — never holds
+            if not all(released.get(cid, True) for cid in cids):
+                held = True
+                break
+        if held:
+            gated.add((path, key))
+    return gated
+
+
+def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[dict]:
     """Deal up to `per_round` CHUNKS (not files) — user decision 2026-09-19.
 
     Three phases, files always in 阅读清单 priority order:
@@ -2241,20 +2656,26 @@ def _deal_reading(data: dict, per_round: int) -> list[dict]:
          the same files contribute their NEXT dealable chunks in file order,
          so a single-file reading list still gets a full round (quick=2 /
          focus=5) instead of exactly one chunk.
-    Done/skipped chunks are never dealt.
+    Done/skipped chunks are never dealt. GATED chunks (cards still inside
+    the preview pipeline — B·二段重推, 2026-09-19 round 3) are never dealt
+    either, and a gated frontier locks its whole file (the summary's
+    frontier is already gate-aware, so blocked files drop out of `views`).
     """
+    gated = gated or set()
     payloads: list[dict] = []
     dealt: set[tuple[str, str]] = set()
     # views = [path, ordered, summary] per dealable file
     views: list[list] = []
     for entry in data.get("list", []):
-        ordered, summary = _file_view(entry)  # may migrate entry (caller saves)
+        ordered, summary = _file_view(entry, gated)  # may migrate (caller saves)
         if not ordered or not summary.get("frontier"):
             continue
         views.append([entry.get("path", ""), ordered, summary])
 
-    def _dealable(st: dict) -> bool:
-        return st.get("status", "todo") not in ("done", "skipped")
+    def _dealable(path: str, key: str, st: dict) -> bool:
+        return st.get("status", "todo") not in (
+            "done", "skipped"
+        ) and (path, key) not in gated
 
     def _take(path: str, ch: dict, key: str, st: dict, summary: dict) -> None:
         payloads.append(_chunk_payload(ch, key, st, summary))
@@ -2264,13 +2685,17 @@ def _deal_reading(data: dict, per_round: int) -> list[dict]:
         for ch, key, st in ordered:
             if len(payloads) >= per_round:
                 break
-            if st.get("status", "todo") == "active" and (path, key) not in dealt:
+            if (
+                st.get("status", "todo") == "active"
+                and (path, key) not in dealt
+                and (path, key) not in gated
+            ):
                 _take(path, ch, key, st, summary)
     for path, ordered, summary in views:  # phase 1: frontier per file
         if len(payloads) >= per_round:
             break
         for ch, key, st in ordered:
-            if not _dealable(st):
+            if not _dealable(path, key, st):
                 continue
             # the frontier is dealt exactly once — if phase 0 already took
             # it (active), this file contributes nothing to the breadth pass
@@ -2281,7 +2706,7 @@ def _deal_reading(data: dict, per_round: int) -> list[dict]:
         for ch, key, st in ordered:
             if len(payloads) >= per_round:
                 return payloads
-            if (path, key) in dealt or not _dealable(st):
+            if (path, key) in dealt or not _dealable(path, key, st):
                 continue
             _take(path, ch, key, st, summary)
     return payloads
@@ -2387,13 +2812,21 @@ async def _reading_extras() -> dict:
         return out
     try:
         data = _reading_read()
+        gated = await _reading_gates(data)
         summaries = []
         for entry in data.get("list", []):
-            _, summary = _file_view(entry)
+            _, summary = _file_view(entry, gated)
             summaries.append(summary)
         out["reading_list_size"] = len(data.get("list", []))
         out["reading_available"] = sum(1 for s in summaries if s.get("frontier"))
-        out["reading_active"] = sum(s.get("active", 0) for s in summaries)
+        # funnel signal: only NOT-held 正在制卡 chunks resurface next round
+        # (a gated active chunk waits for its cards to clear the preview
+        # pipeline — counting it here would pull the user into a reading
+        # start screen that deals nothing)
+        out["reading_active"] = sum(
+            max(0, s.get("active", 0) - s.get("gated", 0)) for s in summaries
+        )
+        out["reading_gated"] = sum(s.get("gated", 0) for s in summaries)
         rp = _reading_round_payload(data)
         if rp is not None and rp.get("status") == "active":
             out["reading_round"] = rp
@@ -2409,9 +2842,10 @@ async def reading_status():
     async with _state_lock:
         _reading_guard()
         data = _reading_read()
+        gated = await _reading_gates(data)
         summaries = []
         for entry in data.get("list", []):
-            _, summary = _file_view(entry)
+            _, summary = _file_view(entry, gated)
             summaries.append(summary)
         rp = _reading_round_payload(data)
         _reading_write(data)
@@ -2436,6 +2870,26 @@ async def reading_corpus():
             for p in _corpus_files()
         ]
     }
+
+
+# ---- file browser (文件 section, user spec 2026-09-19 round 3) --------------
+# Read-only corpus browsing for the left-rail 文件 page. Deliberately NOT
+# gated on READING_MODE: browsing notes works even with the reading feature
+# flag off. Same corpus rules + traversal-safe reader as reading mode.
+
+@app.get("/api/files/list")
+async def files_list():
+    return {
+        "files": [{"path": p, "title": Path(p).stem} for p in _corpus_files()]
+    }
+
+
+@app.get("/api/files/raw")
+async def files_raw(path: str):
+    text = _read_note_text(path)
+    if text is None:
+        raise HTTPException(status_code=404, detail="note file not found")
+    return {"path": path, "text": text}
 
 
 class ReadingPathBody(BaseModel):
@@ -2544,9 +2998,10 @@ async def reading_state():
     async with _state_lock:
         _reading_guard()
         data = _reading_read()
+        gated = await _reading_gates(data)
         summaries = []
         for entry in data.get("list", []):
-            _, summary = _file_view(entry)
+            _, summary = _file_view(entry, gated)
             summaries.append(summary)
         rp = _reading_round_payload(data)
         _reading_write(data)
@@ -2563,16 +3018,27 @@ async def reading_start(mode: str | None = None):
     """Deal one reading segment: STUDY_MODES[mode]["read"] frontier chunks."""
     async with _state_lock:
         _reading_guard()
-        return _reading_start_impl(study_mode(mode))
+        return await _reading_start_impl(study_mode(mode))
 
 
-def _reading_start_impl(mode: str = DEFAULT_MODE):
+async def _reading_start_impl(mode: str = DEFAULT_MODE):
     data = _reading_read()
     per_round = STUDY_MODES[mode].get("read", 0)
-    payloads = _deal_reading(data, per_round) if per_round > 0 else []
+    gated = await _reading_gates(data)
+    payloads = _deal_reading(data, per_round, gated) if per_round > 0 else []
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
-        return {"chunks": [], "mode": mode, "empty": True, "study_modes": STUDY_MODES}
+        return {
+            "chunks": [],
+            "mode": mode,
+            "empty": True,
+            "study_modes": STUDY_MODES,
+            # why nothing was dealt: all_gated = every remaining chunk is
+            # waiting on its cards to clear the preview pipeline (the UI can
+            # then say 「等卡片过预览池」 instead of 「清单读完了」)
+            "gated": len(gated),
+            "all_gated": bool(gated),
+        }
     data["round"] = {
         "status": "active",
         "created": datetime.now().isoformat(timespec="seconds"),

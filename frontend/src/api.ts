@@ -97,6 +97,10 @@ export const api = {
       parse<{ filename: string }>(r),
     )
   },
+  // ---- file browser (文件 section, user spec 2026-09-19 round 3) ----
+  filesList: () => get<{ files: { path: string; title: string }[] }>('/api/files/list'),
+  filesRaw: (path: string) =>
+    get<{ path: string; text: string }>(`/api/files/raw?path=${encodeURIComponent(path)}`),
   // ---- reading mode (渐进制卡, 2026-09-19) ----
   readingStatus: () => get<ReadingStatusResponse>('/api/reading/status'),
   readingState: () => get<ReadingStateResponse>('/api/reading/state'),

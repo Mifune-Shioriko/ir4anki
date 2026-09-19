@@ -15,6 +15,9 @@ interface Props {
   available: number
   /** chunks sitting in 正在制卡 (resurface first) */
   active: number
+  /** chunks held by the preview-pool gate (B·二段重推, round 3): their
+   * cards haven't all cleared 预览池 yet, so they won't be dealt */
+  gated?: number
   busy: boolean
   onStart: () => void
   /** funnel next: preview when preview mode is on, review otherwise */
@@ -64,6 +67,12 @@ export const ReadingStartScreen: Component<Props> = (props) => {
               <div class="stat-row">
                 <span>正在制卡（会先重现）</span>
                 <span class="stat-value">{props.active} 段</span>
+              </div>
+            </Show>
+            <Show when={(props.gated ?? 0) > 0}>
+              <div class="stat-row">
+                <span>等卡片过预览池（暂缓推送）</span>
+                <span class="stat-value">{props.gated} 段</span>
               </div>
             </Show>
           </div>

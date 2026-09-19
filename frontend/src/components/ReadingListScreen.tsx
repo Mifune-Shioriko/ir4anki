@@ -1,6 +1,8 @@
 import { Component, For, Show, createSignal, onMount } from 'solid-js'
 import { api } from '../api'
 import type { ReadingCorpusFile, ReadingFileSummary } from '../types'
+import { buildTree, allDirPaths } from '../lib/tree'
+import type { TreeNode } from '../lib/tree'
 import {
   IconArrowUpward, IconChevronRight, IconClose, IconDescription, IconFolder,
   IconMenuBook, IconVerticalAlignTop,
@@ -16,14 +18,18 @@ import {
 // 「添加文件」 opens a corpus picker rendered as a FOLDER TREE (user spec
 // 2026-09-19 round 2 — 像正经的文件管理器: 文件夹可展开，里面是子文件夹
 // 或文件). The tree is built client-side from the flat /api/reading/corpus
-// paths (year/科目/文件.md). The dialog STAYS OPEN across adds for batch
+// paths (year/科目/文件.md) via the SHARED lib/tree.ts (the 文件 browser
+// uses the same builder). The dialog STAYS OPEN across adds for batch
 // adding; files already in the list render as 已加入 (disabled). All
 // mutations go through /api/reading/list/* and re-read the status
 // afterwards (single source of truth = the backend's list order).
 
 interface Props {
-  onBack: () => void
+  onBack?: () => void
   busy: boolean
+  /** fired after any list mutation so the nav-rail badge (readingListSize)
+   * stays fresh while this section is open (round 3) */
+  onListChange?: () => void
 }
 
 const FRONTIER_LABEL: Record<string, string> = {
@@ -31,61 +37,10 @@ const FRONTIER_LABEL: Record<string, string> = {
   active: '正在制卡',
   done: '制卡完成',
   skipped: '已跳过',
-}
-
-// ---- folder tree (built from flat corpus paths) ----
-interface TreeNode {
-  /** display name: folder segment or file title (without .md) */
-  name: string
-  /** full relative path for FILES; joined dir path for folders */
-  path: string
-  kind: 'dir' | 'file'
-  file?: ReadingCorpusFile
-  dirs: TreeNode[]
-  files: TreeNode[]
-}
-
-function buildTree(files: ReadingCorpusFile[]): TreeNode[] {
-  const roots: TreeNode[] = []
-  const dirIndex = new Map<string, TreeNode>()
-  for (const f of files) {
-    const parts = f.path.split('/')
-    let container = roots
-    let prefix = ''
-    for (let i = 0; i < parts.length - 1; i++) {
-      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i]
-      let dir = dirIndex.get(prefix)
-      if (!dir) {
-        dir = { name: parts[i], path: prefix, kind: 'dir', dirs: [], files: [] }
-        dirIndex.set(prefix, dir)
-        container.push(dir)
-      }
-      container = dir.dirs
-    }
-    const fileNode: TreeNode = {
-      name: parts[parts.length - 1].replace(/\.md$/, ''),
-      path: f.path,
-      kind: 'file',
-      file: f,
-      dirs: [],
-      files: [],
-    }
-    // a file lives in its parent dir's `files` list; top-level files in roots
-    const parentDir = parts.length > 1 ? dirIndex.get(parts.slice(0, -1).join('/')) : undefined
-    if (parentDir) parentDir.files.push(fileNode)
-    else roots.push(fileNode)
-  }
-  const sortRec = (nodes: TreeNode[]) => {
-    nodes.sort((a, b) =>
-      a.kind !== b.kind
-        ? a.kind === 'dir' ? -1 : 1
-        : a.name.localeCompare(b.name, 'zh-Hans-CN'),
-    )
-    nodes.forEach(n => { if (n.kind === 'dir') { sortRec(n.dirs); sortRec(n.files) } })
-  }
-  sortRec(roots)
-  dirIndex.forEach(d => { sortRec(d.dirs); sortRec(d.files) })
-  return roots
+  // held by the preview-pool gate (B·二段重推, round 3) — not a stored
+  // status; the list screen maps gated_frontier.status to this label when
+  // the chunk is currently held
+  held: '等卡片过预览池',
 }
 
 export const ReadingListScreen: Component<Props> = (props) => {
@@ -119,6 +74,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
     try {
       await fn()
       await reload()
+      props.onListChange?.()
     } catch (e) {
       alert('操作失败：' + (e as Error).message)
     } finally {
@@ -130,7 +86,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
     mutate(() => api.readingListReorder({ path: s.path }))
   const moveTop = (s: ReadingFileSummary) =>
     mutate(() => api.readingListReorder({ path: s.path, top: true }))
-  const addFile = (f: ReadingCorpusFile) =>
+  const addFile = (f: { path: string }) =>
     // keep the dialog OPEN after an add (batch adding several files is the
     // common case); the picker list refreshes via reload() and the just-added
     // file drops out of notListed()
@@ -158,11 +114,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
   // open the picker with every folder pre-expanded (small corpus — showing
   // the whole tree beats making the user click into each folder)
   const openPicker = () => {
-    const all = new Set<string>()
-    const collect = (nodes: TreeNode[]) =>
-      nodes.forEach(n => { if (n.kind === 'dir') { all.add(n.path); collect(n.dirs) } })
-    collect(tree())
-    setExpanded(all)
+    setExpanded(allDirPaths(tree()))
     setPickerOpen(true)
   }
   const pendingInTree = () => {
@@ -232,6 +184,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
           <h1 class="screen-title md-typescale-headline-small">阅读清单</h1>
           <p class="screen-detail md-typescale-body-medium">
             排在前面的文件先推进；一个文件内按顺序读，前一段没完成不会推后面的。
+            已制卡的片段会等它的卡过完预览池（次日放行）后再重推，补卡后点「制卡完成」解锁下一段。
             移出清单不会丢进度，重新添加即恢复。
           </p>
 
@@ -281,14 +234,22 @@ export const ReadingListScreen: Component<Props> = (props) => {
                       />
                     </Show>
                     <div class="reading-list-item__frontier md-typescale-label-small">
-                      <Show
-                        when={s.frontier}
-                        fallback={<span class="reading-frontier-done">全部读完 ✓</span>}
-                      >
+                      <Show when={s.frontier}>
                         下一段：{s.frontier!.title}
                         <span class={`reading-status-chip reading-status-${s.frontier!.status}`}>
                           {FRONTIER_LABEL[s.frontier!.status] ?? s.frontier!.status}
                         </span>
+                      </Show>
+                      {/* B·二段重推 (round 3): frontier held because its
+                          cards are still inside the preview pipeline */}
+                      <Show when={!s.frontier && s.gated_frontier}>
+                        下一段：{s.gated_frontier!.title}
+                        <span class="reading-status-chip reading-status-held">
+                          等卡片过预览池
+                        </span>
+                      </Show>
+                      <Show when={!s.frontier && !s.gated_frontier && !s.missing}>
+                        <span class="reading-frontier-done">全部读完 ✓</span>
                       </Show>
                     </div>
                   </div>
@@ -325,9 +286,11 @@ export const ReadingListScreen: Component<Props> = (props) => {
               添加文件
             </md-filled-tonal-button>
           </div>
-          <md-text-button onClick={() => props.onBack()} disabled={busyNow()}>
-            返回
-          </md-text-button>
+          <Show when={props.onBack}>
+            <md-text-button onClick={() => props.onBack?.()} disabled={busyNow()}>
+              返回
+            </md-text-button>
+          </Show>
         </div>
       </md-elevated-card>
 
