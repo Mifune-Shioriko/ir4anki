@@ -220,7 +220,7 @@ READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
 READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
 # same exclusion set notes-rag/sync.py uses
 NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules"}
-READING_ACTIONS = ("mark_active", "complete", "skip", "next")
+READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
 
 
 def _active_preview_per_round() -> int | None:
@@ -1982,11 +1982,18 @@ async def _to_preview_pool_impl(card_id: int):
 # Chunking reuses notes-rag's chunker.py (imported, NOT copied — single
 # source of truth) over the ~/anki-notes corpus.
 #
-# Chunk identity: "{line_start}:{heading_path joined by >}". File edits shift
-# line numbers, so on drift the stored states migrate: exact key first, then
-# heading-path match (split parts of one section migrate in line order),
-# anything unmatched becomes an orphan (chunk falls back to todo, old state
-# parked in entry["orphans"] and surfaced as a count for a future repair UI).
+# Segment identity (user spec 2026-09-20 round 4): DB-issued seg_id per file
+# (PK path+seg_id, per-file counter, never reused). The chunker is now a
+# SEEDING tool only — identity no longer derives from line numbers or
+# heading paths, so edits never drift the identity. Structure (ranges,
+# status, lineage) lives in the segments table; .md files stay pure text
+# (no in-file markers). The app is the ONLY writer: in-app edits update
+# file + segments in one transaction. External drift (file_sha mismatch)
+# trips the re-anchoring fuse: segments relocate by exact fingerprint
+# (first-line index + window sha, bounded full-scan fallback); failures
+# park in rorphans (card-holding ones demote to container so provenance
+# survives) and the file is flagged needs_resync — out of dealing until
+# POST /api/reading/reseed confirms.
 #
 # All mutating endpoints run under _state_lock (same serialization as the
 # preview round); reads that may persist migrations take it too.
@@ -2081,116 +2088,286 @@ def _chunk_key(ch: dict) -> str:
     return f'{ch["line_start"]}:{">".join(ch["heading_path"])}'
 
 
-def _migrate_entry(entry: dict, chunks: list[dict], sha: str) -> None:
-    """Re-key stored chunk states after the file changed (see header comment).
+def _seed_segments(chunks: list[dict], lines: list[str], start_id: int = 1) -> list[dict]:
+    """Fresh segments (status=todo) for chunker output — the ONLY place the
+    chunker touches identity: it seeds seg rows, then never decides anything
+    again (round 4). seg_ids are per-file, issued from `start_id`."""
+    now = datetime.now().isoformat(timespec="seconds")
+    segs = []
+    for i, ch in enumerate(chunks):
+        st, en = ch["line_start"], ch["line_end"]
+        segs.append({
+            "seg_id": start_id + i,
+            "start_line": st,
+            "end_line": en,
+            "fingerprint": _seg_fingerprint(lines, st, en),
+            "first_line": lines[st - 1] if 0 <= st - 1 < len(lines) else "",
+            "title": ch.get("title") or "",
+            "heading_path": ch.get("heading_path") or [],
+            "status": "todo",
+            "parent_seg_id": None,
+            "updated_at": now,
+        })
+    return segs
 
-    No-op when the stored file_sha matches. Mutates entry in place; the
-    CALLER persists reading.json.
+
+def _segments_from_legacy(path: str, states: dict, orphans: list) -> tuple[list[dict], str | None]:
+    """Seed segments for one file, carrying legacy round-3 states over.
+
+    `states`: {chunk_key: {status, updated_at, cards_created?}} — the old
+    rchunks+rcards (or reading.json chunks) shape. Legacy keys match seeded
+    segments by chunker-derived key equality (exact only; a file that
+    drifted since round 3 orphans rather than mis-binds). Unmatched states
+    park in `orphans` (mutated in place). Returns (segments, sha);
+    ([], None) when the file left the corpus.
     """
-    if entry.get("file_sha") == sha:
-        return
-    states: dict = entry.get("chunks") or {}
-    new_keys = {_chunk_key(c) for c in chunks}
-    by_hp: dict[str, list[str]] = {}
-    for c in chunks:
-        by_hp.setdefault(">".join(c["heading_path"]), []).append(_chunk_key(c))
-    consumed: set[str] = set()
-    migrated: dict = {}
-    orphans = list(entry.get("orphans") or [])
-
-    def _line_of(k: str) -> int:
-        head = k.split(":", 1)[0]
-        return int(head) if head.isdigit() else 0
-
-    for key in sorted(states, key=_line_of):
-        st = states[key]
-        if key in new_keys and key not in consumed:
-            migrated[key] = st
-            consumed.add(key)
-            continue
-        hp = key.split(":", 1)[1] if ":" in key else ""
-        cand = next(
-            (k for k in by_hp.get(hp, []) if k not in consumed and k not in migrated),
-            None,
-        )
-        if cand:
-            migrated[cand] = st
-            consumed.add(cand)
-        else:
+    loaded = _chunks_for(path)
+    text = _read_note_text(path)
+    if loaded is None or text is None:
+        for key, st in states.items():
+            orphans.append({"chunk_key": key, **(st or {})})
+        return [], None
+    chunks, sha = loaded
+    segs = _seed_segments(chunks, text.split("\n"))
+    by_key = {_chunk_key(ch): seg for seg, ch in zip(segs, chunks)}
+    for key, st in states.items():
+        st = st or {}
+        seg = by_key.get(key)
+        if seg is None:
             orphans.append({"chunk_key": key, **st})
-    entry["chunks"] = migrated
+            continue
+        if st.get("status"):
+            seg["status"] = st["status"]
+        if st.get("updated_at"):
+            seg["updated_at"] = st["updated_at"]
+        if st.get("cards_created"):
+            seg["cards_created"] = list(st["cards_created"])
+    return segs, sha
+
+
+def _next_seg_id(entry: dict) -> int:
+    """Next per-file segment id (issued, never reused — ids of deleted or
+    containerized segments stay retired so provenance lookups can't collide)."""
+    ids = [s.get("seg_id") or 0 for s in entry.get("segments") or []]
+    for o in entry.get("orphans") or []:
+        sid = (o or {}).get("seg_id")
+        if isinstance(sid, int):
+            ids.append(sid)
+    return (max(ids) + 1) if ids else 1
+
+
+def _seg_fingerprint(lines: list[str], start: int, end: int) -> str:
+    """sha of the [start, end] 1-based inclusive line window (re-anchor fuse)."""
+    if not lines or start < 1 or end < start:
+        return ""
+    window = "\n".join(lines[start - 1 : min(end, len(lines))])
+    return hashlib.sha256(window.encode("utf-8")).hexdigest()[:32]
+
+
+def _relocate_span(
+    lines: list[str], fp: str, first_line: str, span: int, hint_start: int
+) -> int | None:
+    """New start_line for a segment whose window sha is `fp`; None when lost.
+
+    Exact-fingerprint search only (no fuzzy matching — an edited segment is
+    an identity crisis and must surface, not silently re-bind): hint position
+    first, then occurrences of the stored first line, then a bounded full
+    scan. O(lines × span) per lost-position segment — fine at corpus scale.
+    """
+    n = len(lines)
+    if not fp or span < 1 or n < span:
+        return None
+    tried: set[int] = set()
+
+    def _hit(st: int) -> bool:
+        return st + span - 1 <= n and _seg_fingerprint(lines, st, st + span - 1) == fp
+
+    if 1 <= hint_start <= n - span + 1:
+        tried.add(hint_start)
+        if _hit(hint_start):
+            return hint_start
+    if first_line:
+        for i, l in enumerate(lines[:5000]):
+            if l == first_line and (i + 1) not in tried:
+                tried.add(i + 1)
+                if _hit(i + 1):
+                    return i + 1
+    for st in range(1, n - span + 2):
+        if st in tried:
+            continue
+        if _hit(st):
+            return st
+    return None
+
+
+def _reanchor_entry(entry: dict, lines: list[str], new_sha: str) -> None:
+    """Re-locate stored segments after an EXTERNAL file edit (fuse path —
+    the app itself edits file+segments in one transaction and never drifts).
+
+    Pure line shifts re-anchor cleanly (fingerprint intact). A segment whose
+    content changed can't match anywhere: with cards_created it DEMOTES to a
+    clamped container (provenance survives — the card's source range still
+    renders, marked stale); without cards it parks in orphans. Any loss flags
+    the file needs_resync: out of dealing until POST /api/reading/reseed.
+    Containers that lost their own fingerprint recompute from relocated
+    children (their range is the union of the children's by construction).
+    """
+    n = len(lines)
+    segs = entry.get("segments") or []
+    orphans = list(entry.get("orphans") or [])
+    damaged = False
+
+    for s in segs:  # pass 1: leaves
+        if s.get("status") == "container":
+            continue
+        span = s["end_line"] - s["start_line"] + 1
+        st = _relocate_span(
+            lines, s.get("fingerprint", ""), s.get("first_line", ""), span, s["start_line"]
+        )
+        if st is None:
+            s["_lost"] = True
+            damaged = True
+        else:
+            s["start_line"] = st
+            s["end_line"] = st + span - 1
+            s["first_line"] = lines[st - 1] if st - 1 < n else ""
+
+    for s in segs:  # pass 2: containers — own fp, else union of live children
+        if s.get("status") != "container":
+            continue
+        span = s["end_line"] - s["start_line"] + 1
+        st = _relocate_span(
+            lines, s.get("fingerprint", ""), s.get("first_line", ""), span, s["start_line"]
+        )
+        if st is not None:
+            s["start_line"] = st
+            s["end_line"] = st + span - 1
+            s["first_line"] = lines[st - 1] if st - 1 < n else ""
+            continue
+        kids = [
+            c for c in segs
+            if c.get("parent_seg_id") == s["seg_id"] and not c.get("_lost")
+        ]
+        if kids:
+            s["start_line"] = min(k["start_line"] for k in kids)
+            s["end_line"] = max(k["end_line"] for k in kids)
+            s["fingerprint"] = _seg_fingerprint(lines, s["start_line"], s["end_line"])
+            s["first_line"] = lines[s["start_line"] - 1] if n else ""
+        else:
+            s["_lost"] = True
+            damaged = True
+
+    kept: list[dict] = []
+    for s in segs:
+        if not s.pop("_lost", False):
+            kept.append(s)
+            continue
+        if s.get("cards_created"):
+            # provenance container: clamp the stale range into the new file
+            s["status"] = "container"
+            s["start_line"] = max(1, min(s["start_line"], n or 1))
+            s["end_line"] = max(s["start_line"], min(s["end_line"], n or 1))
+            s["fingerprint"] = _seg_fingerprint(lines, s["start_line"], s["end_line"])
+            s["first_line"] = lines[s["start_line"] - 1] if n else ""
+            s["stale"] = True
+            kept.append(s)
+        else:
+            payload = {k: v for k, v in s.items()}
+            # keep seg_id INSIDE the payload — _next_seg_id scans orphans so a
+            # parked id is never reissued (provenance collision guard)
+            orphans.append({"chunk_key": f"seg:{payload.get('seg_id')}", **payload})
+    entry["segments"] = kept
     entry["orphans"] = orphans
-    entry["file_sha"] = sha
+    entry["file_sha"] = new_sha
+    if damaged:
+        entry["needs_resync"] = True
 
 
 def _file_view(entry: dict, gated: set | None = None):
     """(ordered, summary) for one reading-list entry.
 
-    ordered = [(chunk, key, state_dict)] in file order, or None when the file
-    vanished from the corpus. Migrates stored states on drift (caller persists).
+    ordered = [(chunk_view, key, seg_dict)] for LEAF segments in file order
+    (containers excluded — they are history/anchors, never dealt), or None
+    when the file vanished from the corpus. key = str(seg_id): the wire's
+    chunk_key field is now an opaque segment id (round 4). Re-anchors
+    segments on external drift; caller persists.
 
-    `gated` = set of (path, chunk_key) pairs whose created cards have not all
+    `gated` = set of (path, key) pairs whose created cards have not all
     left the preview pool yet (user spec 2026-09-19 round 3, B·二段重推):
-    a gated chunk is NOT the frontier — it blocks its file (later chunks stay
-    locked behind it) and is excluded from dealing until its cards are
-    truly released (out of 预览池 AND unsuspended = next-day release done).
+    a gated segment is NOT the frontier — it blocks its file (later
+    segments stay locked behind it) and is excluded from dealing until its
+    cards are truly released (out of 预览池 AND unsuspended).
     """
     gated = gated or set()
     path = entry.get("path", "")
-    loaded = _chunks_for(path)
-    if loaded is None:
-        return None, {
-            "path": path,
-            "title": Path(path).stem,
-            "missing": True,
-            "total_chunks": 0,
-            "todo": 0,
-            "active": 0,
-            "done": 0,
-            "skipped": 0,
-            "frontier": None,
-            "gated": 0,
-            "gated_frontier": None,
-            "orphans": len(entry.get("orphans") or []),
-            "cards_created": 0,
+    text = _read_note_text(path)
+    if text is None:
+        return None, _file_summary(entry, None, gated)
+    lines = text.split("\n")
+    sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if entry.get("file_sha") != sha:
+        _reanchor_entry(entry, lines, sha)
+    if entry.get("needs_resync"):
+        return [], _file_summary(entry, [], gated)
+    ordered = []
+    segs = sorted(
+        entry.get("segments") or [],
+        key=lambda s: (s.get("start_line", 0), s.get("seg_id", 0)),
+    )
+    for s in segs:
+        if s.get("status") == "container":
+            continue
+        start = max(1, min(s.get("start_line", 1), len(lines)))
+        end = max(start, min(s.get("end_line", start), len(lines)))
+        ch = {
+            "file": path,
+            "title": s.get("title") or Path(path).stem,
+            "heading_path": s.get("heading_path") or [],
+            "line_start": start,
+            "line_end": end,
+            "text": "\n".join(lines[start - 1 : end]),
         }
-    chunks, sha = loaded
-    _migrate_entry(entry, chunks, sha)
-    states = entry.get("chunks") or {}
-    ordered = [(ch, _chunk_key(ch), states.get(_chunk_key(ch)) or {}) for ch in chunks]
+        ordered.append((ch, str(s["seg_id"]), s))
     return ordered, _file_summary(entry, ordered, gated)
 
 
 def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     gated = gated or set()
     path = entry.get("path", "")
+    base = {
+        "path": path,
+        "title": Path(path).stem,
+        "orphans": len(entry.get("orphans") or []),
+        "needs_resync": bool(entry.get("needs_resync")),
+    }
     if ordered is None:
         return {
-            "path": path,
-            "title": Path(path).stem,
+            **base,
             "missing": True,
             "total_chunks": 0,
             "todo": 0,
             "active": 0,
             "done": 0,
             "skipped": 0,
+            "background": 0,
             "frontier": None,
             "gated": 0,
             "gated_frontier": None,
-            "orphans": len(entry.get("orphans") or []),
             "cards_created": 0,
         }
-    counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0}
+    counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0, "background": 0}
     cards = 0
     frontier = None
     gated_count = 0
     gated_frontier = None
-    blocked = False  # a gated chunk in dealable territory locks the file
+    blocked = base["needs_resync"]  # a flagged file deals nothing
     for ch, key, st in ordered:
         s = st.get("status", "todo")
         counts[s if s in counts else "todo"] += 1
         cards += len(st.get("cards_created") or [])
-        if s in ("done", "skipped"):
+        # background (un-scheduled context) and done/skipped never deal and
+        # never block the frontier — the frontier is the first DEALABLE one
+        if s in ("done", "skipped", "background"):
             continue
         is_gated = (path, key) in gated
         if is_gated:
@@ -2213,15 +2390,13 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
             "line_start": ch["line_start"],
         }
     return {
-        "path": path,
-        "title": Path(path).stem,
+        **base,
         "missing": False,
         "total_chunks": len(ordered),
         **counts,
         "frontier": frontier,
         "gated": gated_count,
         "gated_frontier": gated_frontier,
-        "orphans": len(entry.get("orphans") or []),
         "cards_created": cards,
     }
 
@@ -2230,6 +2405,8 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict) -> dict:
     return {
         "path": ch["file"],
         "chunk_key": key,
+        "seg_id": int(key) if str(key).isdigit() else None,
+        "parent_seg_id": st.get("parent_seg_id"),
         "title": ch.get("title") or Path(ch["file"]).stem,
         "heading_path": ch.get("heading_path") or [],
         "line_start": ch["line_start"],
@@ -2282,19 +2459,11 @@ def _reading_ensure_schema(conn: sqlite3.Connection) -> None:
             added_at  TEXT,
             file_sha  TEXT
         );
-        CREATE TABLE IF NOT EXISTS rchunks (
-            path       TEXT NOT NULL,
-            chunk_key  TEXT NOT NULL,
-            status     TEXT,
-            updated_at TEXT,
-            PRIMARY KEY (path, chunk_key)
-        );
         CREATE TABLE IF NOT EXISTS rcards (
             path      TEXT NOT NULL,
-            chunk_key TEXT NOT NULL,
+            seg_id    INTEGER NOT NULL,
             note_id   INTEGER NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_rcards_chunk ON rcards(path, chunk_key);
         CREATE TABLE IF NOT EXISTS rorphans (
             path      TEXT NOT NULL,
             chunk_key TEXT NOT NULL,
@@ -2308,8 +2477,40 @@ def _reading_ensure_schema(conn: sqlite3.Connection) -> None:
             key   TEXT PRIMARY KEY,
             value TEXT
         );
+        CREATE TABLE IF NOT EXISTS segments (
+            path          TEXT NOT NULL,
+            seg_id        INTEGER NOT NULL,
+            start_line    INTEGER NOT NULL,
+            end_line      INTEGER NOT NULL,
+            fingerprint   TEXT NOT NULL DEFAULT '',
+            first_line    TEXT NOT NULL DEFAULT '',
+            title         TEXT NOT NULL DEFAULT '',
+            heading_path  TEXT NOT NULL DEFAULT '[]',
+            status        TEXT NOT NULL DEFAULT 'todo',
+            parent_seg_id INTEGER,
+            updated_at    TEXT,
+            PRIMARY KEY (path, seg_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_segments_parent ON segments(path, parent_seg_id);
         """
     )
+    # rcards indexes only once the table is round-4 shape: a legacy DB still
+    # has rcards(path, chunk_key, note_id) until _reading_migrate_round4
+    # renames it — creating seg_id indexes on it would raise and brick every
+    # reading call BEFORE the migration gets a chance to run.
+    rcards_cols = {r[1] for r in conn.execute("PRAGMA table_info(rcards)")}
+    if "seg_id" in rcards_cols:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rcards_seg ON rcards(path, seg_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_rcards_note ON rcards(note_id)"
+        )
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(rfiles)")}
+    if "needs_resync" not in cols:
+        conn.execute(
+            "ALTER TABLE rfiles ADD COLUMN needs_resync INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def _store_entry(
@@ -2319,38 +2520,52 @@ def _store_entry(
     pos: int,
     added_at: str | None,
     file_sha: str | None,
-    chunks: dict,
+    segments: list,
     orphans: list,
+    needs_resync: bool = False,
 ) -> None:
-    """Upsert one file entry (listed or archived) with its chunks/cards/
+    """Upsert one file entry (listed or archived) with its segments/cards/
     orphans. Caller runs inside a transaction (`with conn:`)."""
     conn.execute(
-        "INSERT INTO rfiles(path, in_list, pos, added_at, file_sha) "
-        "VALUES(?,?,?,?,?) "
+        "INSERT INTO rfiles(path, in_list, pos, added_at, file_sha, needs_resync) "
+        "VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(path) DO UPDATE SET in_list=excluded.in_list, "
         "pos=excluded.pos, added_at=excluded.added_at, "
-        "file_sha=excluded.file_sha",
-        (path, in_list, pos, added_at, file_sha),
+        "file_sha=excluded.file_sha, needs_resync=excluded.needs_resync",
+        (path, in_list, pos, added_at, file_sha, 1 if needs_resync else 0),
     )
-    conn.execute("DELETE FROM rchunks WHERE path = ?", (path,))
+    conn.execute("DELETE FROM segments WHERE path = ?", (path,))
     conn.execute("DELETE FROM rcards WHERE path = ?", (path,))
     conn.execute("DELETE FROM rorphans WHERE path = ?", (path,))
-    chunk_rows = []
+    seg_rows = []
     card_rows = []
-    for key, st in (chunks or {}).items():
-        st = st or {}
-        chunk_rows.append((path, key, st.get("status"), st.get("updated_at")))
-        for nid in st.get("cards_created") or []:
-            card_rows.append((path, key, nid))
-    if chunk_rows:
+    for s in segments or []:
+        s = dict(s or {})
+        seg_rows.append((
+            path,
+            s.get("seg_id"),
+            s.get("start_line", 1),
+            s.get("end_line", s.get("start_line", 1)),
+            s.get("fingerprint", ""),
+            s.get("first_line", ""),
+            s.get("title", ""),
+            json.dumps(s.get("heading_path") or [], ensure_ascii=False),
+            s.get("status", "todo"),
+            s.get("parent_seg_id"),
+            s.get("updated_at"),
+        ))
+        for nid in s.get("cards_created") or []:
+            card_rows.append((path, s.get("seg_id"), nid))
+    if seg_rows:
         conn.executemany(
-            "INSERT OR REPLACE INTO rchunks(path, chunk_key, status, updated_at) "
-            "VALUES(?,?,?,?)",
-            chunk_rows,
+            "INSERT OR REPLACE INTO segments(path, seg_id, start_line, end_line, "
+            "fingerprint, first_line, title, heading_path, status, parent_seg_id, "
+            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            seg_rows,
         )
     if card_rows:
         conn.executemany(
-            "INSERT INTO rcards(path, chunk_key, note_id) VALUES(?,?,?)",
+            "INSERT INTO rcards(path, seg_id, note_id) VALUES(?,?,?)",
             card_rows,
         )
     orphan_rows = []
@@ -2397,15 +2612,23 @@ def _reading_migrate_json() -> None:
             return
         with conn:
             for i, e in enumerate(d.get("list") or []):
+                p = e.get("path", "")
+                orphans = list(e.get("orphans") or [])
+                segs, sha = _segments_from_legacy(
+                    p, e.get("chunks") or {}, orphans
+                )
                 _store_entry(
-                    conn, e.get("path", ""), 1, i,
-                    e.get("added_at"), e.get("file_sha"),
-                    e.get("chunks") or {}, e.get("orphans") or [],
+                    conn, p, 1, i,
+                    e.get("added_at"), sha or e.get("file_sha"),
+                    segs, orphans,
                 )
             for i, (p, a) in enumerate(sorted((d.get("archive") or {}).items())):
+                a = a or {}
+                orphans = list(a.get("orphans") or [])
+                segs, sha = _segments_from_legacy(p, a.get("chunks") or {}, orphans)
                 _store_entry(
-                    conn, p, 0, i, None, (a or {}).get("file_sha"),
-                    (a or {}).get("chunks") or {}, (a or {}).get("orphans") or [],
+                    conn, p, 0, i, None, sha or a.get("file_sha"),
+                    segs, orphans,
                 )
             rd = d.get("round")
             if isinstance(rd, dict):
@@ -2422,28 +2645,115 @@ def _reading_migrate_json() -> None:
         pass
 
 
+def _reading_migrate_round4() -> None:
+    """One-time rchunks(+rcards) → segments migration (round 4).
+
+    Runs only when the DB predates round 4 (no rmeta 'round4_migrated') and
+    an rchunks table exists. Order matters: legacy rows are READ first, then
+    rchunks/rcards are RENAMED to *_r3bak (zero-delete rollback: revert the
+    app and rename them back), the schema is re-ensured (fresh seg_id-shaped
+    rcards), and segments are seeded with legacy states re-bound by exact
+    chunker-key equality; unmatched states park in rorphans.
+    """
+    try:
+        conn = _reading_conn()
+    except Exception:
+        return
+    try:
+        with conn:
+            row = conn.execute(
+                "SELECT value FROM rmeta WHERE key = 'round4_migrated'"
+            ).fetchone()
+            if row is not None:
+                return
+            has_rchunks = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='rchunks'"
+            ).fetchone()
+            conn.execute(
+                "INSERT OR REPLACE INTO rmeta(key, value) VALUES('round4_migrated', ?)",
+                (datetime.now().isoformat(timespec="seconds"),),
+            )
+            if not has_rchunks:
+                return  # fresh DB — nothing to migrate
+            file_rows = conn.execute(
+                "SELECT path, in_list, pos, added_at, file_sha FROM rfiles"
+            ).fetchall()
+            chunk_rows = conn.execute(
+                "SELECT path, chunk_key, status, updated_at FROM rchunks"
+            ).fetchall()
+            card_rows = conn.execute(
+                "SELECT path, chunk_key, note_id FROM rcards ORDER BY rowid"
+            ).fetchall()
+            orphan_rows = conn.execute(
+                "SELECT path, chunk_key, data FROM rorphans ORDER BY rowid"
+            ).fetchall()
+        # assemble legacy per-file states (the old _reading_read shape)
+        states_by_path: dict[str, dict] = {}
+        for path, key, status, updated in chunk_rows:
+            st: dict = {}
+            if status is not None:
+                st["status"] = status
+            if updated is not None:
+                st["updated_at"] = updated
+            states_by_path.setdefault(path, {})[key] = st
+        for path, key, note_id in card_rows:
+            st_c = states_by_path.get(path, {}).get(key)
+            if st_c is not None:
+                st_c.setdefault("cards_created", []).append(note_id)
+        orphans_by_path: dict[str, list] = {}
+        for path, key, data in orphan_rows:
+            try:
+                payload = json.loads(data) if data else {}
+            except Exception:
+                payload = {}
+            orphans_by_path.setdefault(path, []).append({"chunk_key": key, **payload})
+        # park the legacy tables (zero-delete rollback), then recreate the
+        # round-4 rcards shape before any _store_entry insert touches it
+        conn.execute("ALTER TABLE rchunks RENAME TO rchunks_r3bak")
+        conn.execute("ALTER TABLE rcards RENAME TO rcards_r3bak")
+        _reading_ensure_schema(conn)
+        with conn:
+            for path, in_list, pos, added_at, file_sha in file_rows:
+                orphans = orphans_by_path.get(path, [])
+                segs, sha = _segments_from_legacy(
+                    path, states_by_path.get(path, {}), orphans
+                )
+                _store_entry(
+                    conn, path, in_list, pos, added_at,
+                    sha if segs else file_sha,
+                    segs, orphans,
+                )
+    except Exception:
+        pass  # never block startup on migration; the flag prevents retries
+    finally:
+        conn.close()
+
+
 if READING_MODE:
     _reading_migrate_json()
+    _reading_migrate_round4()
 
 
 def _reading_read() -> dict:
     """Assemble the working state dict from the SQLite store.
 
-    Shape is IDENTICAL to the legacy reading.json document (list/archive/
-    round) so every consumer (dealing, summaries, drift migration, round
-    rehydration) is unchanged; only persistence moved to rows.
+    Round 4 shape: entries carry `segments` (list of segment dicts incl.
+    cards_created) instead of the legacy `chunks` dict. Consumers (dealing,
+    summaries, round rehydration) work off _file_view which hides the shape.
     """
     conn = _reading_conn()
     try:
         files = conn.execute(
-            "SELECT path, in_list, pos, added_at, file_sha FROM rfiles "
+            "SELECT path, in_list, pos, added_at, file_sha, needs_resync FROM rfiles "
             "ORDER BY in_list DESC, pos, path"
         ).fetchall()
-        chunk_rows = conn.execute(
-            "SELECT path, chunk_key, status, updated_at FROM rchunks"
+        seg_rows = conn.execute(
+            "SELECT path, seg_id, start_line, end_line, fingerprint, first_line, "
+            "title, heading_path, status, parent_seg_id, updated_at FROM segments "
+            "ORDER BY path, start_line, seg_id"
         ).fetchall()
         card_rows = conn.execute(
-            "SELECT path, chunk_key, note_id FROM rcards ORDER BY rowid"
+            "SELECT path, seg_id, note_id FROM rcards ORDER BY rowid"
         ).fetchall()
         orphan_rows = conn.execute(
             "SELECT path, chunk_key, data FROM rorphans ORDER BY rowid"
@@ -2452,18 +2762,32 @@ def _reading_read() -> dict:
     finally:
         conn.close()
 
-    chunks_by_path: dict[str, dict] = {}
-    for path, key, status, updated in chunk_rows:
-        st: dict = {}
-        if status is not None:
-            st["status"] = status
-        if updated is not None:
-            st["updated_at"] = updated
-        chunks_by_path.setdefault(path, {})[key] = st
-    for path, key, note_id in card_rows:
-        st = chunks_by_path.get(path, {}).get(key)
-        if st is not None:
-            st.setdefault("cards_created", []).append(note_id)
+    segs_by_path: dict[str, list] = {}
+    seg_index: dict[tuple[str, int], dict] = {}
+    for (path, seg_id, start_line, end_line, fp, first_line, title, hp_json,
+         status, parent_seg_id, updated) in seg_rows:
+        try:
+            hp = json.loads(hp_json) if hp_json else []
+        except Exception:
+            hp = []
+        s: dict = {
+            "seg_id": seg_id,
+            "start_line": start_line,
+            "end_line": end_line,
+            "fingerprint": fp or "",
+            "first_line": first_line or "",
+            "title": title or "",
+            "heading_path": hp,
+            "status": status or "todo",
+            "parent_seg_id": parent_seg_id,
+            "updated_at": updated,
+        }
+        segs_by_path.setdefault(path, []).append(s)
+        seg_index[(path, seg_id)] = s
+    for path, seg_id, note_id in card_rows:
+        seg = seg_index.get((path, seg_id))
+        if seg is not None:
+            seg.setdefault("cards_created", []).append(note_id)
     orphans_by_path: dict[str, list] = {}
     for path, key, data in orphan_rows:
         try:
@@ -2472,29 +2796,33 @@ def _reading_read() -> dict:
             payload = {}
         orphans_by_path.setdefault(path, []).append({"chunk_key": key, **payload})
 
-    def _entry(path: str, added_at: str | None, file_sha: str | None) -> dict:
+    def _entry(path: str, added_at: str | None, file_sha: str | None,
+               needs_resync: int | None) -> dict:
         e = {
             "path": path,
             "file_sha": file_sha,
-            "chunks": chunks_by_path.get(path, {}),
+            "segments": segs_by_path.get(path, []),
             "orphans": orphans_by_path.get(path, []),
         }
+        if needs_resync:
+            e["needs_resync"] = True
         if added_at is not None:
             e["added_at"] = added_at
         return e
 
     listed = [
-        _entry(path, added_at, file_sha)
-        for path, in_list, _pos, added_at, file_sha in files
+        _entry(path, added_at, file_sha, needs_resync)
+        for path, in_list, _pos, added_at, file_sha, needs_resync in files
         if in_list
     ]
     archive = {
         path: {
             "file_sha": file_sha,
-            "chunks": chunks_by_path.get(path, {}),
+            "segments": segs_by_path.get(path, []),
             "orphans": orphans_by_path.get(path, []),
+            **({"needs_resync": True} if needs_resync else {}),
         }
-        for path, in_list, _pos, _added, file_sha in files
+        for path, in_list, _pos, _added, file_sha, needs_resync in files
         if not in_list
     }
     d: dict = {"list": listed, "archive": archive}
@@ -2517,7 +2845,7 @@ def _reading_write(d: dict | None):
 
     Row-level upserts keep the store structured (queryable, indexable, no
     single-blob rewrite); at reading-list scale (dozens of files, hundreds
-    of chunks) a full sync per action is sub-millisecond and runs under
+    of segments) a full sync per action is sub-millisecond and runs under
     _state_lock, so dict → tables can never race itself.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2525,14 +2853,14 @@ def _reading_write(d: dict | None):
     try:
         with conn:
             if d is None:
-                for t in ("rfiles", "rchunks", "rcards", "rorphans", "rround"):
+                for t in ("rfiles", "segments", "rcards", "rorphans", "rround"):
                     conn.execute(f"DELETE FROM {t}")
                 return
             listed = d.get("list") or []
             archive = d.get("archive") or {}
             keep = [e.get("path", "") for e in listed] + list(archive.keys())
             marks = ",".join("?" * len(keep)) if keep else "''"
-            for t in ("rfiles", "rchunks", "rcards", "rorphans"):
+            for t in ("rfiles", "segments", "rcards", "rorphans"):
                 conn.execute(
                     f"DELETE FROM {t} WHERE path NOT IN ({marks})", keep
                 )
@@ -2540,12 +2868,14 @@ def _reading_write(d: dict | None):
                 _store_entry(
                     conn, e.get("path", ""), 1, i,
                     e.get("added_at"), e.get("file_sha"),
-                    e.get("chunks") or {}, e.get("orphans") or [],
+                    e.get("segments") or [], e.get("orphans") or [],
+                    bool(e.get("needs_resync")),
                 )
             for i, (p, a) in enumerate(sorted(archive.items())):
                 _store_entry(
                     conn, p, 0, i, None, (a or {}).get("file_sha"),
-                    (a or {}).get("chunks") or {}, (a or {}).get("orphans") or [],
+                    (a or {}).get("segments") or [], (a or {}).get("orphans") or [],
+                    bool((a or {}).get("needs_resync")),
                 )
             rd = d.get("round")
             if isinstance(rd, dict):
@@ -2590,17 +2920,16 @@ async def _reading_gates(data: dict) -> set[tuple[str, str]]:
         ordered, _ = _file_view(entry)
         if not ordered:
             continue
-        states = entry.get("chunks") or {}
-        for _ch, key, _st in ordered:
-            st = states.get(key) or {}
-            if st.get("status", "todo") in ("done", "skipped"):
+        for _ch, key, st in ordered:
+            st = st or {}
+            if st.get("status", "todo") in ("done", "skipped", "background", "container"):
                 continue
             notes = st.get("cards_created") or []
             if notes:
-                # EVERY live chunk with cards is a gate candidate, not just
-                # the frontier: with depth dealing a deeper chunk can hold
-                # cards while an earlier todo chunk is the frontier (user
-                # made cards for chunk 3, pressed 下一张 on chunk 2).
+                # EVERY live segment with cards is a gate candidate, not just
+                # the frontier: with depth dealing a deeper segment can hold
+                # cards while an earlier todo one is the frontier (user made
+                # cards for segment 3, pressed 下一张 on segment 2).
                 targets.append((path, key, list(notes)))
     note_ids = sorted({n for _, _, notes in targets for n in notes})
     if not note_ids:
@@ -2674,7 +3003,7 @@ def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[
 
     def _dealable(path: str, key: str, st: dict) -> bool:
         return st.get("status", "todo") not in (
-            "done", "skipped"
+            "done", "skipped", "background", "container"
         ) and (path, key) not in gated
 
     def _take(path: str, ch: dict, key: str, st: dict, summary: dict) -> None:
@@ -2772,12 +3101,18 @@ def _reading_round_payload(data: dict) -> dict | None:
 
 
 def _reading_record_card(src: dict | None, note_id: int) -> None:
-    """Append a just-created note id to the source chunk's cards_created.
+    """Append a just-created note id to the source segment's cards_created.
 
-    ALSO auto-marks a `todo` chunk as `active` (user decision 2026-09-19:
-    the 开始制卡 button is gone — making a card/cloze from a chunk IS the
+    ALSO auto-marks a `todo` segment as `active` (user decision 2026-09-19:
+    the 开始制卡 button is gone — making a card/cloze from a segment IS the
     declaration that you're working on it; the chip shows 正在制卡 and the
-    chunk resurfaces first next round). done/skipped chunks are left alone.
+    segment resurfaces first next round). done/skipped/background segments
+    are left alone; a `container` segment KEEPS the provenance (cards made
+    against a pre-split range still anchor to it) but never flips to active.
+
+    src shape: {path, chunk_key} where chunk_key = str(seg_id) on the round-4
+    wire (the reading UI) or a legacy "line:heading" key (old callers) — the
+    latter re-binds by exact seeded-key match when possible.
 
     Fail-soft by contract (caller wraps in try): reading bookkeeping must
     never break card creation.
@@ -2790,11 +3125,33 @@ def _reading_record_card(src: dict | None, note_id: int) -> None:
     entry = _find_entry(data, path)
     if entry is None:
         return
-    st = entry.setdefault("chunks", {}).setdefault(key, {})
-    if st.get("status", "todo") == "todo":
-        st["status"] = "active"
-        st["updated_at"] = datetime.now().isoformat(timespec="seconds")
-    created = st.setdefault("cards_created", [])
+    segs = entry.setdefault("segments", [])
+    target = None
+    if str(key).isdigit():
+        target = next(
+            (s for s in segs if str(s.get("seg_id")) == str(key)), None
+        )
+    else:
+        # legacy chunk_key from a pre-round-4 client — match by seeded key
+        loaded = _chunks_for(path)
+        if loaded is not None:
+            chunks, _sha = loaded
+            for ch in chunks:
+                if _chunk_key(ch) == key:
+                    st_line = ch["line_start"]
+                    target = next(
+                        (s for s in segs
+                         if s.get("start_line") == st_line
+                         and s.get("status") != "container"),
+                        None,
+                    )
+                    break
+    if target is None:
+        return
+    if target.get("status", "todo") in ("todo",):
+        target["status"] = "active"
+        target["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    created = target.setdefault("cards_created", [])
     if note_id not in created:
         created.append(note_id)
     _reading_write(data)
@@ -2915,17 +3272,27 @@ async def reading_list_add(body: ReadingPathBody):
         chunks, sha = loaded
         if not chunks:
             raise HTTPException(status_code=400, detail="文件里没有可读的片段")
-        # re-adding a previously removed file restores its old progress
+        # re-adding a previously removed file restores its old progress;
+        # otherwise seed fresh segments from the chunker (round 4: the
+        # chunker's only identity job is seeding — see _seed_segments)
         archived = (data.get("archive") or {}).pop(body.path, None) or {}
-        data["list"].append(
-            {
-                "path": body.path,
-                "added_at": datetime.now().isoformat(timespec="seconds"),
-                "file_sha": archived.get("file_sha", sha),
-                "chunks": archived.get("chunks", {}),
-                "orphans": archived.get("orphans", []),
-            }
-        )
+        if archived.get("segments"):
+            segments = archived.get("segments", [])
+            entry_sha = archived.get("file_sha", sha)
+        else:
+            text = _read_note_text(body.path) or ""
+            segments = _seed_segments(chunks, text.split("\n"))
+            entry_sha = sha
+        entry_new = {
+            "path": body.path,
+            "added_at": datetime.now().isoformat(timespec="seconds"),
+            "file_sha": entry_sha,
+            "segments": segments,
+            "orphans": archived.get("orphans", []),
+        }
+        if archived.get("needs_resync"):
+            entry_new["needs_resync"] = True
+        data["list"].append(entry_new)
         _reading_write(data)
         return {"ok": True, "order": [e["path"] for e in data["list"]]}
 
@@ -2942,8 +3309,9 @@ async def reading_list_remove(body: ReadingPathBody):
         # park the progress so a later re-add doesn't start from scratch
         data.setdefault("archive", {})[body.path] = {
             "file_sha": entry.get("file_sha"),
-            "chunks": entry.get("chunks", {}),
+            "segments": entry.get("segments", []),
             "orphans": entry.get("orphans", []),
+            **({"needs_resync": True} if entry.get("needs_resync") else {}),
         }
         rd = data.get("round")
         if isinstance(rd, dict) and rd.get("status") == "active":
@@ -3079,22 +3447,24 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
     """
     if action not in READING_ACTIONS:
         raise HTTPException(
-            status_code=400, detail="action must be mark_active|complete|skip|next"
+            status_code=400,
+            detail="action must be mark_active|complete|skip|next|promote|demote",
         )
     data = _reading_read()
     rd = data.get("round")
-    if not isinstance(rd, dict) or rd.get("status") != "active":
+    in_round = isinstance(rd, dict) and rd.get("status") == "active"
+    if not in_round and action in ("mark_active", "complete", "skip", "next"):
         raise HTTPException(status_code=409, detail="no active reading round")
     target = {"path": path, "chunk_key": chunk_key}
-    if target not in rd.get("pending", []):
+    if in_round and target not in rd.get("pending", []) and action != "mark_active":
         return {"ok": False, "reason": "stale"}
     entry = _find_entry(data, path)
     if entry is None:
         raise HTTPException(status_code=404, detail="file not in the reading list")
-    ordered, _ = _file_view(entry)
-    keys = {key for _, key, _ in ordered or []}
 
     def _drop_and_maybe_complete() -> bool:
+        if not in_round:
+            return False
         rd["pending"] = [p for p in rd.get("pending", []) if p != target]
         rd["done"] = rd.get("done", 0) + 1
         if not rd["pending"]:
@@ -3102,26 +3472,40 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
             return True
         return False
 
-    if chunk_key not in keys:
-        # file drifted mid-round and this exact chunk is gone — don't strand
-        # the round on it; the frontier logic re-picks on the next deal
+    segs = entry.setdefault("segments", [])
+    seg = next((s for s in segs if str(s.get("seg_id")) == str(chunk_key)), None)
+    if seg is None:
+        # file drifted mid-round and this exact segment is gone — don't
+        # strand the round on it; the frontier logic re-picks on the next deal
         complete = _drop_and_maybe_complete()
         _reading_write(data)
         return {"ok": False, "reason": "drifted", "round_complete": complete}
-
-    states = entry.setdefault("chunks", {})
-    st = states.setdefault(chunk_key, {})
+    status = seg.get("status", "todo")
+    if status == "container":
+        raise HTTPException(status_code=409, detail="container segments are history")
     if action == "mark_active":
-        if st.get("status", "todo") == "todo":
-            st["status"] = "active"
+        if status == "todo":
+            seg["status"] = "active"
     elif action == "complete":
-        st["status"] = "done"
+        seg["status"] = "done"
     elif action == "skip":
-        st["status"] = "skipped"
-    st["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        seg["status"] = "skipped"
+    elif action == "promote":
+        # background → todo (升格排期); legal outside a round
+        if status != "background":
+            _reading_write(data)
+            return {"ok": False, "reason": "not background", "status": status}
+        seg["status"] = "todo"
+    elif action == "demote":
+        # todo/active → background (降格回上下文)
+        if status not in ("todo", "active"):
+            _reading_write(data)
+            return {"ok": False, "reason": "not demotable", "status": status}
+        seg["status"] = "background"
+    seg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     round_complete = False
-    if action in ("complete", "skip", "next"):
+    if in_round and action in ("complete", "skip", "next"):
         stats_key = {"complete": "done", "skip": "skipped", "next": "next"}[action]
         stats = rd.setdefault("stats", {})
         stats[stats_key] = stats.get(stats_key, 0) + 1
@@ -3129,11 +3513,11 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
     _reading_write(data)
     return {
         "ok": True,
-        "status": st.get("status", "todo"),
+        "status": seg.get("status", "todo"),
         "round_complete": round_complete,
-        "stats": rd.get("stats", {}),
-        "done": rd.get("done", 0),
-        "total": rd.get("total", 0),
+        "stats": (rd or {}).get("stats", {}),
+        "done": (rd or {}).get("done", 0),
+        "total": (rd or {}).get("total", 0),
     }
 
 
@@ -3148,6 +3532,286 @@ async def reading_finish():
         data["round"] = None
         _reading_write(data)
         return {"ok": True, "stats": stats}
+
+
+class ReadingSplitBody(BaseModel):
+    path: str
+    seg_id: int
+    # 1-based inclusive line ranges INSIDE the parent segment, sorted,
+    # disjoint. Each becomes a `todo` child; the gaps become `background`
+    # children (片段组合, round 4). Pure DB operation — the file is untouched.
+    selections: list[dict]
+
+
+@app.post("/api/reading/split")
+async def reading_split(body: ReadingSplitBody):
+    """Recursive split: parent → container + 2k+1 children (round 4).
+
+    Rules (spec 2026-09-20 round 4):
+      - parent keeps its seg_id and EXACT range forever → cards already
+        anchored to it stay valid (provenance never drifts on split);
+      - parent becomes `container` (never dealt, read-only history);
+      - children get fresh seg_ids, parent_seg_id = parent;
+      - selected ranges → todo (scheduled), gaps → background;
+      - a child can be split again — recursion is just interval refinement.
+    """
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        entry = _find_entry(data, body.path)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="file not in the reading list")
+        if entry.get("needs_resync"):
+            raise HTTPException(status_code=409, detail="file needs reseed first")
+        segs = entry.get("segments") or []
+        parent = next(
+            (s for s in segs if s.get("seg_id") == body.seg_id), None
+        )
+        if parent is None:
+            raise HTTPException(status_code=404, detail="segment not found")
+        if parent.get("status") == "container":
+            raise HTTPException(status_code=409, detail="segment already split")
+        text = _read_note_text(body.path)
+        if text is None:
+            raise HTTPException(status_code=404, detail="note file not found")
+        lines = text.split("\n")
+        p_start, p_end = parent["start_line"], parent["end_line"]
+        # normalize + validate selections inside the parent range
+        sels = []
+        for sel in body.selections:
+            try:
+                a = int(sel.get("start_line"))  # type: ignore[arg-type]
+                b = int(sel.get("end_line"))    # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="selections need int start_line/end_line")
+            if a < 1 or b < a or b > len(lines):
+                raise HTTPException(status_code=400, detail=f"selection out of file range: {a}-{b}")
+            sels.append((max(a, p_start), min(b, p_end)))
+        sels = [(a, b) for a, b in sels if a <= b]
+        sels.sort()
+        merged: list[tuple[int, int]] = []
+        for a, b in sels:
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        if not merged:
+            raise HTTPException(status_code=400, detail="no valid selection inside the segment")
+        now = datetime.now().isoformat(timespec="seconds")
+        nid = _next_seg_id(entry)
+        children: list[dict] = []
+
+        def _mk(a: int, b: int, status: str) -> None:
+            nonlocal nid
+            children.append({
+                "seg_id": nid,
+                "start_line": a,
+                "end_line": b,
+                "fingerprint": _seg_fingerprint(lines, a, b),
+                "first_line": lines[a - 1] if a - 1 < len(lines) else "",
+                "title": parent.get("title") or "",
+                "heading_path": list(parent.get("heading_path") or []),
+                "status": status,
+                "parent_seg_id": parent["seg_id"],
+                "updated_at": now,
+            })
+            nid += 1
+
+        cursor = p_start
+        for a, b in merged:
+            if a > cursor:
+                _mk(cursor, a - 1, "background")
+            _mk(a, b, "todo")
+            cursor = b + 1
+        if cursor <= p_end:
+            _mk(cursor, p_end, "background")
+        if not any(c["status"] == "todo" for c in children):
+            raise HTTPException(status_code=400, detail="selections cover nothing new")
+        # containerize the parent; cards_created STAY on it (provenance rule)
+        parent["status"] = "container"
+        parent["updated_at"] = now
+        segs.extend(children)
+        # the parent may be mid-round: replace it in pending with its todo
+        # children so the round doesn't strand on a container
+        rd = data.get("round")
+        if isinstance(rd, dict) and rd.get("status") == "active":
+            pend = rd.get("pending", [])
+            key = str(parent["seg_id"])
+            if any(p.get("path") == body.path and p.get("chunk_key") == key for p in pend):
+                pend = [p for p in pend
+                        if not (p.get("path") == body.path and p.get("chunk_key") == key)]
+                for c in children:
+                    if c["status"] == "todo":
+                        pend.append({"path": body.path, "chunk_key": str(c["seg_id"])})
+                rd["pending"] = pend
+                rd["total"] = rd.get("done", 0) + len(pend)
+        _reading_write(data)
+        return {
+            "ok": True,
+            "parent_seg_id": parent["seg_id"],
+            "children": [
+                {"seg_id": c["seg_id"], "start_line": c["start_line"],
+                 "end_line": c["end_line"], "status": c["status"]}
+                for c in children
+            ],
+        }
+
+
+@app.post("/api/reading/reseed")
+async def reading_reseed(body: ReadingPathBody):
+    """Clear needs_resync after external drift: re-anchor what still matches
+    and re-seed the rest. Existing segments whose fingerprint relocates keep
+    their status; everything else is rebuilt as fresh `todo` segments (cards
+    on lost segments stay anchored to stale containers — provenance never
+    deleted, per round-4 rule).
+    """
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        entry = _find_entry(data, body.path)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="file not in the reading list")
+        loaded = _chunks_for(body.path)
+        text = _read_note_text(body.path)
+        if loaded is None or text is None:
+            raise HTTPException(status_code=404, detail="note file not found")
+        chunks, sha = loaded
+        lines = text.split("\n")
+        # try to relocate every existing segment by fingerprint. Containers
+        # always survive (history anchors + lineage even without cards);
+        # leaves survive when they relocate or when they hold cards (stale
+        # container — provenance never deleted, per round-4 rule).
+        surviving = []
+        for s in entry.get("segments") or []:
+            span = s["end_line"] - s["start_line"] + 1
+            st = _relocate_span(
+                lines, s.get("fingerprint", ""), s.get("first_line", ""), span, s["start_line"]
+            )
+            if s.get("status") == "container":
+                if st is not None:
+                    s["start_line"] = st
+                    s["end_line"] = st + span - 1
+                    s["first_line"] = lines[st - 1] if st - 1 < len(lines) else ""
+                else:
+                    s["stale"] = True
+                surviving.append(s)
+            elif st is not None:
+                s["start_line"] = st
+                s["end_line"] = st + span - 1
+                s["first_line"] = lines[st - 1] if st - 1 < len(lines) else ""
+                surviving.append(s)
+            elif s.get("cards_created"):
+                # keep as a stale container so rcards lookups still resolve
+                s["status"] = "container"
+                s["stale"] = True
+                surviving.append(s)
+        # parked orphans get one re-anchor chance (a segment orphaned by an
+        # earlier drift often matches again once the file is fixed/restored —
+        # restoring it keeps the split family's tiling gap-free)
+        kept_orphans = []
+        for o in entry.get("orphans") or []:
+            sid = o.get("seg_id")
+            if isinstance(sid, int) and o.get("fingerprint"):
+                span = o["end_line"] - o["start_line"] + 1
+                st = _relocate_span(
+                    lines, o.get("fingerprint", ""), o.get("first_line", ""),
+                    span, o.get("start_line", 1),
+                )
+                if st is not None:
+                    restored = {k: v for k, v in o.items() if k != "chunk_key"}
+                    restored["start_line"] = st
+                    restored["end_line"] = st + span - 1
+                    restored["first_line"] = lines[st - 1] if st - 1 < len(lines) else ""
+                    restored["status"] = restored.get("status", "todo")
+                    if restored["status"] not in (
+                        "todo", "active", "done", "skipped", "background", "container"
+                    ):
+                        restored["status"] = "todo"
+                    surviving.append(restored)
+                    continue
+            kept_orphans.append(o)
+        entry["orphans"] = kept_orphans
+        covered: set[int] = set()
+        for s in surviving:
+            covered.update(range(s["start_line"], s["end_line"] + 1))
+        entry["segments"] = surviving  # id counter must see survivors
+        nid = _next_seg_id(entry)
+        fresh = []
+        for ch in chunks:
+            a, b = ch["line_start"], ch["line_end"]
+            if any(l in covered for l in range(a, b + 1)):
+                continue  # overlaps a surviving segment — leave it alone
+            fresh.append({
+                "seg_id": nid,
+                "start_line": a,
+                "end_line": b,
+                "fingerprint": _seg_fingerprint(lines, a, b),
+                "first_line": lines[a - 1] if a - 1 < len(lines) else "",
+                "title": ch.get("title") or "",
+                "heading_path": ch.get("heading_path") or [],
+                "status": "todo",
+                "parent_seg_id": None,
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            nid += 1
+        entry["segments"] = surviving + fresh
+        entry["needs_resync"] = False
+        entry["file_sha"] = sha
+        _reading_write(data)
+        return {"ok": True, "segments": len(entry["segments"]), "fresh": len(fresh)}
+
+
+@app.get("/api/reading/source")
+async def reading_source(note_id: int):
+    """Reverse provenance lookup (round 4): note → source segment.
+
+    Used by the review/preview UI to show a card's TRUE source (rcards is
+    exact history — notes-rag RAG was a similarity guess) and by the
+    add-card dialogs to inherit reading_source for cards made while
+    reviewing (卡 a 复习时制的卡 b 也归到 a 的片段). 404 = orphan card
+    (pre-round-4, desktop-Anki-made, or source segment orphaned) — the UI
+    then shows 无来源.
+    """
+    _reading_guard()
+    data = _reading_read()
+    for entry in list(data.get("list") or []) + [
+        {"path": p, **a} for p, a in (data.get("archive") or {}).items()
+    ]:
+        for s in entry.get("segments") or []:
+            if note_id in (s.get("cards_created") or []):
+                path = entry.get("path", "")
+                # breadcrumb: walk parent_seg_id up to the seeded root
+                by_id = {x.get("seg_id"): x for x in entry.get("segments") or []}
+                trail = []
+                cur = s
+                seen = set()
+                while cur is not None and cur.get("seg_id") not in seen:
+                    seen.add(cur.get("seg_id"))
+                    trail.append(cur)
+                    pid = cur.get("parent_seg_id")
+                    cur = by_id.get(pid) if pid is not None else None
+                trail.reverse()
+                text = _read_note_text(path) or ""
+                lines = text.split("\n")
+                a = max(1, min(s["start_line"], len(lines) or 1))
+                b = max(a, min(s["end_line"], len(lines) or a))
+                return {
+                    "path": path,
+                    "seg_id": s["seg_id"],
+                    "status": s.get("status", "todo"),
+                    "stale": bool(s.get("stale")),
+                    "line_start": a,
+                    "line_end": b,
+                    "text": "\n".join(lines[a - 1 : b]) if lines else "",
+                    "breadcrumb": [
+                        {"seg_id": t.get("seg_id"), "status": t.get("status", "todo"),
+                         "title": t.get("title") or "",
+                         "line_start": t.get("start_line"),
+                         "line_end": t.get("end_line")}
+                        for t in trail
+                    ],
+                }
+    raise HTTPException(status_code=404, detail="no reading source for this note")
 
 
 @app.get("/api/reading/file")
