@@ -1,29 +1,32 @@
 import { Component, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
-import type { NoteSection } from '../types'
+import type { ReadingSource } from '../types'
 import { FileViewer } from './FileViewer'
 
-// Right-hand note panel (知识成体系 Phase 1, 2026-09-17).
+// Right-hand note panel — EXACT provenance (round 4, 2026-09-21).
 //
-// For the current card, notes-rag (:8791 via /api/note/sections) returns the
-// top-k matching note SECTIONS. The panel renders the whole matched file
-// (markdown-it + KaTeX) and scrolls+flashes the matched section — "一个笔记
-// ≈ 一个页面, top-3 用 tab 切换" (user spec).
+// For the current card, /api/reading/source returns the TRUE source segment
+// recorded when the card was made (rcards path+seg_id — exact history, no
+// similarity guess). The panel renders the whole source file (markdown-it +
+// KaTeX via the shared FileViewer, corpus-direct /api/reading/file) and
+// scrolls+flashes the segment's [line_start, line_end] range. The breadcrumb
+// walks parent_seg_id up to the seeded root, so a card made from a deep cut
+// still shows its heading lineage.
 //
-// Rendering + anchoring + flash live in the shared FileViewer (extracted
-// 2026-09-19 for 渐进制卡 — the reading panel renders the same way). This
-// component owns the retrieval orchestration: sections fetch, tab switch,
-// stale-request guarding and the status placeholders.
+// Replaces the notes-rag RAG panel (/api/note/sections, top-3 tabs + 匹配度):
+// a 404 here means the card has NO reading provenance (pre-round-4, made in
+// desktop Anki, or source orphaned) — shown as 无来源, deliberately no
+// similarity fallback (「不应该为了历史遗留问题迁就更好的设计」).
 //
-// Fail-soft: sections fetch error → "笔记服务不可用" + retry; no results →
-// "未找到对应笔记". The panel never blocks or breaks the review flow.
+// Fail-soft: fetch error → "来源服务不可用" + retry; 404 → "无来源". The
+// panel never blocks or breaks the review flow.
 
 interface Props {
   noteId: number | null | undefined
   /** changes force a full reset even when noteId is unchanged (card swap) */
   cardKey: number | null
   /** card is on screen but face-down: hold everything back until reveal
-   *  (answer-leak guard, user spec 2026-09-17) — the matched note section
+   *  (answer-leak guard, user spec 2026-09-17) — the source segment
    *  usually contains the answer, so no fetch/scroll/jump may happen before
    *  显示背面. App passes noteId=null while blocked; this flag only drives
    *  the placeholder copy. */
@@ -34,34 +37,29 @@ type Status = 'idle' | 'loading' | 'ready' | 'empty' | 'error'
 
 export const NotePanel: Component<Props> = (props) => {
   const [status, setStatus] = createSignal<Status>('idle')
-  const [sections, setSections] = createSignal<NoteSection[]>([])
-  const [selected, setSelected] = createSignal(0)
+  const [source, setSource] = createSignal<ReadingSource | null>(null)
   // monotonic request token: a stale fetch (card swapped mid-flight) can
   // never overwrite the newer card's state
   let reqToken = 0
 
-  const current = () => sections()[selected()] ?? null
-
   const refresh = () => {
     const noteId = props.noteId
     const token = ++reqToken
-    setSections([])
-    setSelected(0)
+    setSource(null)
     if (!noteId) {
       setStatus('idle')
       return
     }
     setStatus('loading')
     api
-      .noteSections(noteId, 3)
-      .then(d => {
+      .readingSource(noteId)
+      .then(s => {
         if (token !== reqToken) return
-        const secs = d.sections ?? []
-        if (secs.length === 0) {
+        if (s === null) {
           setStatus('empty')
           return
         }
-        setSections(secs)
+        setSource(s)
         setStatus('ready')
       })
       .catch(() => {
@@ -76,29 +74,27 @@ export const NotePanel: Component<Props> = (props) => {
     refresh()
   })
 
-  const onTabChange = (e: Event) => {
-    // @material/web md-tabs exposes activeTabIndex (selectedIndex does NOT
-    // exist — verified 2026-09-17; reading it gave undefined → the handler
-    // silently no-op'd on every click)
-    const tabs = e.currentTarget as HTMLElement & { activeTabIndex?: number }
-    const i = tabs.activeTabIndex ?? 0
-    if (i === selected()) return
-    setSelected(i)
-  }
-
-  const tabLabel = (s: NoteSection) => {
-    const t = s.heading_path[s.heading_path.length - 1] || s.title
-    return t.length > 18 ? t.slice(0, 17) + '…' : t
+  // 文件 · 根标题 › … › 片段标题 (breadcrumb = seeded root → this segment)
+  const crumb = () => {
+    const s = source()
+    if (!s) return ''
+    const file = s.path.replace(/^\d{4}\//, '')
+    const titles = s.breadcrumb
+      .map(b => b.title)
+      .filter(t => t && t.length > 0)
+      // consecutive duplicates (a cut child often keeps the parent's heading)
+      .filter((t, i, arr) => i === 0 || t !== arr[i - 1])
+    return titles.length > 0 ? `${file} · ${titles.join(' › ')}` : file
   }
 
   return (
     <md-elevated-card class="note-panel">
       <div class="note-panel-inner">
       <div class="note-panel-header">
-        <span class="note-panel-title md-typescale-title-small">笔记</span>
-        <Show when={status() === 'ready' && current()}>
-          <span class="note-panel-score md-typescale-label-small">
-            匹配 {Math.round(current()!.score * 100)}%
+        <span class="note-panel-title md-typescale-title-small">笔记来源</span>
+        <Show when={status() === 'ready' && source()?.stale}>
+          <span class="note-panel-score md-typescale-label-small" title="源文件被外部编辑过，片段按指纹重锚失败，范围可能不精确">
+            来源已过期
           </span>
         </Show>
       </div>
@@ -115,7 +111,7 @@ export const NotePanel: Component<Props> = (props) => {
             <>
               先想一想
               <span class="note-panel-hint md-typescale-body-small">
-                显示背面后，这里会定位到对应笔记
+                显示背面后，这里会定位到制卡时的原文片段
               </span>
             </>
           ) : (
@@ -126,38 +122,28 @@ export const NotePanel: Component<Props> = (props) => {
 
       <Show when={status() === 'empty'}>
         <div class="note-panel-state note-panel-empty md-typescale-body-medium">
-          未找到对应笔记
+          无来源
           <span class="note-panel-hint md-typescale-body-small">
-            这张卡可能不是从笔记制的
+            这张卡不是从阅读模式制的
           </span>
         </div>
       </Show>
 
       <Show when={status() === 'error'}>
         <div class="note-panel-state md-typescale-body-medium">
-          笔记服务不可用
+          来源服务不可用
           <md-text-button onClick={() => refresh()}>重试</md-text-button>
         </div>
       </Show>
 
-      <Show when={sections().length > 0}>
-        <md-tabs class="note-tabs" onChange={onTabChange}>
-          {sections().map((s, i) => (
-            <md-primary-tab selected={i === selected()}>
-              <span class="note-tab-label">{tabLabel(s)}</span>
-            </md-primary-tab>
-          ))}
-        </md-tabs>
-        <Show when={status() === 'ready' && current()}>
-          <div class="note-crumb md-typescale-label-small">
-            {current()!.file.replace(/^\d{4}\//, '')} · {current()!.heading_path.join(' › ')}
-          </div>
-        </Show>
+      <Show when={status() === 'ready' && source()}>
+        <div class="note-crumb md-typescale-label-small">{crumb()}</div>
         <FileViewer
-          path={status() === 'ready' ? current()?.file ?? null : null}
-          anchorLine={current()?.line_start ?? null}
-          anchorToken={`${selected()}-${current()?.line_start}`}
-          fetchFile={api.notesRaw}
+          path={source()!.path}
+          anchorLine={source()!.line_start}
+          anchorEndLine={source()!.line_end}
+          anchorToken={source()!.seg_id}
+          fetchFile={api.readingFile}
           class="note-body md-typescale-body-medium"
           onError={() => setStatus('error')}
         />

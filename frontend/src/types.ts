@@ -169,22 +169,28 @@ export interface NoteResponse {
   tags: string[]
 }
 
-/** One retrieved note section for the right-hand note panel (notes-rag
- * :8791 via /api/note/sections). line_start is the 1-based source line of
- * the section's heading — the panel scrolls+flashes [data-src-line] there. */
-export interface NoteSection {
-  file: string
+/** Exact card→source provenance (round 4): GET /api/reading/source.
+ * The segment recorded in rcards when the card was made — no similarity
+ * guess. breadcrumb walks parent_seg_id from the seeded root down to this
+ * segment (cut lineage). stale = the source file was edited externally and
+ * the fingerprint re-anchor failed, so line numbers may be inexact. */
+export interface ReadingSourceCrumb {
+  seg_id: number
+  status: string
   title: string
-  heading_path: string[]
-  line_start: number
-  line_end: number
-  year: number | null
-  score: number
-  snippet: string
+  line_start: number | null
+  line_end: number | null
 }
 
-export interface NoteSectionsResponse {
-  sections: NoteSection[]
+export interface ReadingSource {
+  path: string
+  seg_id: number
+  status: string
+  stale: boolean
+  line_start: number
+  line_end: number
+  text: string
+  breadcrumb: ReadingSourceCrumb[]
 }
 
 export interface NoteUpdateResponse {

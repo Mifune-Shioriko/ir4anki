@@ -2,7 +2,6 @@ import type {
   AnswerResponse,
   MoreResponse,
   NoteResponse,
-  NoteSectionsResponse,
   NoteUpdateResponse,
   PreviewActResponse,
   PreviewStartResponse,
@@ -10,6 +9,7 @@ import type {
   ReadingActResponse,
   ReadingCorpusFile,
   ReadingCreatedCard,
+  ReadingSource,
   ReadingStartResponse,
   ReadingStateResponse,
   ReadingStatusResponse,
@@ -59,10 +59,6 @@ export const api = {
   undo: () => post<UndoResponse>('/api/undo'),
   note: (cardId: number) => get<NoteResponse>(`/api/note?card_id=${cardId}`),
   tags: () => get<{ tags: string[] }>('/api/tags'),
-  noteSections: (noteId: number, topK = 3) =>
-    get<NoteSectionsResponse>(`/api/note/sections?note_id=${noteId}&top_k=${topK}`),
-  notesRaw: (path: string) =>
-    get<{ path: string; text: string }>(`/api/notes/raw?path=${encodeURIComponent(path)}`),
   updateNote: (cardId: number, fields: Record<string, string>, tags: string[]) =>
     post<NoteUpdateResponse>('/api/note/update', { card_id: cardId, fields, tags }),
   previewStart: (mode?: string) =>
@@ -116,6 +112,12 @@ export const api = {
         `&chunk_key=${encodeURIComponent(chunkKey)}&action=${action}`,
     ),
   readingFinish: () => post<{ ok: boolean; stats?: object }>('/api/reading/finish'),
+  /** Exact card→source provenance (round 4). 404 = the card has no reading
+   *  source (pre-r4 / desktop-Anki / orphaned) → null, NOT an error. */
+  readingSource: (noteId: number): Promise<ReadingSource | null> =>
+    fetch(`/api/reading/source?note_id=${noteId}`).then(r =>
+      r.status === 404 ? null : parse<ReadingSource>(r),
+    ),
   readingCards: (noteIds: number[]) =>
     get<{ cards: ReadingCreatedCard[]; degraded?: boolean }>(
       `/api/reading/cards?notes=${noteIds.join(',')}`,

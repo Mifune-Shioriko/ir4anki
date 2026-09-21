@@ -27,10 +27,15 @@ interface Props {
   path: string | null
   /** 1-based source line to scroll+flash; null = no anchoring */
   anchorLine: number | null
+  /** optional 1-based END line (inclusive): flash every block whose
+   *  [data-src-line] falls inside [anchorLine, anchorEndLine] instead of
+   *  just the anchor heading's section. Exact-provenance panel (round 4)
+   *  passes the segment's full range; heading-only callers omit it. */
+  anchorEndLine?: number | null
   /** bump to re-fire the anchor effect for the same path+line (tab switch) */
   anchorToken?: unknown
-  /** fetcher: NotePanel → /api/notes/raw (notes-rag relay),
-   *  reading panel → /api/reading/file (corpus-direct) */
+  /** fetcher: NotePanel → /api/reading/file (corpus-direct),
+   *  reading panel → /api/reading/file */
   fetchFile: (path: string) => Promise<{ text: string }>
   class?: string
   onError?: () => void
@@ -104,6 +109,7 @@ export const FileViewer: Component<Props> = (props) => {
   createEffect(() => {
     const h = html()
     const line = props.anchorLine
+    const endLine = props.anchorEndLine ?? null
     const tok = props.anchorToken
     void tok
     if (!h || line == null) return
@@ -114,11 +120,32 @@ export const FileViewer: Component<Props> = (props) => {
       const anchor = findAnchor(root, line)
       if (!anchor) return
       anchor.scrollIntoView({ behavior: 'smooth', block: 'start' })
-      const els: HTMLElement[] = [anchor]
-      let n = anchor.nextElementSibling as HTMLElement | null
-      while (n && !n.hasAttribute('data-src-line')) {
-        els.push(n)
-        n = n.nextElementSibling as HTMLElement | null
+      const els: HTMLElement[] = []
+      if (endLine == null) {
+        // section mode: the anchor heading + following siblings up to the
+        // next [data-src-line] (original NotePanel idiom)
+        els.push(anchor)
+        let n = anchor.nextElementSibling as HTMLElement | null
+        while (n && !n.hasAttribute('data-src-line')) {
+          els.push(n)
+          n = n.nextElementSibling as HTMLElement | null
+        }
+      } else {
+        // range mode (exact provenance, round 4): anchor heading + siblings
+        // until a heading PAST endLine — only headings carry [data-src-line],
+        // so body blocks belong to their preceding heading. A segment that
+        // starts mid-section (split child) flashes from the closest heading
+        // at-or-before line_start, same fallback as the scroll anchor.
+        els.push(anchor)
+        let n = anchor.nextElementSibling as HTMLElement | null
+        while (n) {
+          if (n.hasAttribute('data-src-line')) {
+            const l = parseInt(n.dataset.srcLine || '0', 10)
+            if (l > endLine) break
+          }
+          els.push(n)
+          n = n.nextElementSibling as HTMLElement | null
+        }
       }
       els.forEach(el => el.classList.add('note-hl'))
       if (flashTimer) clearTimeout(flashTimer)
