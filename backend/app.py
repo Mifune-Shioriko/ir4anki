@@ -78,8 +78,6 @@ from pydantic import BaseModel
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ANKICONNECT = os.getenv("ANKICONNECT_URL", "http://127.0.0.1:8765")
-ANKI_RAG = os.getenv("ANKI_RAG_URL", "http://127.0.0.1:8789")
-ANKI_EXPLAIN = os.getenv("ANKI_EXPLAIN_URL", "http://127.0.0.1:8788")
 NOTES_RAG = os.getenv("NOTES_RAG_URL", "http://127.0.0.1:8791")
 
 # Anki collection.media directory (served back at /media/<name>)
@@ -436,10 +434,10 @@ async def restore_round_cards(rd: dict) -> list[dict]:
 # ---- card helpers --------------------------------------------------------
 
 class _TextExtractor(HTMLParser):
-    """Strip HTML to plain text (anki-rag lookup keys are plain 正面 text).
+    """Strip HTML to plain text (used by the empty-field card guard).
 
     Skips <style>/<script> content — rendered Anki questions embed the
-    card CSS in a <style> block, which must not pollute the lookup key.
+    card CSS in a <style> block, which must not pollute the extracted text.
     """
 
     _SKIP = {"style", "script"}
@@ -474,41 +472,10 @@ def html_to_text(html: str) -> str:
     return p.text()
 
 
-async def fetch_similar(question_html: str, top_k: int = 3) -> list[dict]:
-    """Ask anki-rag for similar cards (server-side; template JS doesn't run here).
-
-    Fail-soft: any error or timeout returns [] so review never breaks.
-    """
-    q = html_to_text(question_html)
-    if not q:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(
-                f"{ANKI_RAG}/search", params={"query": q, "top_k": top_k}
-            )
-            r.raise_for_status()
-            return r.json().get("results", [])
-    except Exception:
-        return []
-
-
-async def fetch_explanation(note_id: int | None) -> str:
-    """Ask anki-explain (:8788) for the AI explanation of this note.
-
-    Exact lookup by note id (AnkiConnect cardsInfo returns it as "note").
-    Fail-soft like fetch_similar: any error returns "".
-    """
-    if not note_id:
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            r = await client.get(f"{ANKI_EXPLAIN}/note/{note_id}")
-            r.raise_for_status()
-            d = r.json()
-            return d.get("explanation", "") if d.get("found") else ""
-    except Exception:
-        return ""
+# anki-rag (similar cards, :8789) and anki-explain (AI explanations, :8788)
+# were RETIRED 2026-09-21 (user decision: RAG 匹配准确度达不到要求, explain
+# 没用). The left column's 相关卡片 list is EXACT segment provenance
+# (/api/reading/source cards_created), not similarity search.
 
 
 async def fetch_note_sections(note_id: int | None, top_k: int = 3) -> list[dict]:
@@ -561,15 +528,10 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
                 "due": info["due"],
             }
         )
-    # enrich with similar cards + AI explanations in parallel (local
-    # lookups, fast). NOTE: priorKnowledge enrichment removed 2026-09-17
-    # (anki-prior-knowledge project retired at user request — block judged
-    # not useful during actual reviews).
-    similars = await asyncio.gather(*(fetch_similar(c["question"]) for c in out))
-    explanations = await asyncio.gather(*(fetch_explanation(c["noteId"]) for c in out))
-    for card, sim, expl in zip(out, similars, explanations):
-        card["similar"] = sim
-        card["explanation"] = expl
+    # NOTE: similar-cards (anki-rag) + AI explanation (anki-explain)
+    # enrichment removed 2026-09-21 (both projects retired at user request —
+    # 相关卡片 moved to the left column as EXACT segment provenance;
+    # priorKnowledge enrichment was already removed 2026-09-17).
     return out
 
 
@@ -2401,7 +2363,26 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     }
 
 
-def _chunk_payload(ch: dict, key: str, st: dict, summary: dict) -> dict:
+def _chunk_payload(ch: dict, key: str, st: dict, summary: dict,
+                   segs_by_id: dict | None = None) -> dict:
+    # ancestor cards (三栏左栏「相关卡片」, 2026-09-21): a split parent
+    # KEEPS the cards made against its pre-cut range (provenance rule), so a
+    # child segment's "same-content cards" = its own + every ancestor's
+    # cards_created. Surfacing them in the reading UI is what stops
+    # duplicate card-making after a cut (the job anki-rag used to do badly).
+    ancestor_cards: list[int] = []
+    if segs_by_id:
+        pid = st.get("parent_seg_id")
+        seen: set = set()
+        while pid is not None and pid not in seen:
+            seen.add(pid)
+            p = segs_by_id.get(pid)
+            if p is None:
+                break
+            for nid in p.get("cards_created") or []:
+                if nid not in ancestor_cards:
+                    ancestor_cards.append(nid)
+            pid = p.get("parent_seg_id")
     return {
         "path": ch["file"],
         "chunk_key": key,
@@ -2414,6 +2395,7 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict) -> dict:
         "text": ch["text"],
         "status": st.get("status", "todo"),
         "cards_created": list(st.get("cards_created") or []),
+        "ancestor_cards": ancestor_cards,
         "file_chunks": summary.get("total_chunks", 0),
         "file_done": summary.get("done", 0),
         "file_skipped": summary.get("skipped", 0),
@@ -2993,24 +2975,27 @@ def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[
     gated = gated or set()
     payloads: list[dict] = []
     dealt: set[tuple[str, str]] = set()
-    # views = [path, ordered, summary] per dealable file
+    # views = [path, ordered, summary, segs_by_id] per dealable file —
+    # segs_by_id resolves parent_seg_id chains for ancestor_cards
     views: list[list] = []
     for entry in data.get("list", []):
         ordered, summary = _file_view(entry, gated)  # may migrate (caller saves)
         if not ordered or not summary.get("frontier"):
             continue
-        views.append([entry.get("path", ""), ordered, summary])
+        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
+        views.append([entry.get("path", ""), ordered, summary, segs_by_id])
 
     def _dealable(path: str, key: str, st: dict) -> bool:
         return st.get("status", "todo") not in (
             "done", "skipped", "background", "container"
         ) and (path, key) not in gated
 
-    def _take(path: str, ch: dict, key: str, st: dict, summary: dict) -> None:
-        payloads.append(_chunk_payload(ch, key, st, summary))
+    def _take(path: str, ch: dict, key: str, st: dict, summary: dict,
+              segs_by_id: dict) -> None:
+        payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
         dealt.add((path, key))
 
-    for path, ordered, summary in views:  # phase 0: active resurfaces first
+    for path, ordered, summary, by_id in views:  # phase 0: active first
         for ch, key, st in ordered:
             if len(payloads) >= per_round:
                 break
@@ -3019,8 +3004,8 @@ def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[
                 and (path, key) not in dealt
                 and (path, key) not in gated
             ):
-                _take(path, ch, key, st, summary)
-    for path, ordered, summary in views:  # phase 1: frontier per file
+                _take(path, ch, key, st, summary, by_id)
+    for path, ordered, summary, by_id in views:  # phase 1: frontier per file
         if len(payloads) >= per_round:
             break
         for ch, key, st in ordered:
@@ -3029,15 +3014,15 @@ def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[
             # the frontier is dealt exactly once — if phase 0 already took
             # it (active), this file contributes nothing to the breadth pass
             if (path, key) not in dealt:
-                _take(path, ch, key, st, summary)
+                _take(path, ch, key, st, summary, by_id)
             break
-    for path, ordered, summary in views:  # phase 2: deepen, priority order
+    for path, ordered, summary, by_id in views:  # phase 2: deepen, priority order
         for ch, key, st in ordered:
             if len(payloads) >= per_round:
                 return payloads
             if (path, key) in dealt or not _dealable(path, key, st):
                 continue
-            _take(path, ch, key, st, summary)
+            _take(path, ch, key, st, summary, by_id)
     return payloads
 
 
@@ -3073,7 +3058,8 @@ def _reading_round_payload(data: dict) -> dict | None:
         if match is None:
             continue
         ch, key, st = match
-        pending_chunks.append(_chunk_payload(ch, key, st, summary))
+        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
+        pending_chunks.append(_chunk_payload(ch, key, st, summary, segs_by_id))
     dropped = len(rd.get("pending", [])) - len(pending_chunks)
     if dropped:
         rd["done"] = rd.get("done", 0) + dropped
@@ -3631,21 +3617,45 @@ async def reading_split(body: ReadingSplitBody):
         parent["status"] = "container"
         parent["updated_at"] = now
         segs.extend(children)
-        # the parent may be mid-round: replace it in pending with its todo
-        # children so the round doesn't strand on a container
+        # the parent may be mid-round: REPLACE it in pending with its todo
+        # children (in place — the split children take the parent's position
+        # so a mid-round split lands on the new smaller cards immediately)
+        # so the round doesn't strand on a container
         rd = data.get("round")
         if isinstance(rd, dict) and rd.get("status") == "active":
             pend = rd.get("pending", [])
             key = str(parent["seg_id"])
-            if any(p.get("path") == body.path and p.get("chunk_key") == key for p in pend):
-                pend = [p for p in pend
-                        if not (p.get("path") == body.path and p.get("chunk_key") == key)]
-                for c in children:
-                    if c["status"] == "todo":
-                        pend.append({"path": body.path, "chunk_key": str(c["seg_id"])})
+            at = next(
+                (i for i, p in enumerate(pend)
+                 if p.get("path") == body.path and p.get("chunk_key") == key),
+                None,
+            )
+            if at is not None:
+                todo_children = [
+                    {"path": body.path, "chunk_key": str(c["seg_id"])}
+                    for c in children if c["status"] == "todo"
+                ]
+                pend[at : at + 1] = todo_children
                 rd["pending"] = pend
                 rd["total"] = rd.get("done", 0) + len(pend)
         _reading_write(data)
+        # full chunk payloads for the todo children (三栏前端, 2026-09-21):
+        # the caller replaces the on-screen parent chunk with these IN PLACE
+        # (reading round splice / trace detour), no extra round-trip needed.
+        ordered_new, summary_new = _file_view(entry)
+        by_key = {key: (ch, st) for ch, key, st in (ordered_new or [])}
+        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
+        child_payloads = []
+        for c in children:
+            if c["status"] != "todo":
+                continue
+            hit = by_key.get(str(c["seg_id"]))
+            if hit is None:
+                continue
+            ch, st = hit
+            child_payloads.append(
+                _chunk_payload(ch, str(c["seg_id"]), st, summary_new, segs_by_id)
+            )
         return {
             "ok": True,
             "parent_seg_id": parent["seg_id"],
@@ -3654,6 +3664,7 @@ async def reading_split(body: ReadingSplitBody):
                  "end_line": c["end_line"], "status": c["status"]}
                 for c in children
             ],
+            "child_chunks": child_payloads,
         }
 
 
@@ -3803,11 +3814,22 @@ async def reading_source(note_id: int):
                     "line_start": a,
                     "line_end": b,
                     "text": "\n".join(lines[a - 1 : b]) if lines else "",
+                    # every note id created from THIS segment (三栏左栏
+                    # 「相关卡片」, 2026-09-21) — feed to /api/reading/cards
+                    "cards_created": list(s.get("cards_created") or []),
                     "breadcrumb": [
-                        {"seg_id": t.get("seg_id"), "status": t.get("status", "todo"),
-                         "title": t.get("title") or "",
-                         "line_start": t.get("start_line"),
-                         "line_end": t.get("end_line")}
+                        {
+                            "seg_id": t.get("seg_id"),
+                            "status": t.get("status", "todo"),
+                            "title": t.get("title") or "",
+                            "line_start": t.get("line_start"),
+                            "line_end": t.get("line_end"),
+                            # full sibling list per crumb so the left column
+                            # can show 同一片段的卡片 for cards made against
+                            # an ANCESTOR (pre-split provenance rule):
+                            # the container keeps the cards forever
+                            "cards_created": list(t.get("cards_created") or []),
+                        }
                         for t in trail
                     ],
                 }

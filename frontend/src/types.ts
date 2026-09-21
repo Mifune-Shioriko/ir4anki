@@ -1,11 +1,5 @@
 // Wire shapes of the review-app FastAPI backend (app.py).
 
-export interface SimilarCard {
-  question: string
-  answer?: string
-  score: number
-}
-
 export interface Card {
   cardId: number
   noteId?: number
@@ -16,9 +10,6 @@ export interface Card {
   css: string
   isNew: boolean
   due: number
-  similar?: SimilarCard[]
-  /** AI-generated explanation from anki-explain (:8788); "" when missing */
-  explanation?: string
 }
 
 export interface RoundInfo {
@@ -172,14 +163,17 @@ export interface NoteResponse {
 /** Exact card→source provenance (round 4): GET /api/reading/source.
  * The segment recorded in rcards when the card was made — no similarity
  * guess. breadcrumb walks parent_seg_id from the seeded root down to this
- * segment (cut lineage). stale = the source file was edited externally and
- * the fingerprint re-anchor failed, so line numbers may be inexact. */
+ * segment (cut lineage), each crumb carrying its own cards_created so the
+ * left column can merge pre-split cards (a container keeps provenance
+ * forever). stale = the source file was edited externally and the
+ * fingerprint re-anchor failed, so line numbers may be inexact. */
 export interface ReadingSourceCrumb {
   seg_id: number
   status: string
   title: string
   line_start: number | null
   line_end: number | null
+  cards_created: number[]
 }
 
 export interface ReadingSource {
@@ -190,7 +184,27 @@ export interface ReadingSource {
   line_start: number
   line_end: number
   text: string
+  /** every note id created from this exact segment (左栏「相关卡片」) */
+  cards_created: number[]
   breadcrumb: ReadingSourceCrumb[]
+}
+
+/** POST /api/reading/split (round 4): parent → container + 2k+1 children
+ * (selected ranges todo, gaps background). Pure DB op, the .md is untouched. */
+export interface ReadingSplitChild {
+  seg_id: number
+  start_line: number
+  end_line: number
+  status: 'todo' | 'background'
+}
+
+export interface ReadingSplitResponse {
+  ok: boolean
+  parent_seg_id: number
+  children: ReadingSplitChild[]
+  /** full chunk payloads of the todo children — replace the on-screen
+   *  parent with these in place (no re-deal needed) */
+  child_chunks: ReadingChunk[]
 }
 
 export interface NoteUpdateResponse {
@@ -202,13 +216,21 @@ export interface NoteUpdateResponse {
 // ---- reading mode (渐进制卡, user spec 2026-09-19) ----
 
 /** Chunk state machine (human-marked): todo → active(正在制卡) →
- * done(制卡完成), or skipped(无需制卡) from todo/active. */
-export type ReadingChunkStatus = 'todo' | 'active' | 'done' | 'skipped'
+ * done(制卡完成), or skipped(无需制卡) from todo/active. Round 4 adds
+ * background (un-scheduled context from a cut — reversible via promote)
+ * and container (a cut parent — read-only history/anchor). Only
+ * todo/active are ever dealt into a round; the others appear in trace
+ * detours (溯源) and status payloads. */
+export type ReadingChunkStatus =
+  | 'todo' | 'active' | 'done' | 'skipped'
+  | 'background' | 'container'
 
 /** One dealt reading chunk (wire shape of /api/reading/start chunks). */
 export interface ReadingChunk {
   path: string
   chunk_key: string
+  seg_id: number | null
+  parent_seg_id: number | null
   title: string
   heading_path: string[]
   line_start: number
@@ -216,6 +238,9 @@ export interface ReadingChunk {
   text: string
   status: ReadingChunkStatus
   cards_created: number[]
+  /** note ids created from ANCESTOR segments before a split (a container
+   *  keeps provenance forever) — shown in the left 相关卡片 column too */
+  ancestor_cards: number[]
   file_chunks: number
   file_done: number
   file_skipped: number

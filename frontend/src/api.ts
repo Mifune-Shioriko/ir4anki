@@ -10,6 +10,7 @@ import type {
   ReadingCorpusFile,
   ReadingCreatedCard,
   ReadingSource,
+  ReadingSplitResponse,
   ReadingStartResponse,
   ReadingStateResponse,
   ReadingStatusResponse,
@@ -122,6 +123,14 @@ export const api = {
     get<{ cards: ReadingCreatedCard[]; degraded?: boolean }>(
       `/api/reading/cards?notes=${noteIds.join(',')}`,
     ),
+  /** 分割文段 (round 4): selected line ranges become todo children, gaps
+   *  become background; the parent becomes a container. selections =
+   *  1-based inclusive line ranges inside the file. */
+  readingSplit: (
+    path: string,
+    segId: number,
+    selections: { start_line: number; end_line: number }[],
+  ) => post<ReadingSplitResponse>('/api/reading/split', { path, seg_id: segId, selections }),
   readingListAdd: (path: string) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
   readingListRemove: (path: string) =>

@@ -52,7 +52,19 @@ function findAnchor(root: HTMLElement, line: number): HTMLElement | null {
       bestLine = l
     }
   }
-  return best
+  if (!best) return null
+  // Climb to the TOP-LEVEL tagged block (2026-09-21: every block now carries
+  // data-src-line, not just headings — a nested li/td anchor would dead-end
+  // the sibling walk in range mode and scroll inside its list instead of to
+  // the section). The parent's data-src-line is always <= the child's, so
+  // the <= line contract holds.
+  let top = best
+  while (top.parentElement && top.parentElement !== root) {
+    const p = top.parentElement.closest<HTMLElement>('[data-src-line]')
+    if (!p || p === root) break
+    top = p
+  }
+  return top
 }
 
 export const FileViewer: Component<Props> = (props) => {

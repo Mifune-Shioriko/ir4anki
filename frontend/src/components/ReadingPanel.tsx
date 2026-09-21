@@ -31,6 +31,7 @@ export const ReadingPanel: Component<Props> = (props) => {
         <FileViewer
           path={props.chunk.path}
           anchorLine={props.chunk.line_start}
+          anchorEndLine={props.chunk.line_end}
           anchorToken={props.chunk.chunk_key}
           fetchFile={api.readingFile}
           class="note-body md-typescale-body-medium"

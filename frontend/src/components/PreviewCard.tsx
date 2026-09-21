@@ -3,8 +3,8 @@ import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
-import { KATEX_OPTS, textWithMath } from '../lib/math'
-import { IconAdd, IconDelete, IconEdit, IconUndo } from './icons'
+import { KATEX_OPTS } from '../lib/math'
+import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconUndo } from './icons'
 
 // Preview card (先看后考, 2026-09-07 redesign): the question shows first and
 // the answer stays HIDDEN until the user reveals it — a low-stakes retrieval
@@ -14,12 +14,20 @@ import { IconAdd, IconDelete, IconEdit, IconUndo } from './icons'
 // defer (明天再看). Approve is only enabled after reveal: "已看完" must
 // mean the card was actually seen.
 //
+// 三栏重构 (user spec 2026-09-21): AI-explanation + similar-cards blocks
+// GONE (anki-explain / anki-rag retired); 相关卡片 moved to the LEFT column.
+// 溯源 added to the header icon row (same as Flashcard): jump to the card's
+// source segment as a temporary reading detour; disabled (置灰) for orphans.
+//
 // MD3: md-elevated-card container, sys color tokens only, md-typescale
 // classes for text. Same visual lineage as Flashcard so the app reads as
 // one product; a "预览" assist chip marks the mode.
 interface Props {
   card: Card
   revealed: boolean
+  /** card has reading provenance — false greys out 溯源 */
+  traceAvailable: boolean
+  onTrace: () => void
   onReveal: () => void
   onApprove: () => void
   onDefer: () => void
@@ -54,10 +62,9 @@ export const PreviewCard: Component<Props> = (props) => {
 
   const answerHtml = () => {
     const parts = props.card.answer.split(/<hr id="?answer"?>?/i)
-    return cleanCardHtml(parts.length > 1 ? parts.slice(1).join('') : props.card.answer)
+    return cleanCardHtml(parts.length > 1 ? parts.slice(1).join('') : parts[0])
   }
   const questionHtml = () => cleanCardHtml(props.card.question)
-  const sims = () => props.card.similar || []
 
   return (
     <div class="flashcard-wrapper">
@@ -79,6 +86,14 @@ export const PreviewCard: Component<Props> = (props) => {
               <md-icon-button aria-label="编辑卡片" onClick={() => props.onEdit()}>
                 <md-icon><IconEdit /></md-icon>
               </md-icon-button>
+              <md-icon-button
+                aria-label="溯源：回到制卡时的原文片段"
+                title={props.traceAvailable ? '溯源：回到制卡时的原文片段' : '这张卡没有阅读来源'}
+                disabled={!props.traceAvailable}
+                onClick={() => props.onTrace()}
+              >
+                <md-icon><IconFindInPage /></md-icon>
+              </md-icon-button>
               <div class="header-actions-sep" aria-hidden="true" />
               <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>
                 <md-icon><IconAdd /></md-icon>
@@ -88,7 +103,6 @@ export const PreviewCard: Component<Props> = (props) => {
               </md-icon-button>
             </div>
           </div>
-
           {/* question — always visible; answer only after reveal (2026-09-07) */}
           <div
             class="card-content card-question"
@@ -100,40 +114,6 @@ export const PreviewCard: Component<Props> = (props) => {
             <>
               <md-divider class="card-divider" />
               <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
-
-              {props.card.explanation && (
-                <div class="explain-section">
-                  <div class="explain-title md-typescale-label-medium">
-                    AI 讲解
-                  </div>
-                  <div
-                    class="explain-text md-typescale-body-medium"
-                    innerHTML={textWithMath(props.card.explanation)}
-                  />
-                </div>
-              )}
-
-              {sims().length > 0 && (
-                <div class="similar-section">
-                  <div class="similar-title md-typescale-label-medium">相关卡片</div>
-                  {sims().map(s => (
-                    <div class="similar-item">
-                      <div class="similar-q md-typescale-body-medium">
-                        <span innerHTML={textWithMath(s.question)} />
-                        <span class="similar-score md-typescale-label-small">
-                          相似 {Math.round(s.score * 100)}%
-                        </span>
-                      </div>
-                      {s.answer && (
-                        <div
-                          class="similar-a md-typescale-body-small"
-                          innerHTML={textWithMath(s.answer)}
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
             </>
           )}
 

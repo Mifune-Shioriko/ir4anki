@@ -45,6 +45,14 @@ const P_Folder = ['M140-160q-24 0-42-18.5T80-220v-520q0-23 18-41.5t42-18.5h281l6
 const P_School = ['M479-120 189-279v-240L40-600l439-240 441 240v317h-60v-282l-91 46v240L479-120Zm0-308 315-172-315-169-313 169 313 172Zm0 240 230-127v-168L479-360 249-485v170l230 127Zm1-240Zm-1 74Zm0 0Z']
 const P_Description = ['M319-250h322v-60H319v60Zm0-170h322v-60H319v60ZM220-80q-24 0-42-18t-18-42v-680q0-24 18-42t42-18h361l219 219v521q0 24-18 42t-42 18H220Zm331-554v-186H220v680h520v-494H551ZM220-820v186-186 680-680Z']
 const P_ChevronRight = ['M530-481 332-679l43-43 241 241-241 241-43-43 198-198Z']
+// 三栏重构 (user spec 2026-09-21): content_cut = 分割文段 (split a chunk
+// into smaller reading cards), find_in_page = 溯源 (jump from a review card
+// back to its source segment), arrow_back = 回到复习 (return from the
+// traced reading detour). Official Material Symbols outlined paths
+// (@material-symbols/svg-400 0.47.4).
+const P_ContentCut = ['M782-114 481-415 364-298q11 17 13.5 33t2.5 35q0 64-43 107T230-80q-64 0-107-43T80-230q0-64 43-107t107-43q18 0 35.5 5t36.5 15l116-116-118-118q-17 8-34.5 11t-35.5 3q-64 0-107-43T80-730q0-64 43-107t107-43q64 0 107 43t43 107q0 19-2.5 36T367-662l514 514v34h-99ZM599-527l-66-66 249-249h99v33L599-527ZM294-666q26-26 26-64t-26-64q-26-26-64-26t-64 26q-26 26-26 64t26 64q26 26 64 26t64-26Zm202.5 203.5Q502-468 502-476t-5.5-13.5Q491-495 483-495t-13.5 5.5Q464-484 464-476t5.5 13.5Q475-457 483-457t13.5-5.5ZM294-166q26-26 26-64t-26-64q-26-26-64-26t-64 26q-26 26-26 64t26 64q26 26 64 26t64-26Z']
+const P_FindInPage = ['m652-140 60 60H220q-24 0-42-18t-18-42v-680q0-24 18-42t42-18h372l208 239v487q0 14-7.5 28.5T774-102L562-314q-20 12-39.68 17-19.69 5-42.32 5-62 0-104.5-42.5T333-439q0-62 42.5-104.5T480-586q62 0 104.5 42.5T627-439q0 23-6.5 44T601-358l139 139v-403L568-820H220v680h432ZM542.5-381.5Q567-411 567-450q0-33-26-54.5T480-526q-35 0-61 21.5T393-450q0 39 24.5 68.5T480-352q38 0 62.5-29.5ZM480-450Zm0 0Z']
+const P_ArrowBack = ['m274-450 248 248-42 42-320-320 320-320 42 42-248 248h526v60H274Z']
 
 export interface IconProps { size?: number }
 
@@ -87,3 +95,6 @@ export const IconFolder = (props: IconProps) => <Svg paths={P_Folder} {...props}
 export const IconDescription = (props: IconProps) => <Svg paths={P_Description} {...props} />
 export const IconChevronRight = (props: IconProps) => <Svg paths={P_ChevronRight} {...props} />
 export const IconSchool = (props: IconProps) => <Svg paths={P_School} {...props} />
+export const IconContentCut = (props: IconProps) => <Svg paths={P_ContentCut} {...props} />
+export const IconFindInPage = (props: IconProps) => <Svg paths={P_FindInPage} {...props} />
+export const IconArrowBack = (props: IconProps) => <Svg paths={P_ArrowBack} {...props} />

@@ -3,8 +3,8 @@ import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
-import { KATEX_OPTS, textWithMath } from '../lib/math'
-import { IconAdd, IconDelete, IconEdit, IconRestartAlt, IconUndo } from './icons'
+import { KATEX_OPTS } from '../lib/math'
+import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconRestartAlt, IconUndo } from './icons'
 
 // The study card. Uses <md-elevated-card> (labs/card) — the REAL card
 // component. The previous version misused <md-elevation> (a decorative
@@ -15,15 +15,22 @@ import { IconAdd, IconDelete, IconEdit, IconRestartAlt, IconUndo } from './icons
 // (hardcoded white/black CSS) and <script> (desktop-only localhost fetches)
 // blocks are stripped so only field content renders.
 //
-// Math: \(…\) / $$…$$ in card content and similar-card answers are rendered
-// with KaTeX (auto-render on the innerHTML-owned zones, renderToString for
-// the Solid-managed similar-card nodes).
+// Math: \(…\) / $$…$$ in card content is rendered with KaTeX (auto-render
+// on the innerHTML-owned zone).
 //
-// Similar cards: flat inline list under the answer, hidden until reveal,
-// NOT collapsible (user spec).
+// 三栏重构 (user spec 2026-09-21): the AI-explanation (anki-explain) and
+// similar-cards (anki-rag) blocks are GONE from under the answer — 相关卡片
+// (same-segment, exact provenance) lives in the LEFT column (RelatedPanel),
+// the note source in the RIGHT column (NotePanel). The header icon row gains
+// 溯源: jump to the card's source segment as a temporary reading detour
+// (disabled for orphan cards — 404 on /api/reading/source).
 interface Props {
   card: Card
   revealed: boolean
+  /** card has reading provenance (resolved by the App via reading/source) —
+   *  false greys out 溯源 (user spec: 置灰, not hidden) */
+  traceAvailable: boolean
+  onTrace: () => void
   onEdit: () => void
   onUndo: () => void
   undoEnabled: boolean
@@ -57,10 +64,9 @@ export const Flashcard: Component<Props> = (props) => {
   // answer HTML = everything after the <hr id=answer> separator if present
   const answerHtml = () => {
     const parts = props.card.answer.split(/<hr id="?answer"?>?/i)
-    return cleanCardHtml(parts.length > 1 ? parts.slice(1).join('') : props.card.answer)
+    return cleanCardHtml(parts.length > 1 ? parts.slice(1).join('') : parts[0])
   }
   const questionHtml = () => cleanCardHtml(props.card.question)
-  const sims = () => props.card.similar || []
 
   return (
     <div class="flashcard-wrapper">
@@ -82,6 +88,14 @@ export const Flashcard: Component<Props> = (props) => {
               <md-icon-button aria-label="编辑卡片" onClick={() => props.onEdit()}>
                 <md-icon><IconEdit /></md-icon>
               </md-icon-button>
+              <md-icon-button
+                aria-label="溯源：回到制卡时的原文片段"
+                title={props.traceAvailable ? '溯源：回到制卡时的原文片段' : '这张卡没有阅读来源'}
+                disabled={!props.traceAvailable}
+                onClick={() => props.onTrace()}
+              >
+                <md-icon><IconFindInPage /></md-icon>
+              </md-icon-button>
               <div class="header-actions-sep" aria-hidden="true" />
               <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>
                 <md-icon><IconAdd /></md-icon>
@@ -102,45 +116,11 @@ export const Flashcard: Component<Props> = (props) => {
             innerHTML={questionHtml()}
           />
 
-          {/* answer + explanation + similar cards — only after reveal */}
+          {/* answer — only after reveal */}
           {props.revealed && (
             <>
               <md-divider class="card-divider" />
               <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
-
-              {props.card.explanation && (
-                <div class="explain-section">
-                  <div class="explain-title md-typescale-label-medium">
-                    AI 讲解
-                  </div>
-                  <div
-                    class="explain-text md-typescale-body-medium"
-                    innerHTML={textWithMath(props.card.explanation)}
-                  />
-                </div>
-              )}
-
-              {sims().length > 0 && (
-                <div class="similar-section">
-                  <div class="similar-title md-typescale-label-medium">相关卡片</div>
-                  {sims().map(s => (
-                    <div class="similar-item">
-                      <div class="similar-q md-typescale-body-medium">
-                        <span innerHTML={textWithMath(s.question)} />
-                        <span class="similar-score md-typescale-label-small">
-                          相似 {Math.round(s.score * 100)}%
-                        </span>
-                      </div>
-                      {s.answer && (
-                        <div
-                          class="similar-a md-typescale-body-small"
-                          innerHTML={textWithMath(s.answer)}
-                        />
-                      )}
-                    </div>
-                  ))}
-                </div>
-              )}
             </>
           )}
 

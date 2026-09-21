@@ -158,11 +158,16 @@ body {
   }
 }
 
-/* ---- two-column layout (知识成体系 Phase 1, 2026-09-17) ----
- * Wide screens (≥1180px): card column keeps its 680px, the note panel takes
- * the remaining width. Narrow screens: .columns is a plain block and the
- * note column is not rendered at all (App gates it on matchMedia), so the
- * phone layout is pixel-identical to before. */
+/* ---- two/three-column layout ----
+ * 知识成体系 Phase 1 (2026-09-17): wide screens (≥1180px) — card column
+ * keeps its 680px, the note panel takes the remaining width.
+ * 三栏重构 (user spec 2026-09-21): ≥1500px adds the LEFT column (相关卡片,
+ * RelatedPanel) — three EQUAL columns, each capped at the card width
+ * (--content-max-width), same height and MD3 elevated-card shell
+ * (「长宽一致，圆角阴影 md3 风格」). Between the breakpoints the layout
+ * degrades to 中+右, then to single-column phone mode (pixel-identical to
+ * the pre-panel era — .columns is a plain block and side columns aren't
+ * rendered at all, App gates them on matchMedia). */
 .columns {
   flex: 1;
   display: flex;
@@ -174,11 +179,22 @@ body {
   padding: 0 var(--content-padding);
 }
 
+.columns--three {
+  /* 3 × card width + 2 × gap + 2 × page padding */
+  max-width: calc(3 * var(--content-max-width) + 2 * 24px + 2 * var(--content-padding));
+}
+
 .columns .content {
   flex: 0 0 var(--content-max-width);
   max-width: var(--content-max-width);
   margin: 0;
   padding: var(--content-padding) 0;
+}
+
+.columns--three .content {
+  /* equal thirds — grow/shrink together, never wider than the card width */
+  flex: 1 1 0;
+  min-width: 0;
 }
 
 /* base .content (applies in BOTH modes — the column rules above only
@@ -205,6 +221,32 @@ body {
   height: calc(100vh - 48px);
   display: flex;
   flex-direction: column;
+}
+
+/* left column 相关卡片 (三栏重构, user spec 2026-09-21): SAME shell as
+ * .note-column — equal width (three equal columns, capped at the card
+ * width), equal height, sticky. The RelatedPanel inside is an
+ * md-elevated-card with the .note-panel treatment, so 圆角阴影/MD3 match
+ * the other two columns by construction. */
+.related-column {
+  flex: 1;
+  min-width: 0;
+  padding: var(--content-padding) 0;
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  height: calc(100vh - 48px);
+  display: flex;
+  flex-direction: column;
+}
+
+/* three-column mode: all three columns are equal thirds, each capped at the
+ * card width (user spec 2026-09-21 「就用现在卡片的那个宽度」) */
+.columns--three .content,
+.columns--three .related-column,
+.columns--three .note-column {
+  flex: 1 1 0;
+  max-width: var(--content-max-width);
 }
 
 @media (max-width: 1179px) {
@@ -302,6 +344,28 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ---- left column 相关卡片 list (三栏重构, user spec 2026-09-21) ----
+ * Scrollable list body of the RelatedPanel — same inset-absolute shell as
+ * NotePanel (.note-panel-inner), items reuse the .similar-item treatment
+ * (flat inline list, surface-container, small corner). The CURRENT card
+ * (review/preview mode) is highlighted with a primary-container tint so the
+ * user can see which of the segment's cards is on screen. */
+.related-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px 24px;
+  scroll-behavior: smooth;
+}
+
+.related-item--self {
+  background: var(--md-sys-color-primary-container);
+}
+
+.related-item--self .similar-score {
+  color: var(--md-sys-color-on-primary-container);
 }
 
 /* the rendered markdown — scroll container is the panel body */
@@ -609,26 +673,12 @@ body {
 /* ---- AI prior knowledge block REMOVED 2026-09-17 (anki-prior-knowledge
    project retired at user request) ---- */
 
-/* ---- AI explanation (anki-explain :8788), shown after reveal ---- */
-.explain-section {
-  margin-top: 16px;
-  padding: 12px 14px;
-  background: var(--md-sys-color-secondary-container);
-  border-radius: var(--md-sys-shape-corner-small, 8px);
-}
+/* ---- AI explanation (anki-explain :8788) REMOVED 2026-09-21 — project
+   retired at user request (三栏重构) ---- */
 
-.explain-title {
-  color: var(--md-sys-color-on-secondary-container);
-  opacity: 0.75;
-  margin-bottom: 6px;
-}
-
-.explain-text {
-  color: var(--md-sys-color-on-secondary-container);
-  line-height: 1.6;
-}
-
-/* ---- similar cards: flat inline list, not collapsible (user spec) ---- */
+/* ---- 相关卡片 items: flat inline list, not collapsible (user spec).
+   .similar-* is now ONLY the left column's exact-provenance list
+   (RelatedPanel) — anki-rag similarity search was retired 2026-09-21. ---- */
 .similar-section {
   margin-top: 20px;
 }
@@ -1230,7 +1280,8 @@ body {
   margin-top: 10px;
 }
 
-.reading-made-item .similar-q span:first-child {
+.reading-made-item .similar-q span:first-child,
+.related-item .similar-q span:first-child {
   /* cloze/qa HTML can be long — let it wrap and shrink instead of pushing
    * the kind badge out of the row */
   min-width: 0;
@@ -1244,8 +1295,11 @@ body {
 }
 
 /* stored cloze fields are HTML now (2026-09-20) — a table chunk renders a
- * real <table> inside the list item; give it the note-body treatment */
-.reading-made-item table {
+ * real <table> inside the list item; give it the note-body treatment.
+ * .related-item (左栏, 2026-09-21) shares the exact same rich-content
+ * styling as the old inline .reading-made-item. */
+.reading-made-item table,
+.related-item table {
   border-collapse: collapse;
   margin: 6px 0;
   font-size: 0.92em;
@@ -1253,22 +1307,27 @@ body {
   overflow-x: auto;
 }
 .reading-made-item th,
-.reading-made-item td {
+.reading-made-item td,
+.related-item th,
+.related-item td {
   border: 1px solid var(--md-sys-color-outline-variant);
   padding: 4px 8px;
   text-align: left;
   vertical-align: top;
 }
-.reading-made-item th {
+.reading-made-item th,
+.related-item th {
   background: var(--md-sys-color-surface-container);
   font-weight: 600;
 }
-.reading-made-item :is(h1, h2, h3, h4, h5, h6) {
+.reading-made-item :is(h1, h2, h3, h4, h5, h6),
+.related-item :is(h1, h2, h3, h4, h5, h6) {
   font-size: 1em;
   font-weight: 600;
   margin: 4px 0;
 }
-.reading-made-item p {
+.reading-made-item p,
+.related-item p {
   margin: 2px 0;
 }
 

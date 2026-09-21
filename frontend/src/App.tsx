@@ -27,14 +27,21 @@ import { ReadingStartScreen } from './components/ReadingStartScreen'
 import { ReadingDoneScreen } from './components/ReadingDoneScreen'
 import { ReadingListScreen } from './components/ReadingListScreen'
 import { NotePanel } from './components/NotePanel'
+import { RelatedPanel } from './components/RelatedPanel'
 import { Snackbar } from './components/Snackbar'
-import type { StudyModes, ReadingChunk, ReadingRoundStats } from './types'
+import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingRoundStats, ReadingSource } from './types'
+import type { SplitSelection } from './lib/split-selection'
 
 // The note panel (知识成体系 Phase 1) only makes sense on a wide screen —
 // the user reviews from phone AND desktop, and on a phone the second column
 // would crush the card. A matchMedia signal (not CSS alone) also stops the
 // sections fetch from firing on narrow viewports.
 const WIDE_QUERY = '(min-width: 1180px)'
+// 三栏重构 (user spec 2026-09-21): the LEFT column (相关卡片 = same-segment
+// cards, exact provenance) needs a third column — ≥1500px shows all three
+// (equal width, capped at the card width); 1180–1499 keeps today's
+// 中+右 two-column layout; below that, phone single column.
+const WIDE3_QUERY = '(min-width: 1500px)'
 
 // Pacing-mode persistence (2026-09-14): the last tier the user picked is
 // remembered across page loads, so the habitual case is one tap ("开始").
@@ -107,8 +114,17 @@ export const App: Component = () => {
   const mq = window.matchMedia(WIDE_QUERY)
   const [isWide, setIsWide] = createSignal(mq.matches)
   const onMq = (e: MediaQueryListEvent) => setIsWide(e.matches)
-  onMount(() => mq.addEventListener('change', onMq))
-  onCleanup(() => mq.removeEventListener('change', onMq))
+  const mq3 = window.matchMedia(WIDE3_QUERY)
+  const [isWide3, setIsWide3] = createSignal(mq3.matches)
+  const onMq3 = (e: MediaQueryListEvent) => setIsWide3(e.matches)
+  onMount(() => {
+    mq.addEventListener('change', onMq)
+    mq3.addEventListener('change', onMq3)
+  })
+  onCleanup(() => {
+    mq.removeEventListener('change', onMq)
+    mq3.removeEventListener('change', onMq3)
+  })
 
   // ---- phase & loading text ----
   const [phase, setPhase] = createSignal<Phase>('loading')
@@ -275,6 +291,124 @@ export const App: Component = () => {
 
   // ---- empty screen ----
   const [emptyDetail, setEmptyDetail] = createSignal('')
+
+  // ---- 溯源 (trace detour, 三栏重构 user spec 2026-09-21) ----
+  // A review/preview card's 溯源 button jumps OUT of the round into a
+  // temporary reading session on the card's source segment: 中栏 = the
+  // chunk (trace variant, no round actions), 左栏 = 相关卡片 of that
+  // segment, 右栏 = whole file anchored at the segment. The underlying
+  // round phase is untouched — 回到复习 (icon, top-right of the chunk card
+  // or Escape) just closes the detour and the suspended card returns in
+  // its exact state (face-up preserved via revealedFor keys).
+  const srcCache = new Map<number, ReadingSource | null>() // noteId → source; null = orphan (404)
+  const [traceSource, setTraceSource] = createSignal<ReadingSource | null>(null)
+  const [traceOpen, setTraceOpen] = createSignal(false)
+  const [traceChunk, setTraceChunk] = createSignal<ReadingChunk | null>(null)
+  // bump to force the left 相关卡片 panel to refetch (after adds/splits)
+  const [relatedToken, setRelatedToken] = createSignal(0)
+
+  const sourceToChunk = (s: ReadingSource): ReadingChunk => {
+    const own = (s.cards_created || []).filter(id => id > 0)
+    const anc: number[] = []
+    for (const b of s.breadcrumb) {
+      for (const id of b.cards_created || []) {
+        if (id > 0 && !own.includes(id) && !anc.includes(id)) anc.push(id)
+      }
+    }
+    const file = s.path.replace(/^\d{4}\//, '').replace(/\.md$/, '')
+    const last = s.breadcrumb[s.breadcrumb.length - 1]
+    return {
+      path: s.path,
+      chunk_key: String(s.seg_id),
+      seg_id: s.seg_id,
+      parent_seg_id: null,
+      title: (last && last.title) || file,
+      heading_path: s.breadcrumb.map(b => b.title).filter(t => !!t),
+      line_start: s.line_start,
+      line_end: s.line_end,
+      text: s.text,
+      status: (s.status as ReadingChunkStatus) || 'todo',
+      cards_created: own,
+      ancestor_cards: anc,
+      file_chunks: 0,
+      file_done: 0,
+      file_skipped: 0,
+    }
+  }
+
+  const openTrace = () => {
+    const s = traceSource()
+    if (!s || traceOpen()) return
+    setTraceChunk(sourceToChunk(s))
+    setTraceOpen(true)
+  }
+  const closeTrace = () => {
+    setTraceOpen(false)
+    setTraceChunk(null)
+  }
+
+  // the chunk the add/cloze/split actions target: the trace detour's chunk
+  // when open, else the reading round's current chunk
+  const activeChunk = () => (traceOpen() ? traceChunk() : rdCurrent())
+
+  // 分割文段 (round-4 split): selection lines are RELATIVE to the chunk
+  // text → shift by line_start-1 for file lines. Selected range → todo
+  // child (a smaller reading card), gaps → background, parent → container.
+  // In-round: children splice into rdChunks at the parent's position (the
+  // backend mirrors this in round.pending) and rdTotal grows. Trace detour:
+  // the detour lands on the first todo child; the round (if any) is
+  // re-fetched afterwards because the traced segment may have been pending
+  // in it (the backend replaced it there too).
+  const doSplit = async (chunk: ReadingChunk, sel: SplitSelection) => {
+    if (chunk.seg_id == null || rdBusy()) return
+    const base = chunk.line_start - 1
+    const selections = [{ start_line: base + sel.start_line, end_line: base + sel.end_line }]
+    const wasTrace = traceOpen()
+    setRdBusy(true)
+    try {
+      const res = await api.readingSplit(chunk.path, chunk.seg_id, selections)
+      const kids = res.child_chunks || []
+      if (kids.length === 0) {
+        showSnack('分割失败：没有产生新片段')
+        return
+      }
+      if (wasTrace) {
+        setTraceChunk(kids[0])
+        // the traced segment may have sat in the active reading round's
+        // pending list — the backend swapped it for the children there, so
+        // rebuild the local mirror (cheap; silent on failure)
+        try {
+          const st = await api.readingState()
+          if (st.round?.status === 'active') {
+            setRdChunks(st.round.chunks ?? [])
+            setRdDone(st.round.done)
+            setRdTotal(st.round.total)
+          }
+        } catch { /* next resync fixes it */ }
+      } else {
+        setRdChunks(prev => {
+          const i = prev.findIndex(
+            c => c.chunk_key === chunk.chunk_key && c.path === chunk.path,
+          )
+          if (i < 0) return prev
+          const next = [...prev]
+          next.splice(i, 1, ...kids)
+          return next
+        })
+        setRdTotal(t => t + kids.length - 1)
+      }
+      setRelatedToken(t => t + 1)
+      showSnack(
+        kids.length === 1
+          ? '已分割出 1 个新片段（未选中部分转入背景，可在阅读清单提升）'
+          : `已分割出 ${kids.length} 个新片段（未选中部分转入背景，可在阅读清单提升）`,
+      )
+    } catch (e) {
+      showSnack('分割失败：' + (e as Error).message)
+    } finally {
+      setRdBusy(false)
+    }
+  }
 
   // ---- MD3 snackbar (transient feedback, 2026-09-16) ----
   // Currently used by the double-Again auto-return: the card silently left
@@ -560,13 +694,21 @@ export const App: Component = () => {
   // frontend just mirrors that locally — same splice pattern as answer().
 
   const openAdd = () => {
-    setAddSource(null)
+    // provenance inheritance (r4, backend docstring: 卡 a 复习时制的卡 b
+    // 也归到 a 的片段): when the on-screen card has a reading source, the
+    // new card joins that segment — it then shows up in the left column's
+    // 相关卡片 list and participates in the preview-pool gate like any
+    // segment-born card. Orphan card / no source → plain add.
+    const s = traceSource()
+    setAddSource(s ? { path: s.path, chunk_key: String(s.seg_id) } : null)
     setAddOpen(true)
   }
-  // 渐进制卡: add from the reading round — links the new card to the
-  // current chunk (provenance → cards_created)
+  // 渐进制卡: add from a chunk — links the new card to the chunk
+  // (provenance → cards_created). activeChunk() = the trace detour's chunk
+  // when 溯源 is open (cards made while tracing inherit the traced
+  // segment), else the reading round's current chunk.
   const openReadingAdd = () => {
-    const chunk = rdCurrent()
+    const chunk = activeChunk()
     setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
     setAddOpen(true)
   }
@@ -581,7 +723,7 @@ export const App: Component = () => {
   // recall from (user report). Selection can't be located (exotic markdown)
   // → whole chunk, user wraps manually. No selection → whole chunk as-is.
   const openReadingCloze = (selText: string, selBlock?: string) => {
-    const chunk = rdCurrent()
+    const chunk = activeChunk()
     if (!chunk) return
     const base = chunk.text
     let seed = base
@@ -618,8 +760,22 @@ export const App: Component = () => {
             : c,
         ),
       )
+      // 溯源 detour: the chunk card is traceChunk, not rdChunks — mirror the
+      // provenance there too so the left 相关卡片 column grows live
+      setTraceChunk(prev =>
+        prev && prev.path === src.path && prev.chunk_key === src.chunk_key
+          ? {
+              ...prev,
+              cards_created: [...prev.cards_created, noteId || 0],
+              status: prev.status === 'todo' ? 'active' : prev.status,
+            }
+          : prev,
+      )
       if (readingMode()) rdRefreshCounts()
     }
+    // any add can change the left 相关卡片 column (trace/reading provenance
+    // or a future re-resolve) — force the panel to refetch
+    setRelatedToken(t => t + 1)
     setAddSource(null)
   }
 
@@ -972,6 +1128,23 @@ export const App: Component = () => {
   const handleKeyDown = (e: KeyboardEvent) => {
     if (isTypingTarget(e.target)) return
     if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
+    // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
+    // shortcuts (Space/1-4/approve) must not fire behind the trace card.
+    // Escape = 回到复习; A/C keep working (they target the traced chunk).
+    if (traceOpen()) {
+      if (clozeOpen()) return
+      if (e.key === 'Escape') {
+        e.preventDefault()
+        closeTrace()
+      } else if (e.key === 'a' || e.key === 'A') {
+        e.preventDefault()
+        openReadingAdd()
+      } else if (e.key === 'c' || e.key === 'C') {
+        e.preventDefault()
+        openReadingCloze('', '')
+      }
+      return
+    }
     if (phase() === 'reading') {
       // any dialog open (add / cloze): Space is typing there, never complete
       if (clozeOpen()) return
@@ -1062,6 +1235,49 @@ export const App: Component = () => {
     (phase() === 'preview' && !!previewCard() && !pvRevealed()) ||
     (phase() === 'review' && !!currentCard() && !revealed())
 
+  // 溯源 availability (三栏重构 2026-09-21): resolve the on-screen card's
+  // reading source ONCE per note id (cached). NOT reveal-gated — the button
+  // state (enabled/greyed) reveals nothing about the answer; the detour
+  // itself is only reachable by an explicit click. Result feeds BOTH the
+  // Flashcard/PreviewCard 溯源 button (置灰 for orphans, per user spec —
+  // never hidden) and openTrace().
+  const screenCard = () => {
+    if (phase() === 'review') return currentCard()
+    if (phase() === 'preview') return previewCard()
+    return undefined
+  }
+  createEffect(() => {
+    const c = screenCard()
+    const noteId = c?.noteId
+    if (!noteId || !readingMode()) {
+      setTraceSource(null)
+      return
+    }
+    if (srcCache.has(noteId)) {
+      setTraceSource(srcCache.get(noteId) ?? null)
+      return
+    }
+    setTraceSource(null)
+    api.readingSource(noteId).then(s => {
+      srcCache.set(noteId, s)
+      // stale-response guard: the card may have swapped while in flight
+      if (screenCard()?.noteId === noteId) setTraceSource(s)
+    }).catch(() => {
+      // dead backend: leave null (button greyed); no negative caching —
+      // a transient failure shouldn't permanently disable 溯源
+    })
+  })
+  const traceAvailable = () => traceSource() !== null
+
+  // safety net: the detour only makes sense while its host card is on
+  // screen. If the round ends or the section changes underneath (resync,
+  // another device answered the card), close it instead of stranding the
+  // user on a chunk they can't get back from.
+  createEffect(() => {
+    if (!traceOpen()) return
+    if (section() !== 'study' || !screenCard()) closeTrace()
+  })
+
   // Ring progress for the nav-rail footer (user spec 2026-09-20): the ring
   // moved OUT of the strip above the columns into the rail's bottom-left
   // corner. Derived from the ACTIVE round phase — null when no round is on
@@ -1074,6 +1290,17 @@ export const App: Component = () => {
     if (phase() === 'preview' && previewCard()) return { done: pvDone(), total: pvTotal() }
     return null
   }
+
+  // 三栏 gate helpers (user spec 2026-09-21): the side columns only render
+  // while a card/chunk is actually on screen — start/done/empty screens stay
+  // single-column (same rule the two-column layout has always used).
+  const centerOccupied = () =>
+    (phase() === 'reading' && !!rdCurrent()) ||
+    (phase() === 'review' && !!currentCard()) ||
+    (phase() === 'preview' && !!previewCard())
+  // left column feeds on a CHUNK when a chunk is the thing on screen
+  // (reading round, or the 溯源 detour); otherwise it resolves by note id
+  const leftChunk = () => (traceOpen() ? traceChunk() : (phase() === 'reading' ? rdCurrent() : null))
 
   return (
     <div class="app-shell">
@@ -1107,7 +1334,31 @@ export const App: Component = () => {
           share a top edge on EVERY phase (the strip only rendered mid-round,
           which is why start screens used to misalign). */}
 
-      <div class="columns">
+      <div class="columns" classList={{ 'columns--three': isWide3() && centerOccupied() }}>
+      {/* left column 相关卡片 (三栏重构, user spec 2026-09-21): cards made
+          from the SAME note segment (exact provenance — anki-rag similarity
+          is retired). Reading round / trace detour → the chunk's own cards
+          (+ pre-split ancestors); review/preview → the revealed card's note,
+          resolved via /api/reading/source (orphan = 无来源 empty state).
+          Same reveal gate as the right NotePanel (a face-down card must not
+          leak which segment — and therefore which answer — is on screen). */}
+      <Show when={isWide3() && centerOccupied()}>
+        <div class="related-column">
+          <Show
+            when={leftChunk()}
+            fallback={
+              <RelatedPanel
+                noteId={noteCard()?.noteId ?? null}
+                cardKey={noteCard()?.cardId ?? null}
+                blocked={noteBlocked()}
+                refreshToken={relatedToken()}
+              />
+            }
+          >
+            <RelatedPanel chunk={leftChunk()!} refreshToken={relatedToken()} />
+          </Show>
+        </div>
+      </Show>
       <div class="content">
         <Show when={phase() === 'loading'}>
           <Loading
@@ -1134,7 +1385,7 @@ export const App: Component = () => {
           />
         </Show>
 
-        <Show when={phase() === 'reading' && rdCurrent()}>
+        <Show when={phase() === 'reading' && rdCurrent() && !traceOpen()}>
           <ReadingCard
             chunk={rdCurrent()!}
             busy={rdBusy()}
@@ -1143,7 +1394,27 @@ export const App: Component = () => {
             onSkip={() => rdAct('skip')}
             onAdd={openReadingAdd}
             onCloze={openReadingCloze}
+            onSplit={(sel) => doSplit(rdCurrent()!, sel)}
             onExit={rdFinish}
+          />
+        </Show>
+
+        {/* 溯源 detour (2026-09-21): a review/preview card's source segment
+            as a temporary reading session. Replaces the suspended card in
+            the center column; the round itself is untouched underneath. */}
+        <Show when={traceOpen() && traceChunk()}>
+          <ReadingCard
+            chunk={traceChunk()!}
+            variant="trace"
+            busy={rdBusy()}
+            onComplete={() => {}}
+            onNext={() => {}}
+            onSkip={() => {}}
+            onAdd={openReadingAdd}
+            onCloze={openReadingCloze}
+            onSplit={(sel) => doSplit(traceChunk()!, sel)}
+            onExit={closeTrace}
+            onBack={closeTrace}
           />
         </Show>
 
@@ -1176,11 +1447,13 @@ export const App: Component = () => {
           />
         </Show>
 
-        <Show when={phase() === 'preview' && previewCard()}>
+        <Show when={phase() === 'preview' && previewCard() && !traceOpen()}>
           <PreviewCard
             card={previewCard()!}
             busy={pvBusy()}
             revealed={pvRevealed()}
+            traceAvailable={traceAvailable()}
+            onTrace={openTrace}
             onReveal={() => setPvRevealedFor(previewCard()?.cardId ?? null)}
             onApprove={() => pvAct('approve')}
             onDefer={() => pvAct('defer')}
@@ -1232,10 +1505,12 @@ export const App: Component = () => {
           />
         </Show>
 
-        <Show when={phase() === 'review' && currentCard()}>
+        <Show when={phase() === 'review' && currentCard() && !traceOpen()}>
           <Flashcard
             card={currentCard()!}
             revealed={revealed()}
+            traceAvailable={traceAvailable()}
+            onTrace={openTrace}
             onEdit={() => setEditOpen(true)}
             onUndo={undo}
             undoEnabled={canUndo()}
@@ -1283,13 +1558,14 @@ export const App: Component = () => {
 
       {/* right-hand note panel (知识成体系 Phase 1): wide screens only, and
           only while a card is actually on screen (review or preview round).
-          During a reading round the column switches to ReadingPanel: the
-          whole source file anchored at the current chunk (user spec
-          2026-09-19 — 左栏只展示 chunk，右边回溯整个笔记看上下文). */}
+          During a reading round — or a 溯源 detour (2026-09-21) — the
+          column switches to ReadingPanel: the whole source file anchored at
+          the current chunk (user spec 2026-09-19 — 中栏只展示 chunk，右边
+          回溯整个笔记看上下文). */}
       <Show when={isWide()}>
         <div class="note-column">
           <Show
-            when={phase() === 'reading' && rdCurrent()}
+            when={leftChunk()}
             fallback={
               <NotePanel
                 noteId={noteCard()?.noteId}
@@ -1298,7 +1574,7 @@ export const App: Component = () => {
               />
             }
           >
-            <ReadingPanel chunk={rdCurrent()!} />
+            <ReadingPanel chunk={leftChunk()!} />
           </Show>
         </div>
       </Show>
