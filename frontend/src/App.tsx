@@ -38,10 +38,12 @@ import type { SplitSelection } from './lib/split-selection'
 // sections fetch from firing on narrow viewports.
 const WIDE_QUERY = '(min-width: 1180px)'
 // 三栏重构 (user spec 2026-09-21): the LEFT column (相关卡片 = same-segment
-// cards, exact provenance) needs a third column — ≥1500px shows all three
-// (equal width, capped at the card width); 1180–1499 keeps today's
-// 中+右 two-column layout; below that, phone single column.
-const WIDE3_QUERY = '(min-width: 1500px)'
+// cards, exact provenance) needs a third column. User decision: every column
+// keeps the CURRENT card width (680px) — 就用现在阅读/预览/复习栏卡片的那个
+// 宽度. Three fixed 680 columns + gaps need 2216px of viewport (80 rail +
+// 3×680 + 2×24 gap + 2×24 padding), so below that the layout stays exactly
+// as today: 1180–2215 = 中+右 two columns, <1180 = phone single column.
+const WIDE3_QUERY = '(min-width: 2216px)'
 
 // Pacing-mode persistence (2026-09-14): the last tier the user picked is
 // remembered across page loads, so the habitual case is one tap ("开始").
@@ -359,6 +361,38 @@ export const App: Component = () => {
   // the detour lands on the first todo child; the round (if any) is
   // re-fetched afterwards because the traced segment may have been pending
   // in it (the backend replaced it there too).
+  // child_chunks (full payloads) is the r4.5 wire field; if absent (old
+  // backend process) the todo children are built CLIENT-SIDE from the
+  // returned line ranges + the file text — the split itself succeeded
+  // server-side either way, the UI must not claim otherwise.
+  const buildFallbackChildren = async (
+    chunk: ReadingChunk,
+    children: { seg_id: number; start_line: number; end_line: number; status: string }[],
+  ): Promise<ReadingChunk[]> => {
+    const todos = children.filter(c => c.status === 'todo')
+    if (todos.length === 0) return []
+    try {
+      const f = await api.readingFile(chunk.path)
+      const lines = f.text.split('\n')
+      return todos.map(c => ({
+        ...chunk,
+        chunk_key: String(c.seg_id),
+        seg_id: c.seg_id,
+        parent_seg_id: chunk.seg_id,
+        line_start: c.start_line,
+        line_end: c.end_line,
+        text: lines.slice(c.start_line - 1, c.end_line).join('\n'),
+        status: 'todo' as ReadingChunkStatus,
+        cards_created: [],
+        // pre-split cards live on the (now container) parent — carry them as
+        // ancestors so the left column keeps showing the duplicate guard
+        ancestor_cards: [...(chunk.cards_created || []), ...(chunk.ancestor_cards || [])],
+      }))
+    } catch {
+      return []
+    }
+  }
+
   const doSplit = async (chunk: ReadingChunk, sel: SplitSelection) => {
     if (chunk.seg_id == null || rdBusy()) return
     const base = chunk.line_start - 1
@@ -367,7 +401,8 @@ export const App: Component = () => {
     setRdBusy(true)
     try {
       const res = await api.readingSplit(chunk.path, chunk.seg_id, selections)
-      const kids = res.child_chunks || []
+      let kids = res.child_chunks || []
+      if (kids.length === 0) kids = await buildFallbackChildren(chunk, res.children || [])
       if (kids.length === 0) {
         showSnack('分割失败：没有产生新片段')
         return

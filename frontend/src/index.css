@@ -180,7 +180,7 @@ body {
 }
 
 .columns--three {
-  /* 3 × card width + 2 × gap + 2 × page padding */
+  /* 3 × card width + 2 × gap + 2 × page padding (rail lives outside) */
   max-width: calc(3 * var(--content-max-width) + 2 * 24px + 2 * var(--content-padding));
 }
 
@@ -191,10 +191,14 @@ body {
   padding: var(--content-padding) 0;
 }
 
-.columns--three .content {
-  /* equal thirds — grow/shrink together, never wider than the card width */
-  flex: 1 1 0;
-  min-width: 0;
+/* three-column mode: every column is FIXED at the card width — the center
+ * card never shrinks below today's 680px (user spec 2026-09-21 「就用现在
+ * 阅读/预览/复习栏卡片的那个宽度」). The breakpoint (App's WIDE3_QUERY,
+ * 2216px) guarantees they fit. */
+.columns--three .related-column,
+.columns--three .note-column {
+  flex: 0 0 var(--content-max-width);
+  max-width: var(--content-max-width);
 }
 
 /* base .content (applies in BOTH modes — the column rules above only
