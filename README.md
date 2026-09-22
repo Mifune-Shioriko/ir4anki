@@ -94,6 +94,18 @@ systemd user services stop on logout unless lingering is enabled:
 sudo loginctl enable-linger $USER
 ```
 
+## Update
+
+```bash
+bash deploy/update.sh
+```
+
+Pulls the latest `main`, reinstalls backend deps only if `requirements.txt`
+changed, rebuilds the frontend only if `frontend/` changed, then restarts the
+service (~1s downtime). Your state (`~/.local/state/ir4anki`) and config
+(`~/.config/ir4anki.env`) are never touched. Hard-refresh the browser tab
+afterwards (Ctrl+Shift+R) to pick up a new frontend bundle.
+
 ## Configuration
 
 Everything lives in `~/.config/ir4anki.env` (one KEY=VALUE per line). Full documentation
