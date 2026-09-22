@@ -38,12 +38,14 @@ import type { SplitSelection } from './lib/split-selection'
 // sections fetch from firing on narrow viewports.
 const WIDE_QUERY = '(min-width: 1180px)'
 // 三栏重构 (user spec 2026-09-21): the LEFT column (相关卡片 = same-segment
-// cards, exact provenance) needs a third column. User decision: every column
-// keeps the CURRENT card width (680px) — 就用现在阅读/预览/复习栏卡片的那个
-// 宽度. Three fixed 680 columns + gaps need 2216px of viewport (80 rail +
-// 3×680 + 2×24 gap + 2×24 padding), so below that the layout stays exactly
-// as today: 1180–2215 = 中+右 two columns, <1180 = phone single column.
-const WIDE3_QUERY = '(min-width: 2216px)'
+// cards, exact provenance) needs a third column. The original spec kept
+// every column at the FULL card width (680px → 2216px breakpoint), but the
+// user's display is 1920×1200 (report 2026-09-22) and 3×680 doesn't fit.
+// Lowered to 1500px: above it the three columns share the viewport as equal
+// flexible thirds (CSS .columns--three is flex 1 1 0, capped at 680px) —
+// ≈581px each on a 1920 screen. Below: 1180–1499 = 中+右 two columns,
+// <1180 = phone single column.
+const WIDE3_QUERY = '(min-width: 1500px)'
 
 // Pacing-mode persistence (2026-09-14): the last tier the user picked is
 // remembered across page loads, so the habitual case is one tap ("开始").

@@ -191,10 +191,11 @@ body {
   padding: var(--content-padding) 0;
 }
 
-/* three-column mode: every column is FIXED at the card width — the center
- * card never shrinks below today's 680px (user spec 2026-09-21 「就用现在
- * 阅读/预览/复习栏卡片的那个宽度」). The breakpoint (App's WIDE3_QUERY,
- * 2216px) guarantees they fit. */
+/* three-column mode: columns are equal flexible thirds capped at the card
+ * width (680px). The original spec (2026-09-21) fixed them at 680px with a
+ * 2216px breakpoint, but the user's 1920×1200 display (2026-09-22) can't
+ * fit that — WIDE3_QUERY is now 1500px and the flex rules below
+ * (.columns--three … flex: 1 1 0) shrink the thirds to ≈581px at 1920. */
 .columns--three .related-column,
 .columns--three .note-column {
   flex: 0 0 var(--content-max-width);
