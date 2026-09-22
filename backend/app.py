@@ -214,8 +214,10 @@ READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes"
 NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
 READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
 READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
-# corpus scan exclusions (editor/tool dirs, never note content)
-NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules"}
+# corpus scan exclusions (editor/tool dirs + the note-image store, never
+# note content). _assets holds reading-mode image uploads (P5, 2026-09-23)
+# and is served by basename at /api/reading/media/<name>.
+NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "_assets"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
 
 
@@ -3673,6 +3675,133 @@ async def reading_split(body: ReadingSplitBody):
         }
 
 
+class ReadingEditBody(BaseModel):
+    path: str
+    seg_id: int
+    new_text: str
+
+
+@app.post("/api/reading/edit")
+async def reading_edit(body: ReadingEditBody):
+    """In-app segment edit (user spec 2026-09-23): replace one segment's
+    line range in the .md file and re-anchor EVERY segment in the same
+    transaction — the app stays the only writer, so the drift fuse never
+    trips (contrast: external vim edits go through _reanchor_entry).
+
+    Rules:
+      - containers are read-only history (409) — edit their children;
+      - segments strictly AFTER the edited range shift by delta lines;
+        ANCESTOR containers that span the range stretch (end += delta)
+        and recompute their fingerprint; everything before is untouched;
+      - pure shifts never break fingerprints (content is identical), so
+        sibling/ancestor provenance survives line-count changes exactly;
+      - the file is written atomically (tmp + os.replace) BEFORE the
+        state write; file_sha updates in the same transaction;
+      - round membership is untouched (seg_id/status unchanged) — the
+        on-screen chunk is replaced from the returned payload.
+    """
+    async with _state_lock:
+        _reading_guard()
+        data = _reading_read()
+        entry = _find_entry(data, body.path)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="file not in the reading list")
+        if entry.get("needs_resync"):
+            raise HTTPException(status_code=409, detail="file needs reseed first")
+        segs = entry.get("segments") or []
+        seg = next((s for s in segs if s.get("seg_id") == body.seg_id), None)
+        if seg is None:
+            raise HTTPException(status_code=404, detail="segment not found")
+        if seg.get("status") == "container":
+            raise HTTPException(status_code=409, detail="container segments are read-only")
+        new_text = body.new_text.replace("\r\n", "\n").replace("\r", "\n")
+        if not new_text.strip():
+            raise HTTPException(status_code=400, detail="segment cannot be empty")
+        text = _read_note_text(body.path)
+        if text is None:
+            raise HTTPException(status_code=404, detail="note file not found")
+        lines = text.split("\n")
+        st = max(1, min(int(seg["start_line"]), len(lines) or 1))
+        en = max(st, min(int(seg["end_line"]), len(lines)))
+        new_lines = new_text.split("\n")
+        delta = len(new_lines) - (en - st + 1)
+        merged = lines[: st - 1] + new_lines + lines[en:]
+        n = len(merged)
+
+        # the edited segment: new range + fingerprint; refresh the title
+        # when the user rewrote the heading line (breadcrumb is cosmetic —
+        # heading_path keeps its ancestors)
+        seg["start_line"] = st
+        seg["end_line"] = st + len(new_lines) - 1
+        seg["fingerprint"] = _seg_fingerprint(merged, st, seg["end_line"])
+        seg["first_line"] = merged[st - 1] if st - 1 < n else ""
+        c = _chunker()
+        hm = c.HEADING_RE.match(seg["first_line"])
+        if hm:
+            new_title = hm.group(2).strip()
+            hp = list(seg.get("heading_path") or [])
+            if hp and hp[-1] == seg.get("title"):
+                hp[-1] = new_title
+                seg["heading_path"] = hp
+            seg["title"] = new_title
+        seg["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+        # every OTHER segment: containment-aware shift
+        for s in segs:
+            if s is seg:
+                continue
+            s_st, s_en = s.get("start_line", 1), s.get("end_line", 1)
+            if s_st > en:          # entirely after the edit → pure shift
+                s["start_line"] = s_st + delta
+                s["end_line"] = max(s_st + delta, s_en + delta)
+            elif s_en >= en and s_st <= st:
+                # spans the edited range (ancestor container) → stretch +
+                # recompute the fingerprint over the new window
+                s["end_line"] = max(s_st, s_en + delta)
+                s["fingerprint"] = _seg_fingerprint(merged, s["start_line"], s["end_line"])
+                s["first_line"] = merged[s["start_line"] - 1] if n else ""
+            # segments ending before the edit: untouched
+        for o in entry.get("orphans") or []:
+            # parked payloads carry line info too — shift so a future
+            # reseed view isn't misleading (best-effort, they have no fp)
+            if isinstance(o, dict) and (o.get("start_line") or 0) > en:
+                o["start_line"] = o["start_line"] + delta
+                o["end_line"] = o.get("end_line", o["start_line"]) + delta
+
+        # atomic file write, then state (file first: a failed write must
+        # leave the state untouched; a failed state write leaves the file
+        # ahead and the next _file_view trips the re-anchor fuse — which
+        # re-locates pure-shift segments cleanly)
+        p = NOTES_DIR / body.path
+        tmp = p.with_suffix(p.suffix + f".tmp-{uuid.uuid4().hex[:8]}")
+        try:
+            tmp.write_text("\n".join(merged), encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"file write failed: {e}")
+        entry["file_sha"] = hashlib.sha256("\n".join(merged).encode("utf-8")).hexdigest()
+        _reading_write(data)
+
+        # fresh payload for the on-screen chunk (same idiom as split's
+        # child_chunks): _file_view reads the NEW file text back
+        ordered_new, summary_new = _file_view(entry)
+        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
+        payload = None
+        for ch, key, st_ in ordered_new or []:
+            if key == str(seg["seg_id"]):
+                payload = _chunk_payload(ch, key, st_, summary_new, segs_by_id)
+                break
+        return {
+            "ok": True,
+            "delta": delta,
+            "line_start": seg["start_line"],
+            "line_end": seg["end_line"],
+            "file_sha": entry["file_sha"],
+            "chunk": payload,
+        }
+
+
 @app.post("/api/reading/reseed")
 async def reading_reseed(body: ReadingPathBody):
     """Clear needs_resync after external drift: re-anchor what still matches
@@ -3850,6 +3979,73 @@ async def reading_file(path: str):
     if text is None:
         raise HTTPException(status_code=404, detail="note file not found")
     return {"path": path, "text": text}
+
+
+# ---- reading-mode note images (P5, user spec 2026-09-23) ---------------------
+# Notes reference images by BARE BASENAME (same convention as Anki's
+# collection.media): `![](paste-….png)` → GET /api/reading/media/<name>.
+# Files live in NOTES_DIR/_assets (editor uploads) or anywhere else under
+# NOTES_DIR (manually dropped / Obsidian-style attachments). Serving by
+# basename keeps .md files pure (user preference: 文件存纯净文本) and makes
+# notes relocatable. The frontend markdown-it image rule rewrites
+# non-URL srcs to this route.
+NOTE_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".avif"}
+NOTES_ASSETS_DIR = NOTES_DIR / "_assets"
+
+
+def _find_note_image(name: str) -> Path | None:
+    """Traversal-safe basename lookup of one note image under NOTES_DIR.
+    _assets first (the editor's upload store), then a corpus-wide scan."""
+    safe = os.path.basename(name)
+    if not safe or Path(safe).suffix.lower() not in NOTE_IMAGE_EXTS:
+        return None
+    root = NOTES_DIR.resolve()
+    hit = (NOTES_ASSETS_DIR / safe).resolve()
+    if hit.is_file() and hit.is_relative_to(root):
+        return hit
+    try:
+        for p in NOTES_DIR.rglob(safe):
+            rp = p.resolve()
+            if rp.is_file() and rp.is_relative_to(root):
+                return rp
+    except OSError:
+        pass
+    return None
+
+
+@app.get("/api/reading/media/{name:path}")
+async def reading_media(name: str):
+    """Serve one note-corpus image by basename (see _find_note_image)."""
+    _reading_guard()
+    p = _find_note_image(name)
+    if p is None:
+        raise HTTPException(status_code=404, detail="image not found")
+    return FileResponse(p)
+
+
+@app.post("/api/reading/media/upload")
+async def reading_media_upload(file: UploadFile = File(...)):
+    """Store an uploaded image in NOTES_DIR/_assets (reading-mode editor).
+    Returns the bare filename to insert as `![](<filename>)` — basename
+    references, served back at /api/reading/media/. Same clobber-proof
+    naming as /api/media/upload (timestamp + random suffix)."""
+    _reading_guard()
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    if len(data) > UPLOAD_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="file too large (max 25 MB)")
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in NOTE_IMAGE_EXTS:
+        raise HTTPException(status_code=400, detail=f"unsupported image type: {ext or '(none)'}")
+    stem = datetime.now().strftime("note-%Y%m%d-%H%M%S")
+    filename = f"{stem}-{uuid.uuid4().hex[:6]}{ext}"
+    try:
+        NOTES_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        (NOTES_ASSETS_DIR / filename).write_bytes(data)
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+    return {"filename": filename}
 
 
 def _field_value(v) -> str:

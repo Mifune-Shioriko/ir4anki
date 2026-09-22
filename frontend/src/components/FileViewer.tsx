@@ -22,6 +22,15 @@ import { renderMarkdown } from '../lib/markdown'
 
 const fileCache = new Map<string, string>()
 
+/** Drop one file (or everything) from the module-wide text cache.
+ *  Called after an in-app segment edit (/api/reading/edit rewrites the
+ *  .md): without this the right column would keep rendering the stale
+ *  pre-edit text. */
+export function invalidateFileCache(path?: string) {
+  if (path) fileCache.delete(path)
+  else fileCache.clear()
+}
+
 interface Props {
   /** corpus-relative path; null renders nothing */
   path: string | null
@@ -34,6 +43,10 @@ interface Props {
   anchorEndLine?: number | null
   /** bump to re-fire the anchor effect for the same path+line (tab switch) */
   anchorToken?: unknown
+  /** bump to RE-FETCH the file text for the same path (in-app segment
+   *  edit rewrote the .md — the module cache alone would serve stale
+   *  text; caller pairs this with invalidateFileCache). */
+  reloadToken?: unknown
   /** fetcher: NotePanel → /api/reading/file (corpus-direct),
    *  reading panel → /api/reading/file */
   fetchFile: (path: string) => Promise<{ text: string }>
@@ -113,6 +126,7 @@ export const FileViewer: Component<Props> = (props) => {
 
   createEffect(() => {
     props.path // track
+    props.reloadToken // track: in-app edit bumped it → re-fetch fresh text
     load()
   })
 

@@ -28,6 +28,8 @@ import { ReadingDoneScreen } from './components/ReadingDoneScreen'
 import { ReadingListScreen } from './components/ReadingListScreen'
 import { NotePanel } from './components/NotePanel'
 import { RelatedPanel } from './components/RelatedPanel'
+import { SegEditDialog } from './components/SegEditDialog'
+import { invalidateFileCache } from './components/FileViewer'
 import { Snackbar } from './components/Snackbar'
 import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingRoundStats, ReadingSource } from './types'
 import type { SplitSelection } from './lib/split-selection'
@@ -343,6 +345,10 @@ export const App: Component = () => {
   const [traceChunk, setTraceChunk] = createSignal<ReadingChunk | null>(null)
   // bump to force the left 相关卡片 panel to refetch (after adds/splits)
   const [relatedToken, setRelatedToken] = createSignal(0)
+  // bump to force the RIGHT 原文上下文 FileViewer to re-fetch the .md after
+  // an in-app segment edit rewrote it (path unchanged → cache+effect would
+  // otherwise serve stale text). Paired with invalidateFileCache().
+  const [noteReloadToken, setNoteReloadToken] = createSignal(0)
 
   const sourceToChunk = (s: ReadingSource): ReadingChunk => {
     const own = (s.cards_created || []).filter(id => id > 0)
@@ -487,6 +493,39 @@ export const App: Component = () => {
     } finally {
       setRdBusy(false)
     }
+  }
+
+  // ---- 片段编辑 (user spec 2026-09-23) ----
+  // SegEditDialog edits the chunk's .md SOURCE via POST /api/reading/edit
+  // (backend re-anchors all segments in one transaction — app is the only
+  // writer, no drift fuse). On save: replace the on-screen chunk (round OR
+  // trace variant) with the fresh payload, bust the FileViewer cache so the
+  // right column re-renders the new file text, and nudge the left 相关卡片
+  // panel (line numbers behind provenance moved).
+  const [segEditChunk, setSegEditChunk] = createSignal<ReadingChunk | null>(null)
+  const segEditOpen = () => segEditChunk() !== null
+  const openSegEdit = (chunk: ReadingChunk) => setSegEditChunk(chunk)
+
+  const onSegEdited = (fresh: ReadingChunk | null) => {
+    const old = segEditChunk()
+    setSegEditChunk(null)
+    if (!old) return
+    if (fresh) {
+      if (traceOpen() && traceChunk()?.chunk_key === old.chunk_key) {
+        setTraceChunk(fresh)
+      } else {
+        setRdChunks(prev =>
+          prev.map(c =>
+            c.path === old.path && c.chunk_key === old.chunk_key ? fresh : c,
+          ),
+        )
+      }
+    }
+    // the .md changed on disk → the right column must re-fetch the file
+    invalidateFileCache(old.path)
+    setNoteReloadToken(t => t + 1)
+    setRelatedToken(t => t + 1)
+    showSnack('片段已保存，笔记文件已更新')
   }
 
   // ---- MD3 snackbar (transient feedback, 2026-09-16) ----
@@ -1206,7 +1245,7 @@ export const App: Component = () => {
   }
   const handleKeyDown = (e: KeyboardEvent) => {
     if (isTypingTarget(e.target)) return
-    if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget()) return
+    if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget() || segEditOpen()) return
     // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
     // shortcuts (Space/1-4/approve) must not fire behind the trace card.
     // Escape = 回到复习; A/C keep working (they target the traced chunk).
@@ -1474,6 +1513,7 @@ export const App: Component = () => {
             onAdd={openReadingAdd}
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(rdCurrent()!, sel)}
+            onEdit={() => openSegEdit(rdCurrent()!)}
             gapPolicy={gapPolicy()}
             onGapPolicyChange={chooseGapPolicy}
             onExit={rdFinish}
@@ -1494,6 +1534,7 @@ export const App: Component = () => {
             onAdd={openReadingAdd}
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(traceChunk()!, sel)}
+            onEdit={() => openSegEdit(traceChunk()!)}
             gapPolicy={gapPolicy()}
             onGapPolicyChange={chooseGapPolicy}
             onExit={closeTrace}
@@ -1661,7 +1702,7 @@ export const App: Component = () => {
               />
             }
           >
-            <ReadingPanel chunk={leftChunk()!} />
+            <ReadingPanel chunk={leftChunk()!} reloadToken={noteReloadToken()} />
           </Show>
         </div>
       </Show>
@@ -1711,6 +1752,17 @@ export const App: Component = () => {
           readingSource={addSource()}
           onClose={() => { setClozeOpen(false); setAddSource(null) }}
           onAdded={(nid) => onCardAdded(nid)}
+        />
+      </Show>
+
+      {/* 片段编辑器 (user spec 2026-09-23): 宽弹窗 = CM6 源码编辑 + 实时
+          预览，两栏各等于三栏布局的一栏宽。unmount on close = fresh CM6
+          instance per open (same idiom as EditDialog). */}
+      <Show when={segEditOpen() && segEditChunk()}>
+        <SegEditDialog
+          chunk={segEditChunk()!}
+          onClose={() => setSegEditChunk(null)}
+          onSaved={onSegEdited}
         />
       </Show>
 

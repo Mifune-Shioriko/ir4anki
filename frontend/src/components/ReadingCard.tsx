@@ -2,7 +2,7 @@ import { Component, Show } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
 import type { ReadingChunk, ReadingChunkStatus } from '../types'
-import { IconAdd, IconArrowBack, IconContentCut, IconPassword } from './icons'
+import { IconAdd, IconArrowBack, IconContentCut, IconEdit, IconPassword } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign round 2;
 // 三栏重构 2026-09-21). One note chunk to read and turn into cards BY HAND.
@@ -75,6 +75,8 @@ interface Props {
   /** 分割文段: selection mapped to source-line range RELATIVE to the chunk
    *  text (caller adds line_start-1 for file lines) */
   onSplit: (sel: { start_line: number; end_line: number }) => void
+  /** 编辑片段 (user spec 2026-09-23): open the SegEditDialog for this chunk */
+  onEdit?: () => void
   /** 切割语义 (gap_policy, 2026-09-22): bookmark = 进度声明（未读尾巴留在
    *  队列, 默认）, extract = 提炼宣言（未选中部分全部沉背景） */
   gapPolicy: 'bookmark' | 'extract'
@@ -148,6 +150,18 @@ export const ReadingCard: Component<Props> = (props) => {
               >
                 <md-icon><IconContentCut /></md-icon>
               </md-icon-button>
+              {/* 编辑片段 (user spec 2026-09-23): CM6 弹窗改 .md 原文；
+                  container 只读（历史锚，后端也会 409），trace 卡片无 seg 时可编辑 */}
+              <Show when={props.onEdit}>
+                <md-icon-button
+                  aria-label="编辑片段"
+                  title="编辑这个片段的 Markdown 原文（保存后写回笔记文件）"
+                  disabled={props.busy || props.chunk.status === 'container' || props.chunk.seg_id == null}
+                  onClick={() => props.onEdit?.()}
+                >
+                  <md-icon><IconEdit /></md-icon>
+                </md-icon-button>
+              </Show>
               <Show when={trace()}>
                 <div class="header-actions-sep" aria-hidden="true" />
                 <md-icon-button

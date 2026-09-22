@@ -9,6 +9,7 @@ import type {
   ReadingActResponse,
   ReadingCorpusFile,
   ReadingCreatedCard,
+  ReadingEditResponse,
   ReadingSource,
   ReadingSplitResponse,
   ReadingStartResponse,
@@ -137,6 +138,23 @@ export const api = {
   ) => post<ReadingSplitResponse>('/api/reading/split', {
     path, seg_id: segId, selections, gap_policy: gapPolicy,
   }),
+  /** In-app segment edit (user spec 2026-09-23): replace the segment's
+   *  line range in the .md; backend re-anchors all segments in the same
+   *  transaction (app = only writer, no drift fuse). Returns the fresh
+   *  chunk payload for in-place UI replacement. */
+  readingEdit: (path: string, segId: number, newText: string) =>
+    post<ReadingEditResponse>('/api/reading/edit', {
+      path, seg_id: segId, new_text: newText,
+    }),
+  /** Reading-mode note image upload (P5): stores in NOTES_DIR/_assets,
+   *  returns the bare filename to embed as `![](filename)`. */
+  readingMediaUpload: (file: File): Promise<{ filename: string }> => {
+    const fd = new FormData()
+    fd.append('file', file)
+    return fetch('/api/reading/media/upload', { method: 'POST', body: fd }).then(r =>
+      parse<{ filename: string }>(r),
+    )
+  },
   readingListAdd: (path: string) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
   readingListRemove: (path: string) =>

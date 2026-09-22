@@ -12,6 +12,10 @@ import { FileViewer } from './FileViewer'
 
 interface Props {
   chunk: ReadingChunk
+  /** bump to force the whole-file viewer to re-fetch (in-app segment edit
+   *  rewrote the .md; the module cache + a stable path would serve stale
+   *  text otherwise). Paired with invalidateFileCache() in App. */
+  reloadToken?: unknown
 }
 
 export const ReadingPanel: Component<Props> = (props) => {
@@ -33,6 +37,7 @@ export const ReadingPanel: Component<Props> = (props) => {
           anchorLine={props.chunk.line_start}
           anchorEndLine={props.chunk.line_end}
           anchorToken={props.chunk.chunk_key}
+          reloadToken={props.reloadToken}
           fetchFile={api.readingFile}
           class="note-body md-typescale-body-medium"
         />

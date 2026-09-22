@@ -47,6 +47,28 @@ md.renderer.renderToken = ((tokens: TokenLike[], idx: number, options: unknown, 
   return baseRenderToken(tokens, idx, options, env, self)
 }) as typeof md.renderer.renderToken
 
+// Note-corpus images (P5, user spec 2026-09-23): notes reference images by
+// BARE BASENAME (Anki collection.media convention, keeps .md pure and notes
+// relocatable): `![](paste-x.png)` or `![](2026/局部解剖学/_assets/x.png)`.
+// Nothing serves those paths from the SPA origin, so rewrite every non-URL
+// src to the corpus image route (basename lookup under NOTES_DIR on the
+// backend). Absolute http(s)/data: URLs pass through untouched.
+const baseImageRule = md.renderer.rules.image
+md.renderer.rules.image = (tokens, idx, options, env, self) => {
+  const token = tokens[idx]
+  const srcIdx = token.attrIndex('src')
+  if (srcIdx >= 0) {
+    const src = String(token.attrs![srcIdx][1] ?? '')
+    if (!/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
+      const base = src.split('/').pop() || src
+      token.attrs![srcIdx][1] = '/api/reading/media/' + encodeURIComponent(base)
+    }
+  }
+  return baseImageRule
+    ? baseImageRule(tokens, idx, options, env, self)
+    : self.renderToken(tokens, idx, options)
+}
+
 export function renderMarkdown(src: string): string {
   return md.render(src)
 }

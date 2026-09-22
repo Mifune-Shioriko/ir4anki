@@ -1045,6 +1045,110 @@ body {
   color: var(--md-sys-color-on-surface-variant);
 }
 
+/* ---- 片段编辑器 (user spec 2026-09-23) ----
+ * WIDE centered dialog: left = CM6 source editor, right = live preview,
+ * each pane sized like ONE column of the three-column layout
+ * (--content-max-width, ≈581–680px). Total ≈ two columns + gap, clamped
+ * to the viewport. NOT a bottom sheet — this is a workstation dialog, so
+ * it keeps md-dialog's default center scaling. */
+.seg-edit-dialog {
+  width: min(
+    calc(2 * var(--content-max-width) + 24px + 48px),
+    calc(100vw - 48px)
+  );
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  margin: auto;
+}
+
+.seg-edit-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  /* md-dialog's content slot scrolls; the PANES scroll instead — pin the
+   * dialog content to the viewport height minus headline/actions/toolbar */
+  height: min(640px, calc(100vh - 260px));
+}
+
+.seg-edit-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 4px 8px;
+  background: var(--md-sys-color-surface-container-low);
+  border-radius: var(--md-sys-shape-corner-large, 16px);
+  flex: none;
+}
+
+.seg-edit-hint {
+  margin-left: auto;
+  padding-right: 8px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.seg-edit-panes {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.seg-edit-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-large, 16px);
+  overflow: hidden;
+  background: var(--md-sys-color-surface);
+}
+
+.seg-edit-pane-head {
+  flex: none;
+  padding: 8px 14px;
+  color: var(--md-sys-color-on-surface-variant);
+  background: var(--md-sys-color-surface-container-low);
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+
+.seg-edit-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden; /* CM6 manages its own .cm-scroller */
+}
+
+.seg-edit-editor .cm-editor {
+  height: 100%;
+}
+
+.seg-edit-preview {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 16px;
+}
+
+.seg-edit-preview img,
+.note-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+}
+
+/* narrow screens: stack the panes (phone rarely edits, but keep it sane) */
+@media (max-width: 900px) {
+  .seg-edit-panes {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .seg-edit-pane {
+    min-height: 240px;
+  }
+}
+
 /* ---- edit dialog as a bottom sheet (user spec: 从底部中间往上弹出) ----
  * md-dialog is display:contents + position:fixed; the inner <dialog> element
  * inherits margin/insets from the host, and UA styles give it inset:0 —

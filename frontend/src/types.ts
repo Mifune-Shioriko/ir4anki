@@ -213,6 +213,17 @@ export interface ReadingSplitResponse {
   child_chunks: ReadingChunk[]
 }
 
+/** /api/reading/edit response (user spec 2026-09-23): the edited segment's
+ *  fresh payload + how many lines the file grew/shrank. */
+export interface ReadingEditResponse {
+  ok: boolean
+  delta: number
+  line_start: number
+  line_end: number
+  file_sha: string
+  chunk: ReadingChunk | null
+}
+
 export interface NoteUpdateResponse {
   updated: boolean
   question: string

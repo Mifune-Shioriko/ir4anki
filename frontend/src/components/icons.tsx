@@ -53,6 +53,9 @@ const P_ChevronRight = ['M530-481 332-679l43-43 241 241-241 241-43-43 198-198Z']
 const P_ContentCut = ['M782-114 481-415 364-298q11 17 13.5 33t2.5 35q0 64-43 107T230-80q-64 0-107-43T80-230q0-64 43-107t107-43q18 0 35.5 5t36.5 15l116-116-118-118q-17 8-34.5 11t-35.5 3q-64 0-107-43T80-730q0-64 43-107t107-43q64 0 107 43t43 107q0 19-2.5 36T367-662l514 514v34h-99ZM599-527l-66-66 249-249h99v33L599-527ZM294-666q26-26 26-64t-26-64q-26-26-64-26t-64 26q-26 26-26 64t26 64q26 26 64 26t64-26Zm202.5 203.5Q502-468 502-476t-5.5-13.5Q491-495 483-495t-13.5 5.5Q464-484 464-476t5.5 13.5Q475-457 483-457t13.5-5.5ZM294-166q26-26 26-64t-26-64q-26-26-64-26t-64 26q-26 26-26 64t26 64q26 26 64 26t64-26Z']
 const P_FindInPage = ['m652-140 60 60H220q-24 0-42-18t-18-42v-680q0-24 18-42t42-18h372l208 239v487q0 14-7.5 28.5T774-102L562-314q-20 12-39.68 17-19.69 5-42.32 5-62 0-104.5-42.5T333-439q0-62 42.5-104.5T480-586q62 0 104.5 42.5T627-439q0 23-6.5 44T601-358l139 139v-403L568-820H220v680h432ZM542.5-381.5Q567-411 567-450q0-33-26-54.5T480-526q-35 0-61 21.5T393-450q0 39 24.5 68.5T480-352q38 0 62.5-29.5ZM480-450Zm0 0Z']
 const P_ArrowBack = ['m274-450 248 248-42 42-320-320 320-320 42 42-248 248h526v60H274Z']
+// 片段编辑器 (user spec 2026-09-23): grid_on = 插入表格 (GFM template).
+// Official Material Symbols outlined path (@material-symbols/svg-400).
+const P_Grid = ['M180-120q-24 0-42-18t-18-42v-600q0-24 18-42t42-18h600q24 0 42 18t18 42v600q0 24-18 42t-42 18H180Zm270-250H180v190h270v-190Zm60 0v190h270v-190H510Zm-60-60v-190H180v190h270Zm60 0h270v-190H510v190ZM180-680h600v-100H180v100Z']
 
 export interface IconProps { size?: number }
 
@@ -98,3 +101,4 @@ export const IconSchool = (props: IconProps) => <Svg paths={P_School} {...props}
 export const IconContentCut = (props: IconProps) => <Svg paths={P_ContentCut} {...props} />
 export const IconFindInPage = (props: IconProps) => <Svg paths={P_FindInPage} {...props} />
 export const IconArrowBack = (props: IconProps) => <Svg paths={P_ArrowBack} {...props} />
+export const IconGrid = (props: IconProps) => <Svg paths={P_Grid} {...props} />
