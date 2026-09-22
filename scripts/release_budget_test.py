@@ -10,7 +10,7 @@ approval gives it back.
 Runs the real FastAPI app against an in-memory FAKE AnkiConnect (same pattern
 as new_again_test.py) — nothing touches the live collection.
 
-Run: ~/anki-server/review-app/.venv/bin/python /home/shioriko/anki-review-app/scripts/release_budget_test.py
+Run: python scripts/release_budget_test.py   (needs the backend venv's deps + live AnkiConnect)
 """
 import asyncio
 import json

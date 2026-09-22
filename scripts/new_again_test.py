@@ -13,7 +13,7 @@ Runs the real FastAPI app against an in-memory FAKE AnkiConnect (monkeypatched
   6. Kill switch               -> ANKI_NEW_AGAIN_RETURN off = no auto-return
   7. Manual to-preview clears the streak
 
-Run: ~/anki-server/review-app/.venv/bin/python /home/shioriko/anki-review-app/scripts/new_again_test.py
+Run: python scripts/new_again_test.py   (needs the backend venv's deps + live AnkiConnect)
 """
 import asyncio
 import importlib

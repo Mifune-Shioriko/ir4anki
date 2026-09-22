@@ -28,7 +28,7 @@ row + folder-tree picker + cloze dialog):
  10. narrow viewport: no right column during reading
  11. finish clears the round (backend state)
 
-Run: /tmp/pw-venv2/bin/python ~/anki-review-app/scripts/reading_ui_test.py
+Run: python scripts/reading_ui_test.py   (needs playwright + the backend venv deps)
 """
 import json
 import os
@@ -43,6 +43,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:8902"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 PASS = 0
 FAIL = 0
 
@@ -125,11 +126,11 @@ def main():
         "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
         "ANKI_QUICK_READ": "2",
         "ANKI_FOCUS_READ": "5",
-        "REVIEW_DIST_DIR": "/home/shioriko/anki-review-app/frontend/dist",
+        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
     })
     proc = subprocess.Popen(
-        ["/home/shioriko/anki-server/review-app/.venv/bin/uvicorn",
-         "--app-dir", "/home/shioriko/anki-review-app/backend",
+        [sys.executable, "-m", "uvicorn",
+         "--app-dir", str(REPO_ROOT / "backend"),
          "app:app", "--host", "127.0.0.1", "--port", "8902"],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )

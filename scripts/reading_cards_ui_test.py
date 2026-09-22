@@ -28,6 +28,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 BASE = "http://127.0.0.1:8903"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 PASS = 0
 FAIL = 0
 
@@ -157,11 +158,11 @@ def main():
         "ANKI_PREVIEW_MODE": "0",
         "ANKICONNECT_URL": "http://127.0.0.1:18766",
         "ANKI_QUICK_READ": "2",
-        "REVIEW_DIST_DIR": "/home/shioriko/anki-review-app/frontend/dist",
+        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
     })
     proc = subprocess.Popen(
-        ["/home/shioriko/anki-server/review-app/.venv/bin/uvicorn",
-         "--app-dir", "/home/shioriko/anki-review-app/backend",
+        [sys.executable, "-m", "uvicorn",
+         "--app-dir", str(REPO_ROOT / "backend"),
          "app:app", "--host", "127.0.0.1", "--port", "8903"],
         env=env, stdout=open("/tmp/rdcards_backend.log", "w"),
         stderr=subprocess.STDOUT,

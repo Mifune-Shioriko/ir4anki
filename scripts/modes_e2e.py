@@ -6,7 +6,7 @@ ANKI_STATE_DIR, so the user's live round.json/preview.json are untouched.
 Net-zero: no card is ever answered/approved/deferred; every started round
 is finished (cleared) in teardown.
 
-Run: ~/anki-server/review-app/.venv/bin/python modes_e2e.py
+Run: python scripts/modes_e2e.py   (needs the backend venv's deps + live AnkiConnect)
 """
 import asyncio
 import json
@@ -18,11 +18,11 @@ from pathlib import Path
 STATE = tempfile.mkdtemp(prefix="modes-e2e-state-")
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_PREVIEW_MODE"] = "1"
-os.environ["ANKI_MEDIA_DIR"] = str(
-    Path.home() / "anki-server/headless/data/shioriko/collection.media"
+os.environ.setdefault(
+    "ANKI_MEDIA_DIR", tempfile.mkdtemp(prefix="modes-e2e-media-")
 )
 
-sys.path.insert(0, str(Path.home() / "anki-review-app/backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
 import app as backend  # noqa: E402
@@ -157,7 +157,7 @@ async def main():
         s7 = (await c.get("/api/session/state")).json()
         check("final state none/idle", s7.get("state") == "none", s7.get("state"))
         check("no preview round left", s7.get("preview_round") is None)
-        live = Path.home() / "anki-server/review-app/state/round.json"
+        live = Path(os.environ.get("ANKI_LIVE_STATE", str(Path.home() / ".local/state/ir4anki"))) / "round.json"
         check("live round.json untouched (absent or stale)", not live.exists() or True)
 
     print(f"\n{PASS} passed, {FAIL} failed")

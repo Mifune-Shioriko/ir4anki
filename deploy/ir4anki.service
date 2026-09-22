@@ -1,0 +1,19 @@
+[Unit]
+Description=ir4anki — review web app (FastAPI + AnkiConnect)
+Documentation=https://github.com/Mifune-Shioriko/ir4anki
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO@/backend
+# built-in defaults; anything in ~/.config/ir4anki.env overrides them
+Environment=IR4ANKI_HOST=127.0.0.1
+Environment=IR4ANKI_PORT=8901
+EnvironmentFile=-%h/.config/ir4anki.env
+ExecStart=@REPO@/backend/.venv/bin/uvicorn --app-dir @REPO@/backend app:app --host ${IR4ANKI_HOST} --port ${IR4ANKI_PORT}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

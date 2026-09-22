@@ -34,7 +34,7 @@ Session model:
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
     a reading segment of {mode.read} note chunks (quick=2, focus=5,
     ANKI_QUICK_READ / ANKI_FOCUS_READ) runs BEFORE preview+review. The user
-    reads their own markdown notes (~/anki-notes, chunked by notes-rag's
+    reads their own markdown notes (~/anki-notes, chunked by the vendored
     chunker.py) and writes cards by hand. Per chunk: todo → active(正在制卡)
     → done(制卡完成), or skipped(无需制卡). Within a file only the frontier
     chunk is dealt, so later chunks stay locked until the frontier is
@@ -78,7 +78,6 @@ from pydantic import BaseModel
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ANKICONNECT = os.getenv("ANKICONNECT_URL", "http://127.0.0.1:8765")
-NOTES_RAG = os.getenv("NOTES_RAG_URL", "http://127.0.0.1:8791")
 
 # Anki collection.media directory (served back at /media/<name>)
 MEDIA_DIR = Path(os.getenv("ANKI_MEDIA_DIR", str(_REPO_ROOT / "collection.media")))
@@ -206,17 +205,16 @@ NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
 # Files are opt-in (阅读清单): the corpus mixes study notes with misc logs,
 # so nothing is auto-queued; the user adds files and orders them by hand
 # (decision #2). Round size rides the pacing modes: STUDY_MODES[*]["read"]
-# (decision #4). Chunks come from notes-rag's chunker.py (single source of
-# truth — imported, not copied) over ~/anki-notes.
+# (decision #4). Chunks come from the vendored backend/chunker.py over the
+# notes corpus (ANKI_NOTES_DIR).
 #
 # Gated on ANKI_READING_MODE like preview: off ⇒ endpoints 404, the wire
 # reports reading_mode=false and the frontend renders the legacy UI.
 READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes", "on")
 NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
-NOTES_RAG_DIR = os.getenv("NOTES_RAG_DIR", str(Path.home() / "notes-rag"))
 READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
 READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
-# same exclusion set notes-rag/sync.py uses
+# corpus scan exclusions (editor/tool dirs, never note content)
 NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
 
@@ -476,31 +474,6 @@ def html_to_text(html: str) -> str:
 # were RETIRED 2026-09-21 (user decision: RAG 匹配准确度达不到要求, explain
 # 没用). The left column's 相关卡片 list is EXACT segment provenance
 # (/api/reading/source cards_created), not similarity search.
-
-
-async def fetch_note_sections(note_id: int | None, top_k: int = 3) -> list[dict]:
-    """Ask notes-rag (:8791) for the note sections this card came from.
-
-    The right-hand note panel (Phase 1 of the 知识成体系 project) renders
-    the top-1 as a "page" with the rest switchable as tabs. Fail-soft like
-    the other enrichment calls: notes-rag down / card not embedded / note
-    gone → [] and the panel simply doesn't render. Timeout is generous
-    (6s) because notes-rag embeds on cache miss (one DashScope call) for
-    cards added after the last sync — a normal review must never wait on
-    that, so the frontend must treat this as async enrichment.
-    """
-    if not note_id:
-        return []
-    try:
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            r = await client.get(
-                f"{NOTES_RAG}/search", params={"note_id": note_id, "top_k": top_k}
-            )
-            r.raise_for_status()
-            results = r.json().get("results", [])
-            return results if isinstance(results, list) else []
-    except Exception:
-        return []
 
 
 async def fetch_cards(ids: list[int]) -> list[dict]:
@@ -1941,8 +1914,7 @@ async def _to_preview_pool_impl(card_id: int):
 # resurfaces at the head of the next reading round.
 #
 # Files are opt-in via the 阅读清单 (manual priority order = list order).
-# Chunking reuses notes-rag's chunker.py (imported, NOT copied — single
-# source of truth) over the ~/anki-notes corpus.
+# Chunking uses the vendored chunker.py over the notes corpus (ANKI_NOTES_DIR).
 #
 # Segment identity (user spec 2026-09-20 round 4): DB-issued seg_id per file
 # (PK path+seg_id, per-file counter, never reused). The chunker is now a
@@ -1970,11 +1942,9 @@ _chunker_mod = None
 
 
 def _chunker():
-    """Lazy-import notes-rag's chunker module (env NOTES_RAG_DIR)."""
+    """The vendored chunker module (backend/chunker.py, same dir as app.py)."""
     global _chunker_mod
     if _chunker_mod is None:
-        if NOTES_RAG_DIR not in sys.path:
-            sys.path.insert(0, NOTES_RAG_DIR)
         import chunker as _c
 
         _chunker_mod = _c
@@ -1996,8 +1966,8 @@ def _read_note_text(path: str) -> str | None:
 def _corpus_files() -> list[str]:
     """All non-empty .md files under NOTES_DIR (relative paths, sorted).
 
-    Same exclusion rules as notes-rag's sync (SKIP_DIRS + empty files), so
-    the corpus view matches what the note panel can retrieve.
+    Excludes NOTES_SKIP_DIRS + empty files, so the corpus view matches what
+    the reading list can queue.
     """
     if not NOTES_DIR.is_dir():
         return []
@@ -3812,7 +3782,7 @@ async def reading_source(note_id: int):
     """Reverse provenance lookup (round 4): note → source segment.
 
     Used by the review/preview UI to show a card's TRUE source (rcards is
-    exact history — notes-rag RAG was a similarity guess) and by the
+    exact history, not a similarity guess) and by the
     add-card dialogs to inherit reading_source for cards made while
     reviewing (卡 a 复习时制的卡 b 也归到 a 的片段). 404 = orphan card
     (pre-round-4, desktop-Anki-made, or source segment orphaned) — the UI
@@ -3874,7 +3844,7 @@ async def reading_source(note_id: int):
 @app.get("/api/reading/file")
 async def reading_file(path: str):
     """Raw markdown for the reading right-hand panel (served directly from
-    the corpus — independent of the notes-rag service being up)."""
+    the corpus)."""
     _reading_guard()
     text = _read_note_text(path)
     if text is None:
@@ -3972,41 +3942,6 @@ async def media_upload(file: UploadFile = File(...)):
 async def list_tags():
     """All tags in the collection, for autocomplete in the edit dialog."""
     return {"tags": await anki("getTags") or []}
-
-
-# ---- note panel (知识成体系 Phase 1: card → source note sections) ----------
-
-@app.get("/api/note/sections")
-async def note_sections(note_id: int, top_k: int = 3):
-    """Top-k note sections for a card, via notes-rag (:8791).
-
-    The frontend fetches this LAZILY per current card (not bundled into
-    fetch_cards): a review round shouldn't wait on note retrieval, and only
-    the card on screen needs its note. notes-rag embeds on cache miss, so
-    the first lookup of a fresh card can take a few seconds.
-    """
-    sections = await fetch_note_sections(note_id, top_k)
-    return {"sections": sections}
-
-
-@app.get("/api/notes/raw")
-async def notes_raw(path: str):
-    """Raw markdown of one note file, relayed from notes-rag (traversal-safe
-    there — it only ever reads under ~/anki-notes)."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(f"{NOTES_RAG}/file", params={"path": path})
-            if r.status_code == 404:
-                raise HTTPException(status_code=404, detail="note file not found")
-            if 400 <= r.status_code < 500:
-                # traversal / bad path — propagate as 400, never serve content
-                raise HTTPException(status_code=400, detail="invalid note path")
-            r.raise_for_status()
-            return r.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"notes-rag unreachable: {e}")
 
 
 @app.get("/media/{name:path}")

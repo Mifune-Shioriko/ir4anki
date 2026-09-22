@@ -23,7 +23,7 @@ collection nor ~/anki-notes nor the live state are touched. Covers:
  11. finish: clears the round, chunk states untouched (re-dealt next round)
  12. session/state + status carry reading fields
 
-Run: ~/anki-server/review-app/.venv/bin/python ~/anki-review-app/scripts/reading_test.py
+Run: python scripts/reading_test.py   (needs the backend venv's deps)
 """
 import asyncio
 import json
