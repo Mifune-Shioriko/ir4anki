@@ -15,6 +15,7 @@ declare module 'solid-js' {
       // chips (must live inside <md-chip-set>)
       'md-chip-set': any
       'md-assist-chip': any
+      'md-filter-chip': any
       'md-input-chip': any
       'md-suggestion-chip': any
 

@@ -189,21 +189,27 @@ export interface ReadingSource {
   breadcrumb: ReadingSourceCrumb[]
 }
 
-/** POST /api/reading/split (round 4): parent → container + 2k+1 children
- * (selected ranges todo, gaps background). Pure DB op, the .md is untouched. */
+/** POST /api/reading/split (round 4 + gap_policy): parent → container +
+ * 2k+1 children (selected ranges todo; gaps per policy — bookmark keeps the
+ * tail todo = 未读继续排队, extract sinks all gaps). Pure DB op, the .md is
+ * untouched. */
 export interface ReadingSplitChild {
   seg_id: number
   start_line: number
   end_line: number
   status: 'todo' | 'background'
+  /** bookmark 模式的未读尾段：不进当前轮，留在文件队列等 frontier */
+  tail?: boolean
 }
 
 export interface ReadingSplitResponse {
   ok: boolean
   parent_seg_id: number
+  gap_policy?: 'bookmark' | 'extract'
   children: ReadingSplitChild[]
-  /** full chunk payloads of the todo children — replace the on-screen
-   *  parent with these in place (no re-deal needed) */
+  /** full chunk payloads of the ON-SCREEN todo children (bookmark 的 tail
+   *  已排除) — replace the on-screen parent with these in place (no
+   *  re-deal needed) */
   child_chunks: ReadingChunk[]
 }
 

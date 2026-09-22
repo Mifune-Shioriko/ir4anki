@@ -3524,25 +3524,40 @@ class ReadingSplitBody(BaseModel):
     path: str
     seg_id: int
     # 1-based inclusive line ranges INSIDE the parent segment, sorted,
-    # disjoint. Each becomes a `todo` child; the gaps become `background`
-    # children (片段组合, round 4). Pure DB operation — the file is untouched.
+    # disjoint. Each becomes a `todo` child. Gap disposition follows
+    # `gap_policy` (spec §3.3, user spec 2026-09-22「切到哪里=书签」):
+    #   bookmark (DEFAULT, 进度声明): gap BEFORE the first selection →
+    #     background (已读); gap AFTER the last selection → todo (未读,
+    #     keeps queueing — a big segment is a book consumed by repeated
+    #     cuts); an empty tail (body < MIN_READING_BODY) degrades to
+    #     background; middle gaps (multi-selection) → background.
+    #   extract (提炼宣言, original r4): ALL gaps → background.
+    # Pure DB operation — the file is untouched.
     selections: list[dict]
+    gap_policy: str = "bookmark"
 
 
 @app.post("/api/reading/split")
 async def reading_split(body: ReadingSplitBody):
     """Recursive split: parent → container + 2k+1 children (round 4).
 
-    Rules (spec 2026-09-20 round 4):
+    Rules (spec 2026-09-20 round 4 + gap_policy 2026-09-22):
       - parent keeps its seg_id and EXACT range forever → cards already
         anchored to it stay valid (provenance never drifts on split);
       - parent becomes `container` (never dealt, read-only history);
       - children get fresh seg_ids, parent_seg_id = parent;
-      - selected ranges → todo (scheduled), gaps → background;
+      - selected ranges → todo (scheduled);
+      - gaps → `extract`: all background. `bookmark` (default): gap after
+        the LAST selection → todo (未读尾巴继续排队 — the cut is a bookmark;
+        the preview-pool gate on the selection's cards automatically holds
+        the tail until they're digested), other gaps → background;
       - a child can be split again — recursion is just interval refinement.
     """
     async with _state_lock:
         _reading_guard()
+        gap_policy = body.gap_policy
+        if gap_policy not in ("bookmark", "extract"):
+            raise HTTPException(status_code=400, detail="gap_policy must be bookmark|extract")
         data = _reading_read()
         entry = _find_entry(data, body.path)
         if entry is None:
@@ -3609,9 +3624,21 @@ async def reading_split(body: ReadingSplitBody):
                 _mk(cursor, a - 1, "background")
             _mk(a, b, "todo")
             cursor = b + 1
+        tail_seg_id = None
         if cursor <= p_end:
-            _mk(cursor, p_end, "background")
-        if not any(c["status"] == "todo" for c in children):
+            # gap AFTER the last selection: bookmark keeps it queued (todo,
+            # 未读 — the cut is a bookmark, not a discard); extract sinks it.
+            tail_status = "background"
+            if gap_policy == "bookmark":
+                tail_text = "\n".join(lines[cursor - 1 : p_end])
+                if _reading_worthwhile({"text": tail_text}):
+                    tail_status = "todo"
+                # an empty tail (< MIN_READING_BODY, e.g. trailing blanks)
+                # degrades to background — never deal a pointless card
+            _mk(cursor, p_end, tail_status)
+            if tail_status == "todo":
+                tail_seg_id = children[-1]["seg_id"]
+        if not any(c["status"] == "todo" for c in children if c["seg_id"] != tail_seg_id):
             raise HTTPException(status_code=400, detail="selections cover nothing new")
         # containerize the parent; cards_created STAY on it (provenance rule)
         parent["status"] = "container"
@@ -3620,7 +3647,10 @@ async def reading_split(body: ReadingSplitBody):
         # the parent may be mid-round: REPLACE it in pending with its todo
         # children (in place — the split children take the parent's position
         # so a mid-round split lands on the new smaller cards immediately)
-        # so the round doesn't strand on a container
+        # so the round doesn't strand on a container.
+        # bookmark 尾段 EXCLUDED (user spec 2026-09-22): the tail is 未读
+        # 「之后再推」— it stays in the FILE queue (frontier deals it next
+        # round, gated behind the selection's cards), NOT in this round.
         rd = data.get("round")
         if isinstance(rd, dict) and rd.get("status") == "active":
             pend = rd.get("pending", [])
@@ -3633,21 +3663,24 @@ async def reading_split(body: ReadingSplitBody):
             if at is not None:
                 todo_children = [
                     {"path": body.path, "chunk_key": str(c["seg_id"])}
-                    for c in children if c["status"] == "todo"
+                    for c in children
+                    if c["status"] == "todo" and c["seg_id"] != tail_seg_id
                 ]
                 pend[at : at + 1] = todo_children
                 rd["pending"] = pend
                 rd["total"] = rd.get("done", 0) + len(pend)
         _reading_write(data)
-        # full chunk payloads for the todo children (三栏前端, 2026-09-21):
-        # the caller replaces the on-screen parent chunk with these IN PLACE
-        # (reading round splice / trace detour), no extra round-trip needed.
+        # full chunk payloads for the ON-SCREEN todo children (三栏前端,
+        # 2026-09-21): the caller replaces the on-screen parent chunk with
+        # these IN PLACE (reading round splice / trace detour), no extra
+        # round-trip needed. The bookmark tail is excluded — it is not part
+        # of this round; it comes back through the frontier later.
         ordered_new, summary_new = _file_view(entry)
         by_key = {key: (ch, st) for ch, key, st in (ordered_new or [])}
         segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
         child_payloads = []
         for c in children:
-            if c["status"] != "todo":
+            if c["status"] != "todo" or c["seg_id"] == tail_seg_id:
                 continue
             hit = by_key.get(str(c["seg_id"]))
             if hit is None:
@@ -3659,9 +3692,11 @@ async def reading_split(body: ReadingSplitBody):
         return {
             "ok": True,
             "parent_seg_id": parent["seg_id"],
+            "gap_policy": gap_policy,
             "children": [
                 {"seg_id": c["seg_id"], "start_line": c["start_line"],
-                 "end_line": c["end_line"], "status": c["status"]}
+                 "end_line": c["end_line"], "status": c["status"],
+                 "tail": c["seg_id"] == tail_seg_id}
                 for c in children
             ],
             "child_chunks": child_payloads,

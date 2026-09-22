@@ -19,12 +19,16 @@ import { IconAdd, IconArrowBack, IconContentCut, IconPassword } from './icons'
 // The old 开始制卡 gate is GONE — chunks auto-mark 正在制卡 when a card or
 // cloze is created from them (backend _reading_record_card).
 //
-// 分割文段 (round-4 split, 2026-09-21): select text in the chunk body →
-// the icon maps the selection to source lines (block-granular, see
-// lib/split-selection.ts) → POST /api/reading/split: the selection becomes
-// a smaller todo reading card, the rest becomes background (un-scheduled
-// context, promotable later), the parent becomes a container keeping all
-// provenance. Disabled without a selection inside the body.
+// 分割文段 (round-4 split, 2026-09-21; gap_policy 2026-09-22): select text
+// in the chunk body → the icon maps the selection to source lines
+// (block-granular, see lib/split-selection.ts) → POST /api/reading/split.
+// Gap disposition follows the 切割语义 chips: 书签模式 (bookmark, DEFAULT) =
+// the selection becomes a smaller todo reading card, the UNREAD tail stays
+// todo (queued — the cut is a bookmark, gate paces it behind the selection's
+// cards), the read prefix sinks to background; 提炼模式 (extract) = only the
+// selection survives, all gaps sink to background (promotable later). The
+// parent always becomes a container keeping all provenance. Disabled without
+// a selection inside the body.
 //
 // 添加挖空 captures the CURRENT text selection inside the chunk body
 // (tracked via selectionchange — clicking the toolbar button clears the
@@ -71,6 +75,10 @@ interface Props {
   /** 分割文段: selection mapped to source-line range RELATIVE to the chunk
    *  text (caller adds line_start-1 for file lines) */
   onSplit: (sel: { start_line: number; end_line: number }) => void
+  /** 切割语义 (gap_policy, 2026-09-22): bookmark = 进度声明（未读尾巴留在
+   *  队列, 默认）, extract = 提炼宣言（未选中部分全部沉背景） */
+  gapPolicy: 'bookmark' | 'extract'
+  onGapPolicyChange: (p: 'bookmark' | 'extract') => void
   /** mid-round exit: untouched chunks stay todo/active (round only) */
   onExit: () => void
   /** 回到复习 (trace only) */
@@ -153,6 +161,32 @@ export const ReadingCard: Component<Props> = (props) => {
           </div>
 
           <div class="reading-crumb md-typescale-label-small">{crumb()}</div>
+
+          {/* 切割语义开关 (gap_policy, 2026-09-22): bookmark = 未读尾巴留在
+              队列（默认，user spec「切到哪里=书签」）; extract = 未选中部分
+              全部沉背景。状态由 App 持有并持久化（localStorage），round 和
+              trace 两个变体共用。 */}
+          <div class="gap-policy-row">
+            <md-chip-set class="gap-policy-chips" aria-label="切割语义">
+              <md-filter-chip
+                label="书签模式"
+                selected={props.gapPolicy === 'bookmark'}
+                title="切到哪里=书签：选中部分独立成卡，后面未读的部分留在队列，消化完卡片后自动推回来"
+                onClick={() => props.onGapPolicyChange('bookmark')}
+              />
+              <md-filter-chip
+                label="提炼模式"
+                selected={props.gapPolicy === 'extract'}
+                title="提炼宣言：只有选中的部分保留，未选中部分全部沉入背景（可在阅读清单提升）"
+                onClick={() => props.onGapPolicyChange('extract')}
+              />
+            </md-chip-set>
+            <span class="gap-policy-hint md-typescale-label-small">
+              {props.gapPolicy === 'bookmark'
+                ? '未读的尾巴留在队列'
+                : '未选中部分沉入背景'}
+            </span>
+          </div>
 
           <div
             class="card-content reading-chunk-body note-body md-typescale-body-medium"

@@ -19,6 +19,7 @@ chunk_key（`line_start:heading_path`，内容派生、编辑即漂移）换成 
 6. **卡片溯源 = rcards 反查**（精确历史），不是 RAG 相似度（猜测）→ **notes-rag 服务退役**（:8791、两次 daily sync timer、chunks.jsonl、embedding 缓存全下线）。**anki-rag（:8789 相似卡查重）保留**，与溯源无关。
 7. **复习/预览界面制卡继承来源**：过卡 a 时新制的卡 b 自动挂到 a 的 reading_source。无来源卡（历史卡/桌面 Anki 卡）= 孤儿，UI 显示「无来源」，不迁移不修补。
 8. **图片管线修复**：markdown-it `html:false` 吃原始 `<img>`、相对路径打到 /assets 404、`/media/` 只服务 Anki collection——三处断点用一条新路由 + 一条 image 渲染规则解决（P5）。
+9. **切割有两种语义，`gap_policy` 是一等概念**（2026-09-22，user spec）：`extract`（提炼宣言：缝隙=丢弃的上下文）与 `bookmark`（进度声明：切到哪里=书签，未读尾段继续排队）。默认 bookmark——用户的自然工作流是逐次消费大片段（每轮读一点、切出 valuable、消化完 gate 解冻后尾巴自动回来）；extract 保留给「整节读完只捞精华」。不做 tail 再分块：大片段不等于一次读完，递归切割本身就是消费方式。见 §3.3。
 
 ## 2. 数据模型（reading.db）
 
@@ -75,9 +76,21 @@ API 字段名 **chunk_key 保留**，值变为 `str(seg_id)`（前端当不透�
 `_deal_reading` 三阶段、`_reading_gates` B·二段重推、all_gated 语义、STUDY_MODES 配额全部原样，只把「遍历 chunker 输出+状态字典」换成「SELECT segments WHERE path=? AND status NOT IN ('container','background','done','skipped') ORDER BY start_line」。叶子顺序 = 文件顺序，天然成立。
 
 ### 3.3 切割 `POST /api/reading/split`
-`{path, seg_id, selections: [{start_line, end_line}, ...]}` → 一个事务：
+`{path, seg_id, selections: [{start_line, end_line}, ...], gap_policy: "bookmark"|"extract"}` → 一个事务：
 - 父 segment status→container（区间不动）；
-- 按 selections 生成 2k+1 个子 segment（parent_seg_id=父）：选中区间 status=todo（排期），其余 status=background；
+- 按 selections 生成 2k+1 个子 segment（parent_seg_id=父）：选中区间 status=todo（排期）；
+- **缝隙的 status 由 gap_policy 决定**（2026-09-22，user spec「切到哪里=书签」）：
+
+| 缝隙位置 | `bookmark`（默认） | `extract`（原行为） |
+|---|---|---|
+| 首个选区**之前** | background（已读） | background |
+| 末个选区**之后** | **todo（未读，继续排队）** | background |
+| 多选区之间 | background | background |
+
+- **bookmark = 进度语义**：大片段是一本书，逐次消费——每轮只读开头一点，切出 valuable 部分，尾巴留在队列。三状态读法：`background`=已读、选中 todo=已读且值得制卡、尾段 todo=未读待推。递归切对尾段同样成立（任何深度上未读部分都留在队列）。尾段实质为空（正文 < MIN_READING_BODY）时降级 background，不发空卡。
+- **extract = 提炼语义**：整段读完、只捞精华，缝隙全部沉底（promote 可捞回）。
+- **闸门自动节奏**：选中段制卡后挂在它身上 → 预览池 gate hold 住它 → 锁住整个文件 frontier → 尾段在卡解冻（次日）前不会被发牌。「消化完分割出来的部分再往下读」是现有 gate 机制的结构性必然，无需新调度逻辑。
+- **mid-round splice 只替换选中段**：bookmark 的尾段不进当前轮 `pending`（否则违背「之后再推」），留在文件队列；extract 行为不变（全部 todo children 原位替换）。
 - 零文件 I/O。
 
 规则：**父片段上挂的卡片锚点留在父（container）上，子片段全部拿新 seg_id**——卡片指向的区间永不被切割改写（rcards 不迁移）。

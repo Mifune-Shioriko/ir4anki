@@ -1265,6 +1265,24 @@ body {
   word-break: break-all;
 }
 
+/* 切割语义开关 (gap_policy, 2026-09-22): two mutually-exclusive filter chips
+ * (书签/提炼) + a one-line hint. Sits between the breadcrumb and the chunk
+ * body so the user picks the cut semantic before selecting text. */
+.gap-policy-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 10px;
+}
+.gap-policy-chips {
+  flex: 0 0 auto;
+}
+.gap-policy-hint {
+  color: var(--md-sys-color-on-surface-variant);
+  opacity: 0.85;
+}
+
 .reading-chunk-body {
   /* the chunk IS the reading surface — cap very long sections so the action
    * row stays reachable; the full file is always in the right panel */

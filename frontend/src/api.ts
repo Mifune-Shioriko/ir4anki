@@ -123,14 +123,20 @@ export const api = {
     get<{ cards: ReadingCreatedCard[]; degraded?: boolean }>(
       `/api/reading/cards?notes=${noteIds.join(',')}`,
     ),
-  /** 分割文段 (round 4): selected line ranges become todo children, gaps
-   *  become background; the parent becomes a container. selections =
-   *  1-based inclusive line ranges inside the file. */
+  /** 分割文段 (round 4 + gap_policy 2026-09-22): selected line ranges
+   *  become todo children; gaps follow the policy — `bookmark` (default,
+   *  进度声明): the tail after the last selection stays todo (未读, keeps
+   *  queueing), other gaps → background; `extract` (提炼宣言): ALL gaps →
+   *  background. The parent becomes a container. selections = 1-based
+   *  inclusive line ranges inside the file. */
   readingSplit: (
     path: string,
     segId: number,
     selections: { start_line: number; end_line: number }[],
-  ) => post<ReadingSplitResponse>('/api/reading/split', { path, seg_id: segId, selections }),
+    gapPolicy: 'bookmark' | 'extract' = 'bookmark',
+  ) => post<ReadingSplitResponse>('/api/reading/split', {
+    path, seg_id: segId, selections, gap_policy: gapPolicy,
+  }),
   readingListAdd: (path: string) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
   readingListRemove: (path: string) =>

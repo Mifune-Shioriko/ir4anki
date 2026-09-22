@@ -65,6 +65,29 @@ const writeStoredMode = (mode: string) => {
   }
 }
 
+// 切割语义 persistence (gap_policy, 2026-09-22): bookmark = 进度声明
+// (DEFAULT — the cut is a bookmark; the unread tail keeps queueing),
+// extract = 提炼宣言 (gaps sink to background). Same localStorage pattern
+// as the pacing mode.
+const GAP_POLICY_STORAGE_KEY = 'anki-reading-gap-policy'
+export type GapPolicy = 'bookmark' | 'extract'
+const readStoredGapPolicy = (): GapPolicy => {
+  try {
+    return localStorage.getItem(GAP_POLICY_STORAGE_KEY) === 'extract'
+      ? 'extract'
+      : 'bookmark'
+  } catch {
+    return 'bookmark'
+  }
+}
+const writeStoredGapPolicy = (p: GapPolicy) => {
+  try {
+    localStorage.setItem(GAP_POLICY_STORAGE_KEY, p)
+  } catch {
+    /* not critical */
+  }
+}
+
 type Phase =
   | 'loading'
   | 'start'
@@ -177,6 +200,16 @@ export const App: Component = () => {
   const chooseMode = (mode: string) => {
     setSelectedMode(mode)
     writeStoredMode(mode)
+  }
+
+  // ---- 切割语义 (gap_policy, 2026-09-22) ----
+  // bookmark (default) = 进度声明: the cut is a bookmark, the unread tail
+  // stays queued; extract = 提炼宣言: gaps sink to background. Shared by the
+  // round and trace ReadingCard variants; persisted across reloads.
+  const [gapPolicy, setGapPolicy] = createSignal<GapPolicy>(readStoredGapPolicy())
+  const chooseGapPolicy = (p: GapPolicy) => {
+    setGapPolicy(p)
+    writeStoredGapPolicy(p)
   }
 
   // ---- review/new split for the current batch (front-end only) ----
@@ -369,9 +402,10 @@ export const App: Component = () => {
   // server-side either way, the UI must not claim otherwise.
   const buildFallbackChildren = async (
     chunk: ReadingChunk,
-    children: { seg_id: number; start_line: number; end_line: number; status: string }[],
+    children: { seg_id: number; start_line: number; end_line: number; status: string; tail?: boolean }[],
   ): Promise<ReadingChunk[]> => {
-    const todos = children.filter(c => c.status === 'todo')
+    // bookmark 的未读尾段不进屏（child_chunks 已排除它）——fallback 同样排除
+    const todos = children.filter(c => c.status === 'todo' && !c.tail)
     if (todos.length === 0) return []
     try {
       const f = await api.readingFile(chunk.path)
@@ -400,9 +434,10 @@ export const App: Component = () => {
     const base = chunk.line_start - 1
     const selections = [{ start_line: base + sel.start_line, end_line: base + sel.end_line }]
     const wasTrace = traceOpen()
+    const policy = gapPolicy()
     setRdBusy(true)
     try {
-      const res = await api.readingSplit(chunk.path, chunk.seg_id, selections)
+      const res = await api.readingSplit(chunk.path, chunk.seg_id, selections, policy)
       let kids = res.child_chunks || []
       if (kids.length === 0) kids = await buildFallbackChildren(chunk, res.children || [])
       if (kids.length === 0) {
@@ -435,11 +470,18 @@ export const App: Component = () => {
         setRdTotal(t => t + kids.length - 1)
       }
       setRelatedToken(t => t + 1)
-      showSnack(
-        kids.length === 1
-          ? '已分割出 1 个新片段（未选中部分转入背景，可在阅读清单提升）'
-          : `已分割出 ${kids.length} 个新片段（未选中部分转入背景，可在阅读清单提升）`,
-      )
+      const hasTail = (res.children || []).some(c => c.tail && c.status === 'todo')
+      if (policy === 'bookmark' && hasTail) {
+        showSnack(
+          `已分割出 ${kids.length} 个片段；未读的尾巴留在队列，消化完卡片后会自动推回来`,
+        )
+      } else {
+        showSnack(
+          kids.length === 1
+            ? '已分割出 1 个新片段（未选中部分转入背景，可在阅读清单提升）'
+            : `已分割出 ${kids.length} 个新片段（未选中部分转入背景，可在阅读清单提升）`,
+        )
+      }
     } catch (e) {
       showSnack('分割失败：' + (e as Error).message)
     } finally {
@@ -1432,6 +1474,8 @@ export const App: Component = () => {
             onAdd={openReadingAdd}
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(rdCurrent()!, sel)}
+            gapPolicy={gapPolicy()}
+            onGapPolicyChange={chooseGapPolicy}
             onExit={rdFinish}
           />
         </Show>
@@ -1450,6 +1494,8 @@ export const App: Component = () => {
             onAdd={openReadingAdd}
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(traceChunk()!, sel)}
+            gapPolicy={gapPolicy()}
+            onGapPolicyChange={chooseGapPolicy}
             onExit={closeTrace}
             onBack={closeTrace}
           />
