@@ -1645,7 +1645,11 @@ export const App: Component = () => {
           column switches to ReadingPanel: the whole source file anchored at
           the current chunk (user spec 2026-09-19 — 中栏只展示 chunk，右边
           回溯整个笔记看上下文). */}
-      <Show when={isWide()}>
+      {/* Gated on centerOccupied() like the left column (user request
+          2026-09-22): start/done/empty screens stay single-column — the
+          idle 笔记来源 placeholder box used to render here and clutter the
+          开始学习 page. */}
+      <Show when={isWide() && centerOccupied()}>
         <div class="note-column">
           <Show
             when={leftChunk()}
