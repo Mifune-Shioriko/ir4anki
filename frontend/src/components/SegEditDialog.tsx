@@ -87,6 +87,9 @@ export const SegEditDialog: Component<Props> = (props) => {
         onScroll: syncPreviewScroll,
         onSave: () => { void save() },
       })
+      // one extra measure pass on the next frame: the dialog may still be
+      // settling (open animation / font loading) right after mount
+      requestAnimationFrame(() => cm?.requestMeasure())
       cm.focus()
       setBusy(false)
     } catch (e) {

@@ -31,6 +31,8 @@ export interface Cm6Handle {
   wrapSelection(marker: string): void
   /** editor scroll fraction (0..1) for one-way preview sync */
   scrollFraction(): number
+  /** force a viewport/line-metrics re-measure (after container animations) */
+  requestMeasure(): void
   focus(): void
   destroy(): void
 }
@@ -132,7 +134,15 @@ export function createMdEditor(parent: HTMLElement, opts: Cm6Options): Cm6Handle
         : []),
     ],
   })
-  const view = new EditorView({ state, parent })
+  // root: document — CRITICAL (user bug 2026-09-23). CM6 defaults to
+  // getRoot(parent), which walks up through assignedSlot/parentNode; inside
+  // md-dialog's slotted light DOM this resolves to the dialog's SHADOW root,
+  // so StyleModule.mount injects the base theme (.cm-scroller display:flex,
+  // gutter position:sticky, …) into an adoptedStyleSheets of a tree the
+  // editor is NOT in → zero styling: line numbers stack ABOVE the content,
+  // the scroller can't scroll, everything misaligns. Pinning root to the
+  // document mounts the styles where the editor actually renders.
+  const view = new EditorView({ state, parent, root: document })
 
   return {
     getText: () => view.state.doc.toString(),
@@ -167,6 +177,7 @@ export function createMdEditor(parent: HTMLElement, opts: Cm6Options): Cm6Handle
       const max = d.scrollHeight - d.clientHeight
       return max > 0 ? d.scrollTop / max : 0
     },
+    requestMeasure: () => view.requestMeasure(),
     focus: () => view.focus(),
     destroy: () => view.destroy(),
   }

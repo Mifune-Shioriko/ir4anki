@@ -132,6 +132,55 @@ def run(notes: Path):
               page.locator(".seg-edit-dialog .cm-editor").count() == 1)
         cm_text = page.locator(".seg-edit-dialog .cm-content").first.inner_text()
         check("CM6 holds the segment source", "浅层结构" in cm_text, cm_text[:60])
+        # regression (user report 2026-09-23): CM6 mounted during the dialog
+        # open animation cached garbage metrics → gutter line numbers desynced
+        # from content (行号在上内容在下), broken scrolling, clipped text.
+        # Assert: first gutter number vertically aligned with first content
+        # line, and gutter line-count == doc line-count.
+        align = page.evaluate("""() => {
+            const gutEls = [...document.querySelectorAll('.seg-edit-dialog .cm-lineNumbers .cm-gutterElement')]
+                .filter(e => getComputedStyle(e).visibility !== 'hidden');
+            const l = document.querySelector('.seg-edit-dialog .cm-line');
+            if (!gutEls.length || !l) return null;
+            const g = gutEls[0];
+            const gb = g.getBoundingClientRect(), lb = l.getBoundingClientRect();
+            const lines = document.querySelectorAll('.seg-edit-dialog .cm-content .cm-line').length;
+            const sc = document.querySelector('.seg-edit-dialog .cm-scroller');
+            return { dTop: Math.abs(gb.top - lb.top), dH: Math.abs(gb.height - lb.height),
+                     lines, gutters: gutEls.length, firstNum: g.textContent,
+                     display: getComputedStyle(sc).display };
+        }""")
+        check("gutter #1 aligned with first content line",
+              align is not None and align["dTop"] < 3 and align["firstNum"] == "1",
+              str(align))
+        check("scroller is flex (CM6 base theme mounted in the right root)",
+              align is not None and align["display"] == "flex", str(align))
+        # scrolling works: the editor scroller must not clip content when the
+        # doc is taller than the pane (type enough lines to overflow, scroll
+        # to the bottom, last line fully visible)
+        page.locator(".seg-edit-dialog .cm-content").click()
+        page.keyboard.press("Control+End")
+        for _ in range(30):
+            page.keyboard.press("Enter")
+        page.keyboard.type("滚动到底部标记ABC")
+        scrolled = page.evaluate("""() => {
+            const s = document.querySelector('.seg-edit-dialog .cm-scroller');
+            s.scrollTop = s.scrollHeight;
+            return new Promise(r => requestAnimationFrame(() => {
+                const lines = [...document.querySelectorAll('.seg-edit-dialog .cm-content .cm-line')];
+                const last = lines[lines.length - 1];
+                const sb = s.getBoundingClientRect(), lb = last.getBoundingClientRect();
+                r({ lastVisible: lb.bottom <= sb.bottom + 2 && lb.height > 4,
+                      hasScroll: s.scrollHeight > s.clientHeight });
+            }));
+        }""")
+        check("editor scrolls to bottom, last line fully visible",
+              scrolled and scrolled["hasScroll"] and scrolled["lastVisible"], scrolled)
+        # undo the scroll-test edits so later steps see the original segment
+        page.keyboard.press("Control+z")
+        page.wait_for_function(
+            "() => !document.querySelector('.seg-edit-dialog .cm-content')"
+            "?.textContent.includes('滚动到底部标记ABC')", timeout=5000)
         page.wait_for_selector(".seg-edit-preview h2", timeout=10000)
         pv = page.locator(".seg-edit-preview").first.inner_text()
         check("preview renders heading+text",
