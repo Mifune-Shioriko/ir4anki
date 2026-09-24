@@ -125,7 +125,7 @@ else
         echo "ANKI_PREVIEW_MODE=1"
         echo "ANKI_PREVIEW_DECK=预览池"
         echo "ANKI_PREVIEW_RELEASE_DECK=2026"
-        echo "ANKI_RELEASE_DAILY_GOAL=40"
+        echo "ANKI_RELEASE_DAILY_GOAL=45"
         echo "ANKI_READING_MODE=1"
         echo "ANKI_NEW_AGAIN_RETURN=1"
         echo "ANKI_ADD_MODEL=问答题"
