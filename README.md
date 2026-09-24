@@ -151,6 +151,7 @@ backend/.venv/bin/python scripts/reading_test.py
 backend/.venv/bin/python scripts/new_again_test.py
 backend/.venv/bin/python scripts/release_budget_test.py
 backend/.venv/bin/python scripts/modes_e2e.py
+backend/.venv/bin/python scripts/sync_throttle_test.py
 # UI tests additionally need: pip install playwright && playwright install chromium
 backend/.venv/bin/python scripts/reading_ui_test.py
 ```

@@ -54,6 +54,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -297,6 +298,8 @@ app.add_middleware(
 
 _sync_lock = asyncio.Lock()
 _sync_pending = False  # coalesce fire-and-forget syncs
+_sync_timer = None     # throttled tail: call_later handle (None = no tail armed)
+_sync_last_finish = 0.0  # loop.time() when the last sync completed (throttle base)
 
 # Serializes the read-modify-write cycles on round.json / preview.json in
 # the per-card mutation endpoints (answer, undo, preview act/undo, delete,
@@ -309,36 +312,101 @@ _sync_pending = False  # coalesce fire-and-forget syncs
 _state_lock = asyncio.Lock()
 
 
+log = logging.getLogger("ir4anki")
+# uvicorn's default logging config sets up its own loggers but leaves the
+# root logger handler-less — without this, INFO lines below would be
+# silently dropped (only WARNING+ would reach stderr via lastResort).
+# journald (systemd user unit) collects stderr: journalctl --user -u ir4anki
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+# Every AnkiConnect call goes through one global queue (L2). AnkiConnect
+# runs actions on Anki's main thread; concurrent HTTP requests pile up
+# inside the add-on and, together with frequent `sync` (which locks the
+# collection), made desktop Anki freeze. Serializing here means requests
+# wait in OUR queue (no timeout burn — the clock starts after acquiring)
+# instead of stacking up inside Anki. Lock order, never reversed:
+#   _state_lock -> _sync_lock -> _anki_lock
+_anki_lock = asyncio.Lock()
+
+# Slow-call threshold for a WARNING line (ms). Everything is logged at
+# INFO with its duration regardless — journald collects it all
+# (journalctl --user -u ir4anki).
+ANKI_SLOW_MS = int(os.getenv("ANKI_SLOW_MS", "2000"))
+
+# Minimum seconds between background syncs (L1). Every answer used to
+# fire a sync; with local Anki the answers come fast and syncs ran
+# back-to-back, keeping the collection locked most of the time. Now a
+# fire inside the cooldown window is remembered as a "tail": exactly one
+# delayed sync runs when the window expires. <=0 disables throttling
+# (old every-fire behaviour, still coalesced). Explicit do_sync() calls
+# (session finish, release) are NEVER throttled.
+SYNC_MIN_INTERVAL = float(os.getenv("ANKI_SYNC_MIN_INTERVAL", "120"))
+
+
 async def anki(action: str, params: dict | None = None, timeout: float = 30):
     payload = {"action": action, "version": 6, "params": params or {}}
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(ANKICONNECT, json=payload)
-        r.raise_for_status()
-        data = r.json()
+    async with _anki_lock:
+        t0 = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(ANKICONNECT, json=payload)
+                r.raise_for_status()
+                data = r.json()
+        except Exception as e:
+            ms = (time.monotonic() - t0) * 1000
+            log.error("anki %s FAILED after %.0fms: %s", action, ms, e)
+            raise
+    ms = (time.monotonic() - t0) * 1000
     if data.get("error"):
+        log.error("anki %s AnkiConnect error: %s", action, data["error"])
         raise HTTPException(status_code=502, detail=f"AnkiConnect: {data['error']}")
+    if ms >= ANKI_SLOW_MS:
+        log.warning("anki %s slow: %.0fms", action, ms)
+    else:
+        log.info("anki %s %.0fms", action, ms)
     return data.get("result")
 
 
 async def do_sync() -> bool:
-    global _sync_pending
+    """One sync through AnkiConnect. Forced paths call this directly;
+    fire_and_forget_sync() throttles the per-answer background path."""
+    global _sync_pending, _sync_timer, _sync_last_finish
     try:
         async with _sync_lock:
+            t0 = time.monotonic()
             await anki("sync", timeout=300)
+        log.info("sync done in %.1fs", time.monotonic() - t0)
         return True
-    except Exception:
+    except Exception as e:
+        log.warning("sync failed: %s", e)
         return False
     finally:
+        # absorb any throttled tail — the collection was just synced
+        if _sync_timer is not None:
+            _sync_timer.cancel()
+            _sync_timer = None
+        _sync_last_finish = asyncio.get_running_loop().time()
         _sync_pending = False
 
 
 def fire_and_forget_sync():
-    """Coalesced background sync: at most one pending at a time."""
-    global _sync_pending
+    """Coalesced + throttled background sync: at most one pending at a
+    time, and at most one per SYNC_MIN_INTERVAL seconds (tail delayed,
+    never dropped)."""
+    global _sync_pending, _sync_timer
     if _sync_pending:
         return
     _sync_pending = True
-    asyncio.get_running_loop().create_task(do_sync())
+    loop = asyncio.get_running_loop()
+    wait = SYNC_MIN_INTERVAL - (loop.time() - _sync_last_finish)
+    if SYNC_MIN_INTERVAL <= 0 or wait <= 0:
+        loop.create_task(do_sync())
+    else:
+        _sync_timer = loop.call_later(wait, lambda: loop.create_task(do_sync()))
 
 
 # ---- new-card drawing ------------------------------------------------------
