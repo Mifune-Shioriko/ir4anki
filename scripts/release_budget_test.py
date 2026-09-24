@@ -183,44 +183,49 @@ def client():
     return httpx.AsyncClient(transport=transport, base_url="http://t", timeout=30)
 
 
-async def scenario_cap_applies_to_both_modes():
-    print("== 1. budget 6 (< max size 10): BOTH quick and focus deal 6 ==")
+async def scenario_cap_applies():
+    print("== 1. budget 6 (< daily size 15): deals 6 ==")
     fresh()
     setup(goal=40, released_today=34)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
-        check("focus deals 6 (not 10)", len(r["cards"]) == 6, len(r["cards"]))
+        r = (await c.post("/api/preview/start?mode=daily")).json()
+        check("daily deals 6 (not 15)", len(r["cards"]) == 6, len(r["cards"]))
         check("preview_per_round=6", r.get("preview_per_round") == 6, r.get("preview_per_round"))
         prd = json.loads((Path(STATE) / "preview.json").read_text())
         check("round total=6", prd.get("total") == 6, prd.get("total"))
         capped = r.get("study_modes") or {}
-        check("wire table capped: focus preview=6",
-              (capped.get("focus") or {}).get("preview") == 6, capped)
-        check("wire table capped: quick preview=6",
-              (capped.get("quick") or {}).get("preview") == 6, capped)
+        check("wire table capped: daily preview=6",
+              (capped.get("daily") or {}).get("preview") == 6, capped)
         await c.post("/api/preview/finish")
 
-        r = (await c.post("/api/preview/start?mode=quick")).json()
-        check("quick also deals 6 (not 5)", len(r["cards"]) == 6, len(r["cards"]))
-        await c.post("/api/preview/finish")
+
+async def scenario_legacy_mode_normalizes():
+    print("== 1b. legacy quick/focus normalize to the single daily tier ==")
+    fresh()
+    setup(goal=40, released_today=34)
+    async with client() as c:
+        for legacy in ("quick", "focus", "BOGUS"):
+            r = (await c.post(f"/api/preview/start?mode={legacy}")).json()
+            check(f"mode={legacy} → daily, deals 6",
+                  r.get("mode") == "daily" and len(r["cards"]) == 6,
+                  (r.get("mode"), len(r["cards"])))
+            await c.post("/api/preview/finish")
 
 
 async def scenario_no_cap_while_budget_large():
-    print("== 2. budget 32 (>= 10): normal sizes 5/10 ==")
+    print("== 2. budget 32 (>= 15): normal daily size 15 ==")
     fresh()
     setup(goal=40, released_today=8)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
-        check("focus deals 10", len(r["cards"]) == 10, len(r["cards"]))
+        r = (await c.post("/api/preview/start?mode=daily")).json()
+        check("daily deals 15", len(r["cards"]) == 15, len(r["cards"]))
         await c.post("/api/preview/finish")
-        r = (await c.post("/api/preview/start?mode=quick")).json()
-        check("quick deals 5", len(r["cards"]) == 5, len(r["cards"]))
         s = (await c.get("/api/session/state")).json()
         check("state release_budget_left=32", s.get("release_budget_left") == 32,
               s.get("release_budget_left"))
-        check("state study_modes raw", (s.get("study_modes") or {}).get("focus", {}).get("preview") == 10,
+        check("state study_modes raw preview=15",
+              (s.get("study_modes") or {}).get("daily", {}).get("preview") == 15,
               s.get("study_modes"))
-        await c.post("/api/preview/finish")
 
 
 async def scenario_exhausted():
@@ -228,7 +233,7 @@ async def scenario_exhausted():
     fresh()
     setup(goal=40, released_today=40)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
+        r = (await c.post("/api/preview/start?mode=daily")).json()
         check("no cards dealt", r["cards"] == [], r["cards"])
         check("goal_reached flag", r.get("goal_reached") is True, r)
         check("no active round written", not (Path(STATE) / "preview.json").exists()
@@ -237,7 +242,7 @@ async def scenario_exhausted():
         check("state release_budget_left=0", s.get("release_budget_left") == 0,
               s.get("release_budget_left"))
         check("state capped table preview=0",
-              (s.get("study_modes") or {}).get("quick", {}).get("preview") == 0,
+              (s.get("study_modes") or {}).get("daily", {}).get("preview") == 0,
               s.get("study_modes"))
 
 
@@ -246,7 +251,7 @@ async def scenario_over_goal_clamps_to_zero():
     fresh()
     setup(goal=40, released_today=43)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=quick")).json()
+        r = (await c.post("/api/preview/start?mode=daily")).json()
         check("goal_reached when over", r.get("goal_reached") is True, r)
 
 
@@ -255,7 +260,7 @@ async def scenario_defer_does_not_consume():
     fresh()
     fake = setup(goal=40, released_today=34)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
+        r = (await c.post("/api/preview/start?mode=daily")).json()
         ids = [x["cardId"] for x in r["cards"]]
         # defer 2, approve 1 (user's example shape)
         await c.post(f"/api/preview/act?card_id={ids[0]}&action=defer")
@@ -271,7 +276,7 @@ async def scenario_defer_does_not_consume():
         check("approved card stamped", STAMP in fake._tags(ids[2]), fake._tags(ids[2]))
         # finish the round, start the next: must deal exactly 5
         await c.post("/api/preview/finish")
-        r2 = (await c.post("/api/preview/start?mode=focus")).json()
+        r2 = (await c.post("/api/preview/start?mode=daily")).json()
         check("next round deals 5 (40-35)", len(r2["cards"]) == 5, len(r2["cards"]))
         await c.post("/api/preview/finish")
 
@@ -281,7 +286,7 @@ async def scenario_undo_gives_budget_back():
     fresh()
     setup(goal=40, released_today=39)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
+        r = (await c.post("/api/preview/start?mode=daily")).json()
         check("deals 1 (budget 1)", len(r["cards"]) == 1, len(r["cards"]))
         cid = r["cards"][0]["cardId"]
         a = (await c.post(f"/api/preview/act?card_id={cid}&action=approve")).json()
@@ -289,7 +294,7 @@ async def scenario_undo_gives_budget_back():
         check("act reports budget 0", a.get("release_budget_left") == 0,
               a.get("release_budget_left"))
         check("act capped table preview=0",
-              (a.get("study_modes") or {}).get("focus", {}).get("preview") == 0,
+              (a.get("study_modes") or {}).get("daily", {}).get("preview") == 0,
               a.get("study_modes"))
         u = (await c.post("/api/preview/undo")).json()
         check("undo ok", u.get("restored") is True, u)
@@ -304,8 +309,8 @@ async def scenario_goal_disabled():
     fresh()
     setup(goal=0, released_today=999)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
-        check("focus deals full 10 despite 999 released", len(r["cards"]) == 10,
+        r = (await c.post("/api/preview/start?mode=daily")).json()
+        check("daily deals full 15 despite 999 released", len(r["cards"]) == 15,
               len(r["cards"]))
         s = (await c.get("/api/session/state")).json()
         check("budget None (disabled)", s.get("release_budget_left") is None,
@@ -318,7 +323,7 @@ async def scenario_active_round_per_round_is_total():
     fresh()
     setup(goal=40, released_today=37)
     async with client() as c:
-        r = (await c.post("/api/preview/start?mode=focus")).json()
+        r = (await c.post("/api/preview/start?mode=daily")).json()
         check("deals 3", len(r["cards"]) == 3, len(r["cards"]))
         s = (await c.get("/api/session/state")).json()
         check("state preview_per_round=3", s.get("preview_per_round") == 3,
@@ -327,7 +332,8 @@ async def scenario_active_round_per_round_is_total():
 
 
 async def main():
-    await scenario_cap_applies_to_both_modes()
+    await scenario_cap_applies()
+    await scenario_legacy_mode_normalizes()
     await scenario_no_cap_while_budget_large()
     await scenario_exhausted()
     await scenario_over_goal_clamps_to_zero()

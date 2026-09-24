@@ -91,13 +91,14 @@ ROUND_FILE = STATE_DIR / "round.json"
 
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
-# ---- two pacing modes (user spec 2026-09-14, sizes retuned 2026-09-16) ----
-# quick = 碎片时间 (queue at the canteen): the 5+5+20 rhythm, meant to
-#         be opened many times a day.
-# focus = 整块时间 (a free afternoon block): 10+10+30, roughly 2× quick.
-# The mode is picked per round on the start screen and PERSISTS in
-# round.json / preview.json (page refresh resumes the same mode); 'more'
-# inherits the completed round's mode. All numbers env-overridable.
+# ---- single daily pacing (user spec 2026-09-24) ----
+# One round shape, run 早/中/晚: 4 reading segments + 15 preview + a review
+# batch of 15 new + ceil(D/3) reviews, where D = the due-card count
+# SNAPSHOTTED at the day's first review deal (daily.json, Anki-day keyed —
+# three rounds then clear the day's due pile). The old quick/focus tiers are
+# retired; `mode` survives on the wire as an opaque compat field and every
+# unknown value normalizes to "daily". review=0 in the static table means
+# "dynamic" — the wire copy carries the computed size. Sizes env-overridable.
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
@@ -105,20 +106,68 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 STUDY_MODES: dict[str, dict[str, int]] = {
-    "quick": {
-        "read": _env_int("ANKI_QUICK_READ", 2),
-        "preview": _env_int("ANKI_QUICK_PREVIEW", 5),
-        "new": _env_int("ANKI_QUICK_NEW", 5),
-        "review": _env_int("ANKI_QUICK_REVIEW", 20),
-    },
-    "focus": {
-        "read": _env_int("ANKI_FOCUS_READ", 5),
-        "preview": _env_int("ANKI_FOCUS_PREVIEW", 10),
-        "new": _env_int("ANKI_FOCUS_NEW", 10),
-        "review": _env_int("ANKI_FOCUS_REVIEW", 30),
+    "daily": {
+        "read": _env_int("ANKI_DAILY_READ", 4),
+        "preview": _env_int("ANKI_DAILY_PREVIEW", 15),
+        "new": _env_int("ANKI_DAILY_NEW", 15),
+        "review": 0,  # dynamic: ceil(due snapshot / divisor), see below
     },
 }
-DEFAULT_MODE = "quick"
+DEFAULT_MODE = "daily"
+REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 3))
+
+# Daily due snapshot (user spec 2026-09-24): D is captured ONCE per Anki day
+# at the first review deal, so 早/中/晚 rounds each take ceil(D/3) and the
+# day's due pile drains evenly instead of a live count decaying round over
+# round (live ceil(due/3) three times only covers ~70%).
+DAILY_FILE = STATE_DIR / "daily.json"
+
+
+def _daily_read() -> dict:
+    try:
+        d = json.loads(DAILY_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _daily_write(d: dict | None) -> None:
+    STATE_DIR.mkdir(exist_ok=True)
+    if d is None:
+        DAILY_FILE.unlink(missing_ok=True)
+        return
+    tmp = DAILY_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d))
+    tmp.replace(DAILY_FILE)
+
+
+async def _daily_review_size(snapshot: bool = False) -> int:
+    """ceil(D/3) for the current Anki day.
+
+    snapshot=True (review deal): capture D NOW if today has no snapshot yet.
+    snapshot=False (wire display / status): never persist — show the size
+    from today's snapshot, else from the live due count (so an incidental
+    status poll can't lock in a bogus D). AnkiConnect failure → 0 reviews
+    (new cards still deal); no snapshot is written on failure."""
+    day = _anki_day()
+    d = _daily_read()
+    if d.get("day") == day and isinstance(d.get("due"), int):
+        due = d["due"]
+    else:
+        try:
+            ids = await anki("findCards", {"query": "is:due -is:new"})
+            due = len(ids or [])
+        except Exception:
+            return 0
+        if snapshot:
+            _daily_write({
+                "day": day,
+                "due": due,
+                "snapshot_at": datetime.now().isoformat(timespec="seconds"),
+            })
+    if due <= 0:
+        return 0
+    return -(-due // REVIEW_DUE_DIVISOR)  # ceil division
 
 # Daily goal for new-card releases (放行) — progress bar on the preview
 # start screen (user spec 2026-09-16) AND a hard cap on preview dealing
@@ -129,11 +178,16 @@ DEFAULT_MODE = "quick"
 # the wire field `pending_release` (cards approved TODAY, still suspended,
 # released tomorrow) — cap and bar can never disagree. Deferred cards
 # (明天再看) do NOT consume the budget; undoing an approval gives it back.
-# <=0 disables both the bar and the cap. Env-overridable.
-RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 40)
+# <=0 disables both the bar and the cap. Env-overridable. Default 45 =
+# 3 rounds × 15 preview (single daily pacing, user spec 2026-09-24).
+RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 45)
 
 def study_mode(name: str | None) -> str:
-    """Validate/normalize a mode name; falls back to the default."""
+    """Validate/normalize a mode name; falls back to the default.
+
+    The quick/focus tiers are retired (single daily pacing, 2026-09-24);
+    every legacy/unknown value normalizes to "daily", so a persisted
+    round.json/preview.json mode from before the change still resolves."""
     return name if name in STUDY_MODES else DEFAULT_MODE
 
 # ---- preview mode (先看后考: read new cards before they enter testing) ----
@@ -240,32 +294,46 @@ def _active_preview_per_round() -> int | None:
     return None
 
 
-def _capped_study_modes(budget: int | None) -> dict[str, dict[str, int]]:
-    """STUDY_MODES with each tier's `preview` size adapted to the remaining
-    daily release budget (user spec 2026-09-16).
+def _capped_study_modes(budget: int | None, review_size: int | None = None) -> dict[str, dict[str, int]]:
+    """Wire copy of STUDY_MODES, adapted to live numbers:
 
-    budget=None (goal disabled) → the raw table unchanged. While the budget
-    is at least the biggest preview size every tier deals its normal size;
-    once it drops below (e.g. 34 released of 40 → 6 left), EVERY tier deals
-    exactly what's left — one round lands the goal instead of dragging it
-    across several quick rounds. The frontend renders sizes from this table
-    only, so the rule lives in exactly one place.
+    - `preview` tracks the remaining daily release budget (user spec
+      2026-09-16): once the budget drops below the normal size, deal
+      exactly what's left — one round lands the goal instead of dragging it
+      across rounds. budget=None (goal disabled) → size unchanged.
+    - `review` is DYNAMIC (single daily pacing 2026-09-24): ceil(D/3) from
+      the daily due snapshot. review_size=None leaves the static 0
+      placeholder (AnkiConnect unavailable — the frontend then hides the
+      number instead of showing a bogus 0).
+
+    The frontend renders sizes from this table only, so the rules live in
+    exactly one place.
     """
-    if budget is None:
-        return STUDY_MODES
-    max_preview = max(m["preview"] for m in STUDY_MODES.values())
-    return {
-        name: {
-            **sizes,
-            "preview": budget if budget < max_preview else min(sizes["preview"], budget),
-        }
-        for name, sizes in STUDY_MODES.items()
-    }
+    out = {}
+    for name, sizes in STUDY_MODES.items():
+        row = dict(sizes)
+        if budget is not None:
+            row["preview"] = min(sizes["preview"], budget)
+        if review_size is not None:
+            row["review"] = review_size
+        out[name] = row
+    return out
+
+
+async def _wire_study_modes(budget: int | None) -> dict[str, dict[str, int]]:
+    """_capped_study_modes with the dynamic review size resolved (display
+    mode — never persists a snapshot)."""
+    try:
+        review_size = await _daily_review_size(snapshot=False)
+    except Exception:
+        review_size = None
+    return _capped_study_modes(budget, review_size)
 
 
 def _capped_preview_size(mode: str, budget: int | None) -> int:
     """Preview batch size for one round: the mode's size, adapted to the
-    remaining daily release budget (see _capped_study_modes)."""
+    remaining daily release budget (see _capped_study_modes). Sync — the
+    preview size never depends on the dynamic review number."""
     return _capped_study_modes(budget)[mode]["preview"]
 
 # stamp tag added on approve; the card is released (unsuspended) when this
@@ -643,7 +711,7 @@ async def status():
             "reading_mode": READING_MODE,
             # two pacing modes (user spec 2026-09-14) — the frontend renders
             # the start-screen choice from this table, never hardcoded
-            "study_modes": _capped_study_modes(budget),
+            "study_modes": await _wire_study_modes(budget),
             "default_mode": DEFAULT_MODE,
             # daily 放行 goal for the preview-start progress bar (2026-09-16)
             "release_daily_goal": RELEASE_DAILY_GOAL,
@@ -676,8 +744,11 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
     if PREVIEW_MODE:
         await release_yesterday_approved()
     m = STUDY_MODES[mode]
+    # dynamic review size (2026-09-24): ceil(D/3) with D = today's due
+    # snapshot, captured on the day's FIRST review deal (snapshot=True)
+    review_n = await _daily_review_size(snapshot=True)
     cards, due_remaining, new_total = await build_batch(
-        m["review"], allow_new=True, new_count=m["new"]
+        review_n, allow_new=True, new_count=m["new"]
     )
     if cards:
         _round_write(
@@ -709,7 +780,7 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": _capped_study_modes(budget),
+        "study_modes": await _wire_study_modes(budget),
     }
 
 
@@ -741,9 +812,11 @@ async def _session_state_impl():
     # render the preview UI at all — feature flag off ⇒ exact legacy shape)
     preview: dict = {
         "preview_mode": PREVIEW_MODE,
-        # pacing-mode table for the start screens (2026-09-14) — the UI
-        # renders the quick/focus choice from this, never hardcoded numbers
-        "study_modes": STUDY_MODES,
+        # pacing table for the start screen (single daily tier, 2026-09-24) —
+        # the UI renders today's plan from this, never hardcoded numbers.
+        # PREVIEW_MODE replaces this below with the budget-capped copy, so
+        # only resolve the dynamic review size once (one findCards either way).
+        "study_modes": None if PREVIEW_MODE else await _wire_study_modes(None),
         "default_mode": DEFAULT_MODE,
         # daily 放行 goal for the preview-start progress bar (2026-09-16);
         # the bar tracks pending_release below against this goal
@@ -766,7 +839,7 @@ async def _session_state_impl():
         except Exception:
             budget = None
         preview["release_budget_left"] = budget
-        preview["study_modes"] = _capped_study_modes(budget)
+        preview["study_modes"] = await _wire_study_modes(budget)
         try:
             pool = await preview_pool_ids()
             deferred = await _deferred_today_cards(pool)
@@ -893,16 +966,19 @@ async def session_more():
 async def _session_more_impl():
     """'Keep going' — another full batch: reviews + a fresh random new draw.
 
-    INHERITS the pacing mode of the round that just finished (2026-09-14):
-    a focus session chains focus-sized batches, a quick session quick ones.
+    Legacy endpoint (the single-flow UI 2026-09-24 no longer offers 继续复习);
+    kept working for API compat. Uses the day's due SNAPSHOT (snapshot=False
+    — 'more' always follows a 'start' that captured it, and a display-only
+    read can't corrupt the day's divisor base).
     """
     if PREVIEW_MODE:
         await release_yesterday_approved()
     rd = current_round()
     mode = study_mode((rd or {}).get("mode"))
     m = STUDY_MODES[mode]
+    review_n = await _daily_review_size(snapshot=False)
     cards, due_remaining, new_total = await build_batch(
-        m["review"], allow_new=True, new_count=m["new"]
+        review_n, allow_new=True, new_count=m["new"]
     )
     if cards:
         _round_write(
@@ -929,7 +1005,7 @@ async def _session_more_impl():
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": _capped_study_modes(budget),
+        "study_modes": await _wire_study_modes(budget),
     }
 
 
@@ -1474,7 +1550,7 @@ async def _preview_start_impl(mode: str = DEFAULT_MODE):
             "available": len(available),
             "mode": mode,
             "goal_reached": True,
-            "study_modes": _capped_study_modes(budget),
+            "study_modes": await _wire_study_modes(budget),
         }
     # random draw (2026-09-04 spec) — mirrors the review-round new draw
     per_round = _capped_preview_size(mode, budget)
@@ -1498,7 +1574,7 @@ async def _preview_start_impl(mode: str = DEFAULT_MODE):
         "mode": mode,
         "preview_per_round": per_round,
         # capped table so the UI's size labels track the budget immediately
-        "study_modes": _capped_study_modes(budget),
+        "study_modes": await _wire_study_modes(budget),
     }
 
 
@@ -1603,7 +1679,7 @@ async def _preview_act_impl(card_id: int, action: str):
             "available": len(remaining) - len(deferred),
             "mode": study_mode(rd.get("mode")),
             "release_budget_left": budget,
-            "study_modes": _capped_study_modes(budget),
+            "study_modes": await _wire_study_modes(budget),
         }
     _preview_write(rd)
     return {"ok": True, "round_complete": False}
@@ -3487,13 +3563,16 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
     per_round = STUDY_MODES[mode].get("read", 0)
     gated = await _reading_gates(data)
     payloads = _deal_reading(data, per_round, gated) if per_round > 0 else []
+    # resolved pacing table (dynamic review size, 2026-09-24) — the frontend
+    # pipes this into its studyModes signal, so it must not carry review=0
+    modes = await _wire_study_modes(None)
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
         return {
             "chunks": [],
             "mode": mode,
             "empty": True,
-            "study_modes": STUDY_MODES,
+            "study_modes": modes,
             # why nothing was dealt: all_gated = every remaining chunk is
             # waiting on its cards to clear the preview pipeline (the UI can
             # then say 「等卡片过预览池」 instead of 「清单读完了」)
@@ -3516,7 +3595,7 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
         "chunks": payloads,
         "mode": mode,
         "empty": False,
-        "study_modes": STUDY_MODES,
+        "study_modes": modes,
     }
 
 

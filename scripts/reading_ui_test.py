@@ -8,25 +8,27 @@ dir, the real collection and ~/anki-notes are all untouched. Preview mode
 is OFF so the funnel is reading → review and no release-budget logic mixes
 in.
 
-Covers (round-3 layout: LEFT NAV RAIL + progress RING + 文件 browser;
-round-2 features still asserted: header icon actions + state-only bottom
-row + folder-tree picker + cloze dialog):
+Covers (single daily pipeline, user spec 2026-09-24 + round-3 layout: LEFT
+NAV RAIL + progress RING + 文件 browser):
   1. nav rail: three destinations (学习/文件/阅读清单), NO old top bar
   2. 阅读清单 section: TREE picker (folder rows collapse/expand, file rows
-     add), reorder buttons render, progress rows
+     add), reorder buttons render, progress rows (whole-file seeding = 0/1)
   3. 文件 section: folder tree + read-only file viewer (markdown renders)
-  4. readingStart screen: stats, mode tiles carry 阅读 N from the wire
-  5. reading round: header icon buttons 添加卡片/添加挖空, bottom row =
-     state buttons ONLY (no 开始制卡 anywhere), chunk markdown + breadcrumb
-     + status chip; right panel renders the WHOLE file with anchors;
-     progress shown as a RING with done/total centered (no detail rows)
+  4. unified start screen: NO mode tiles (quick/focus retired), today's plan
+     from the wire, single 开始 button
+  5. 开始 → reading stage: header icon buttons 添加卡片/添加挖空, bottom row =
+     state buttons ONLY, WHOLE-FILE chunk card + status chip; right panel
+     renders the file with anchors; progress RING in the rail footer
   6. 制卡完成 works straight from 未读 (no active gate); complete advances
   7. refresh mid-round resumes the same chunk
   8. cloze dialog opens (添加挖空 icon) and degrades gracefully with dead
      AnkiConnect (error shown, closable)
-  9. skip advances; readingDone shows separated stats; 再读一轮 deals next
- 10. narrow viewport: no right column during reading
- 11. finish clears the round (backend state)
+  9. narrow viewport: no right column during reading
+ 10. draining the reading round AUTO-CHAINS into the next stage (no
+     readingDone stats page; the chain's deal fails against the dead
+     AnkiConnect, proving the transition fired)
+ 11. backend state after the chain: reading round no longer active; list
+     progress updated (1 segment per file)
 
 Run: python scripts/reading_ui_test.py   (needs playwright + the backend venv deps)
 """
@@ -124,8 +126,7 @@ def main():
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
         "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
-        "ANKI_QUICK_READ": "2",
-        "ANKI_FOCUS_READ": "5",
+        "ANKI_DAILY_READ": "4",
         "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
     })
     proc = subprocess.Popen(
@@ -176,17 +177,10 @@ def run(state):
               "nav-rail__item--active" in items.nth(0).get_attribute("class"))
         title = page.locator(".screen-title").first.inner_text()
         print(f"  (study funnel landed on: {title})")
-        # top-edge alignment on START screens (user report 2026-09-20: 首页
-        # misaligned because .screen added 40px above the card while the
-        # note panel starts at the .content padding edge). Measure the CARD
-        # boxes themselves (.note-column is a wrapper with 24px padding).
-        screen_card_y = page.locator(
-            ".columns .content md-elevated-card").first.bounding_box()["y"]
-        note_card_y = page.locator(
-            ".note-column md-elevated-card").first.bounding_box()["y"]
-        check("screen card and note panel top edges aligned (start screen)",
-              abs(screen_card_y - note_card_y) <= 2,
-              f"screen_card={screen_card_y} note_card={note_card_y}")
+        # start screens stay SINGLE-column (2026-09-22 gating; the old
+        # note-panel top-edge alignment check died with the idle placeholder)
+        check("start screen: no note column (single-column idle)",
+              page.locator(".note-column").count() == 0)
         check("no ring on start screens (no active round)",
               page.locator(".progress-ring").count() == 0)
 
@@ -259,12 +253,15 @@ def run(state):
         check("rail 阅读清单 badge shows (2)",
               "(2)" in page.locator(".nav-rail").inner_text(),
               page.locator(".nav-rail").inner_text())
-        # row progress by name (add order = 颈部 then 上肢)
+        # row progress by name (add order = 颈部 then 上肢). Whole-file
+        # seeding (2026-09-24): each file = ONE segment until split.
         neck_row = page.locator(".reading-list-item", has_text="颈部").first
         arm_row = page.locator(".reading-list-item", has_text="上肢").first
-        check("颈部 row 进度 0 / 3", "进度 0 / 3" in neck_row.inner_text(),
+        check("颈部 row 进度 0 / 1 (whole-file seed)",
+              "进度 0 / 1" in neck_row.inner_text(),
               neck_row.inner_text())
-        check("上肢 row 进度 0 / 2", "进度 0 / 2" in arm_row.inner_text(),
+        check("上肢 row 进度 0 / 1 (whole-file seed)",
+              "进度 0 / 1" in arm_row.inner_text(),
               arm_row.inner_text())
         check("frontier label 未读", "未读" in neck_row.inner_text())
         # md-icon-button is a custom element: disabled is a PROPERTY — read
@@ -282,29 +279,31 @@ def run(state):
         items.nth(0).click()  # 学习
         page.wait_for_selector(".screen-title", timeout=15000)
 
-        # ---- 3. readingStart screen ----
+        # ---- 3. unified start screen (single daily pacing, 2026-09-24) ----
         page.wait_for_timeout(800)
         title = page.locator(".screen-title").first.inner_text()
-        check("funnel lands on 渐进制卡 start", "渐进制卡" in title, title)
-        tiles = page.locator(".mode-tile")
-        check("mode tiles render", tiles.count() == 2, tiles.count())
-        check("quick tile shows 阅读 2 (wire)",
-              "阅读 2" in tiles.nth(0).inner_text(), tiles.nth(0).inner_text())
-        check("focus tile shows 阅读 5 (wire)",
-              "阅读 5" in tiles.nth(1).inner_text(), tiles.nth(1).inner_text())
-        # 管理阅读清单: text only, NO leading icon (user 2026-09-20: icon
-        # broke the button alignment)
-        manage_btn = page.locator("md-text-button", has_text="管理阅读清单").first
-        check("管理阅读清单 has no icon", manage_btn.locator("md-icon").count() == 0)
+        check("funnel lands on the unified 开始学习 start screen",
+              "开始学习" in title, title)
+        # the old per-stage start screens + mode tiles are retired
+        check("mode tiles are gone", page.locator(".mode-tile").count() == 0)
+        check("渐进制卡 start screen is gone",
+              page.locator(".screen-title", has_text="渐进制卡").count() == 0)
+        plan = page.locator(".screen-stats").first.inner_text()
+        check("plan shows 阅读 4 段 (wire)", "阅读" in plan and "4 段" in plan, plan)
+        check("single 开始 button",
+              page.locator("md-filled-button", has_text="开始").count() == 1)
         page.screenshot(path="/tmp/reading-ui-start.png")
 
-        # ---- 4. reading round: two columns, round-2 action layout ----
-        page.locator("md-filled-button", has_text="开始阅读").click()
+        # ---- 4. 开始 → reading stage: WHOLE-FILE segments (no pre-chunking),
+        # 上肢 first (置顶 priority). preview mode off → the chain after
+        # reading goes straight to the review stage.
+        page.locator("md-filled-button", has_text="开始").click()
         page.wait_for_selector(".reading-crumb", timeout=20000)
         crumb = page.locator(".reading-crumb").inner_text()
         check("crumb = 上肢 first (置顶 priority)", "上肢" in crumb, crumb)
         body = page.locator(".reading-chunk-body").inner_text()
-        check("chunk text rendered (markdown → text)", "腋动脉" in body, body[:80])
+        check("chunk = WHOLE file (both sections in one card)",
+              "腋动脉" in body and "臂前区" in body, body[:120])
         check("status chip 未读", page.locator(".reading-status-chip",
                                               has_text="未读").count() >= 1)
         # header icon actions (添加卡片 / 添加挖空) — aria-label hoists to
@@ -403,65 +402,43 @@ def run(state):
         check("still on the same chunk after closing dialog",
               "颈部" in page.locator(".reading-crumb").inner_text())
 
-        # ---- 8. skip → round done → separated stats ----
-        page.locator("md-text-button", has_text="无需制卡，跳过").click()
-        page.wait_for_selector(".screen-title", timeout=15000)
-        page.wait_for_timeout(600)
-        title = page.locator(".screen-title").first.inner_text()
-        check("readingDone screen", "阅读完成" in title, title)
-        stats_txt = page.locator(".screen-stats").first.inner_text()
-        check("stats separate 完成/跳过",
-              "1 段" in stats_txt and "制卡完成" in stats_txt and "跳过" in stats_txt,
-              stats_txt)
-        page.screenshot(path="/tmp/reading-ui-done.png")
-
-        # 再读一轮: round 2 = [上肢 二, 颈部 二] (breadth, list order)
-        page.locator("md-text-button", has_text="再读一轮").click()
-        page.wait_for_selector(".reading-crumb", timeout=20000)
-        crumb3 = page.locator(".reading-crumb").inner_text()
-        check("round 2 deals 上肢 二、臂前区", "臂前区" in crumb3, crumb3)
-        # skip both to drain the round
-        for _ in range(2):
-            skip_btn = page.locator("md-text-button", has_text="跳过").last
-            if skip_btn.count():
-                skip_btn.click()
-                page.wait_for_timeout(900)
-            if page.locator(".reading-crumb").count() == 0:
-                break
-
-        # ---- 9. narrow viewport: no right column. From readingDone, set
-        # narrow FIRST, then 再读一轮 (round 3 = 颈部三 only; 上肢 drained) ----
+        # ---- 8. narrow viewport: no right column while reading ----
         page.set_viewport_size({"width": 414, "height": 900})
         page.wait_for_timeout(500)
-        btn = page.locator("md-text-button", has_text="再读一轮")
-        check("readingDone offers 再读一轮", btn.count() == 1, btn.count())
-        if btn.count():
-            btn.click()
-            page.wait_for_selector(".reading-crumb", timeout=20000)
-            check("narrow: chunk card renders",
-                  page.locator(".reading-chunk-body").count() == 1)
-            crumb4 = page.locator(".reading-crumb").inner_text()
-            check("round 3 = 颈部三 颈动脉三角", "颈动脉三角" in crumb4, crumb4)
-            check("narrow: NO right column",
-                  page.locator(".note-column").count() == 0,
-                  page.locator(".note-column").count())
-            page.screenshot(path="/tmp/reading-ui-narrow.png")
-
-        # ---- 10. finish clears the round on the backend ----
+        check("narrow: chunk card renders",
+              page.locator(".reading-chunk-body").count() == 1)
+        check("narrow: NO right column",
+              page.locator(".note-column").count() == 0,
+              page.locator(".note-column").count())
+        page.screenshot(path="/tmp/reading-ui-narrow.png")
         page.set_viewport_size({"width": 1280, "height": 900})
-        r = api("/api/reading/finish", method="POST")
-        check("finish clears round", r.get("ok") is True, r)
-        r = api("/api/reading/state")
-        check("state round null after finish", r.get("round") is None, r.get("round"))
+        page.wait_for_timeout(300)
 
-        # list manager reflects progress: 颈部 = 2 skipped (一二), 上肢 =
-        # 1 done (一) + 1 skipped (二)
+        # ---- 9. skip the last chunk → round drains → AUTO-CHAIN into the
+        # next stage (2026-09-24: no readingDone stats page). preview off →
+        # the chain lands on the review deal, which fails against the dead
+        # AnkiConnect — the error screen PROVES the chain fired.
+        page.locator("md-text-button", has_text="无需制卡，跳过").click()
+        page.wait_for_function(
+            "() => document.body.textContent.includes('加载失败')", timeout=20000)
+        check("reading drained → chained into review stage (load error vs dead Anki)",
+              page.locator(".screen-title", has_text="阅读完成").count() == 0)
+        page.screenshot(path="/tmp/reading-ui-chain.png")
+
+        # ---- 10. backend state: round cleared by the chain's finish ----
+        r = api("/api/reading/state")
+        rd_state = r.get("round")
+        check("reading round no longer active",
+              rd_state is None or rd_state.get("status") != "active", rd_state)
+
+        # list manager reflects progress: whole-file segments — 颈部 = 1
+        # skipped, 上肢 = 1 done (one segment each, 2026-09-24 seeding)
         r = api("/api/reading/status")
         by = {s["path"]: s for s in r["list"]}
-        check("颈部 progress: skipped=2 done=0",
-              by[a_path]["done"] == 0 and by[a_path]["skipped"] == 2, by[a_path])
-        check("上肢 progress: done=1 skipped=1",
-              by[b_path]["done"] == 1 and by[b_path]["skipped"] == 1, by[b_path])
+        check("颈部 progress: skipped=1 done=0",
+              by[a_path]["done"] == 0 and by[a_path]["skipped"] == 1, by[a_path])
+        check("上肢 progress: done=1 skipped=0",
+              by[b_path]["done"] == 1 and by[b_path]["skipped"] == 0, by[b_path])
 
         check("no JS page errors", not errors, errors[:3])
         browser.close()

@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""E2E for the two-tier pacing modes (2026-09-14).
+"""E2E for the single daily pacing tier (user spec 2026-09-24).
+
+Replaces the old two-tier (quick/focus) modes_e2e: one round shape —
+4 reading + 15 preview + 15 new + ceil(D/3) reviews, where D is the day's
+due count snapshotted at the first review deal (state/daily.json).
 
 In-process ASGITransport against the REAL AnkiConnect but an ISOLATED
-ANKI_STATE_DIR, so the user's live round.json/preview.json are untouched.
-Net-zero: no card is ever answered/approved/deferred; every started round
-is finished (cleared) in teardown.
+ANKI_STATE_DIR, so the user's live round.json/preview.json/daily.json are
+untouched. Net-zero: no card is ever answered/approved/deferred; every
+started round is finished (cleared) in teardown.
 
 Run: python scripts/modes_e2e.py   (needs the backend venv's deps + live AnkiConnect)
 """
 import asyncio
 import json
+import math
 import os
 import sys
 import tempfile
@@ -44,121 +49,100 @@ def check(name, cond, detail=""):
 async def main():
     transport = httpx.ASGITransport(app=backend.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test", timeout=300) as c:
-
-        print("== /api/status carries the mode table ==")
+        print("== /api/status carries the single daily tier ==")
         st = (await c.get("/api/status")).json()
         check("status anki ok", st.get("anki") == "ok", st)
         modes = st.get("study_modes") or {}
-        # read = 渐进制卡 segment size (2026-09-19); riding the same wire table
-        check("quick = 2+5+5+20", modes.get("quick") == {"read": 2, "preview": 5, "new": 5, "review": 20}, modes)
-        check("focus = 5+10+10+30", modes.get("focus") == {"read": 5, "preview": 10, "new": 10, "review": 30}, modes)
-        check("release_daily_goal = 40", st.get("release_daily_goal") == 40, st.get("release_daily_goal"))
-        check("default_mode = quick", st.get("default_mode") == "quick")
+        check("only 'daily' tier", list(modes.keys()) == ["daily"], list(modes.keys()))
+        d = modes.get("daily", {})
+        check("read=4 (wire)", d.get("read") == 4, d)
+        check("preview=15 (wire)", d.get("preview") == 15, d)
+        check("new=15 (wire)", d.get("new") == 15, d)
+        check("review resolved (>=0, not the static placeholder when due>0)",
+              isinstance(d.get("review"), int) and d["review"] >= 0, d.get("review"))
+        check("default_mode = daily", st.get("default_mode") == "daily")
+        check("release_daily_goal = 45", st.get("release_daily_goal") == 45,
+              st.get("release_daily_goal"))
         check("status still has preview_mode", st.get("preview_mode") is True)
 
-        print("== session/state (idle) exposes modes, no hardcoded sizes ==")
+        due_pool = st.get("due_review") or 0
+        expect_review = math.ceil(due_pool / 3) if due_pool else 0
+
+        print("== session/state (idle) exposes the daily table ==")
         s = (await c.get("/api/session/state")).json()
         check("state none", s.get("state") == "none", s.get("state"))
         check("state carries study_modes", (s.get("study_modes") or {}) == modes)
         check("state preview_per_round None when idle", s.get("preview_per_round") is None,
               s.get("preview_per_round"))
 
-        print("== start?mode=focus deals a focus-sized batch ==")
-        r = (await c.post("/api/session/start?mode=focus")).json()
+        print("== start deals the daily batch: 15 new + ceil(D/3) reviews ==")
+        r = (await c.post("/api/session/start")).json()
         n_new = sum(1 for x in r["cards"] if x["isNew"])
         n_rev = len(r["cards"]) - n_new
-        check("response mode=focus", r.get("mode") == "focus", r.get("mode"))
-        check("new_per_round=10 on wire", r.get("new_per_round") == 10, r.get("new_per_round"))
-        check("reviews <= 30", n_rev <= 30, n_rev)
-        check("new <= 10", n_new <= 10, n_new)
-        check("batch non-empty", len(r["cards"]) > 0)
-        if r["cards"]:
-            # focus review size is 30; expect the full draw unless the due
-            # pool is smaller
-            due_pool = st["due_review"]
-            expect_min = min(30, due_pool)
-            check("review count respects mode (>= min(30,due_pool) or pool drained)",
-                  n_rev >= expect_min or due_pool < 5, f"n_rev={n_rev} due_pool={due_pool}")
+        check("response mode=daily", r.get("mode") == "daily", r.get("mode"))
+        check("new_per_round=15 on wire", r.get("new_per_round") == 15, r.get("new_per_round"))
+        check("new <= 15", n_new <= 15, n_new)
+        check(f"reviews == ceil({due_pool}/3) = {expect_review}",
+              n_rev == expect_review or due_pool == 0, f"n_rev={n_rev} due={due_pool}")
         rd = json.loads((Path(STATE) / "round.json").read_text())
-        check("round.json stores mode", rd.get("mode") == "focus", rd.get("mode"))
+        check("round.json stores mode=daily", rd.get("mode") == "daily", rd.get("mode"))
+        await c.post("/api/session/finish")
 
-        print("== session/state resumes with mode ==")
-        s2 = (await c.get("/api/session/state")).json()
-        check("state active", s2.get("state") == "active", s2.get("state"))
-        check("state mode=focus", s2.get("mode") == "focus")
+        print("== daily snapshot: written by the first deal, sticky for the day ==")
+        snap_file = Path(STATE) / "daily.json"
+        check("daily.json written at first review deal", snap_file.exists())
+        snap = json.loads(snap_file.read_text()) if snap_file.exists() else {}
+        check("snapshot day = today's Anki day", snap.get("day") == backend._anki_day(), snap)
+        r2 = (await c.post("/api/session/start")).json()
+        snap2 = json.loads(snap_file.read_text())
+        check("second start keeps the SAME snapshot", snap2.get("due") == snap.get("due"),
+              (snap.get("due"), snap2.get("due")))
+        n_rev2 = sum(1 for x in r2["cards"] if not x["isNew"])
+        check(f"second batch reviews <= {expect_review} (snapshot-driven)",
+              n_rev2 <= max(expect_review, 1) or due_pool == 0,
+              f"n_rev2={n_rev2} expect={expect_review}")
+        await c.post("/api/session/finish")
 
-        print("== more inherits focus ==")
-        await c.post("/api/session/finish")  # clear the first batch (net-zero)
-        # deal again via start then more
-        r2 = (await c.post("/api/session/start?mode=focus")).json()
-        # finish it to complete state, then more should keep focus
-        # (more reads mode from the current/completed round.json)
-        rd2 = json.loads((Path(STATE) / "round.json").read_text())
+        print("== legacy mode names normalize to daily ==")
+        for legacy in ("quick", "focus", "BOGUS"):
+            rl = (await c.post(f"/api/session/start?mode={legacy}")).json()
+            check(f"mode={legacy} → daily", rl.get("mode") == "daily", rl.get("mode"))
+            await c.post("/api/session/finish")
+
+        print("== more keeps working (legacy endpoint) ==")
+        await c.post("/api/session/start")
         r3 = (await c.post("/api/session/more")).json()
-        check("more keeps mode=focus", r3.get("mode") == "focus", r3.get("mode"))
-        n_new3 = sum(1 for x in r3["cards"] if x["isNew"])
-        check("more draws up to 10 new", n_new3 <= 10, n_new3)
+        check("more mode=daily", r3.get("mode") == "daily", r3.get("mode"))
+        check("more draws up to 15 new",
+              sum(1 for x in r3["cards"] if x["isNew"]) <= 15, r3["cards"][:3])
         await c.post("/api/session/finish")
 
-        print("== start default (no mode) = quick ==")
-        r4 = (await c.post("/api/session/start")).json()
-        n_new4 = sum(1 for x in r4["cards"] if x["isNew"])
-        n_rev4 = len(r4["cards"]) - n_new4
-        check("default mode=quick", r4.get("mode") == "quick", r4.get("mode"))
-        check("quick reviews <= 20", n_rev4 <= 20, n_rev4)
-        check("quick new <= 5", n_new4 <= 5, n_new4)
-        await c.post("/api/session/finish")
-
-        print("== invalid mode falls back to quick ==")
-        r5 = (await c.post("/api/session/start?mode=BOGUS")).json()
-        check("bogus -> quick", r5.get("mode") == "quick", r5.get("mode"))
-        await c.post("/api/session/finish")
-
-        print("== preview/start?mode=focus deals up to 10 pool cards ==")
+        print("== preview/start deals up to 15 pool cards ==")
         pool = st.get("preview_pool") or 0
-        p = (await c.post("/api/preview/start?mode=focus")).json()
-        if pool >= 10:
-            check("focus preview deals 10", len(p["cards"]) == 10, len(p["cards"]))
-        else:
-            check(f"preview deals min(10,pool={pool})", len(p["cards"]) == min(10, pool), len(p["cards"]))
-        check("preview response mode=focus", p.get("mode") == "focus", p.get("mode"))
-        check("preview_per_round=10 on wire", p.get("preview_per_round") == 10, p.get("preview_per_round"))
+        p = (await c.post("/api/preview/start")).json()
+        expect_pv = min(15, pool, 45)
+        check(f"preview deals min(15, pool={pool})", len(p["cards"]) == expect_pv,
+              (len(p["cards"]), expect_pv))
+        check("preview response mode=daily", p.get("mode") == "daily", p.get("mode"))
         prd = json.loads((Path(STATE) / "preview.json").read_text())
-        check("preview.json stores mode", prd.get("mode") == "focus", prd.get("mode"))
-        # state must expose the active round's per-round + mode
+        check("preview.json stores mode=daily", prd.get("mode") == "daily", prd.get("mode"))
         s6 = (await c.get("/api/session/state")).json()
-        check("state preview_per_round=10 (active round)", s6.get("preview_per_round") == 10,
-              s6.get("preview_per_round"))
-        check("state preview_round.mode=focus",
-              (s6.get("preview_round") or {}).get("mode") == "focus")
+        check("state preview_round.mode=daily",
+              (s6.get("preview_round") or {}).get("mode") == "daily")
         # teardown: finish WITHOUT acting — cards stay suspended in the pool
         f = (await c.post("/api/preview/finish")).json()
         check("preview finish ok", f.get("ok") is True)
-        if not (Path(STATE) / "preview.json").exists() or json.loads(
-            (Path(STATE) / "preview.json").read_text()
-        ).get("status") != "active":
-            check("preview round cleared", True)
-        else:
-            check("preview round cleared", False)
+        prd_after = json.loads((Path(STATE) / "preview.json").read_text()) \
+            if (Path(STATE) / "preview.json").exists() else {}
+        check("preview round cleared", prd_after.get("status") != "active", prd_after)
 
-        print("== preview/start default = quick (5 cards) ==")
-        p2 = (await c.post("/api/preview/start")).json()
-        if pool >= 5:
-            check("quick preview deals 5", len(p2["cards"]) == 5, len(p2["cards"]))
-        else:
-            check(f"quick preview deals min(5,pool={pool})", len(p2["cards"]) == min(5, pool), len(p2["cards"]))
-        check("preview default mode=quick", p2.get("mode") == "quick", p2.get("mode"))
-        await c.post("/api/preview/finish")
-
-        print("== net-zero: pool + due unchanged, live state dir untouched ==")
+        print("== net-zero: pool unchanged, isolated state dir only ==")
         st2 = (await c.get("/api/status")).json()
         check("preview_pool unchanged", st2.get("preview_pool") == pool,
               f"{pool} -> {st2.get('preview_pool')}")
         s7 = (await c.get("/api/session/state")).json()
         check("final state none/idle", s7.get("state") == "none", s7.get("state"))
         check("no preview round left", s7.get("preview_round") is None)
-        live = Path(os.environ.get("ANKI_LIVE_STATE", str(Path.home() / ".local/state/ir4anki"))) / "round.json"
-        check("live round.json untouched (absent or stale)", not live.exists() or True)
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

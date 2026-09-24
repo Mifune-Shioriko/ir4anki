@@ -985,6 +985,12 @@ body {
   color: var(--md-sys-color-on-surface-variant);
 }
 
+/* 今日每轮计划 header (single daily pacing, 2026-09-24) */
+.plan-head {
+  color: var(--md-sys-color-on-surface-variant);
+  margin-bottom: 2px;
+}
+
 /* ---- MD3 snackbar (spec: m3.material.io/components/snackbar) ----
  * @material/web ships no snackbar component; styled with sys tokens only.
  * Container: inverse-surface, single-line, extra-small shape (4px),

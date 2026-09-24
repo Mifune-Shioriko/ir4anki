@@ -15,7 +15,7 @@ database migration, no add-on code inside Anki.
 ```
 
 You keep reviewing in desktop Anki as usual; ir4anki is an *extra* front door
-for the two workflows below. Cards always live in your collection and move
+for the daily flow below. Cards always live in your collection and move
 between your devices via Anki's own sync.
 
 ## What it adds
@@ -39,10 +39,21 @@ review happens after a night's sleep, so FSRS seeds from real recall instead of
 a recognition illusion. A daily release budget caps how many cards enter the
 queue per day.
 
-### Pacing modes
-Two per-round sizes: **quick** (碎片时间, 2 read + 5 preview + 5 new + 20
-review) and **focus** (整块时间, 5 + 10 + 10 + 30). Chosen per round, survives
-refresh; every number is env-overridable.
+### One daily flow (早/中/晚, one button)
+A single **开始** button runs the whole chain with no intermediate pick/stats
+screens — each stage flows straight into the next, then returns to the start
+screen:
+
+```
+阅读 (4 段)  →  预览新卡 (15)  →  复习 (15 新 + ⌈当日到期 / 3⌉)  →  开始页
+```
+
+The review count is **dynamic**: ⌈D/3⌉ where D is the day's due-card count,
+snapshotted at the first review deal of the Anki day (4 AM rollover) into
+`state/daily.json`. Three rounds (morning/noon/evening) therefore clear the
+day's due pile evenly. Stages with nothing to do are skipped automatically
+(list exhausted, empty preview pool, daily release goal reached). Every number
+is env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
 
 ## Requirements
 
