@@ -7,6 +7,9 @@ export interface TreeFile {
   title: string
   /** reading-list membership (picker only; the file browser omits it) */
   in_list?: boolean
+  /** previously removed with parked progress — picker offers 重新播种
+   * (fresh add, whole-file seeding escape hatch 2026-09-24) */
+  archived?: boolean
 }
 
 export interface TreeNode {

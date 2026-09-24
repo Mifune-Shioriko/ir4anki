@@ -1984,20 +1984,26 @@ async def _to_preview_pool_impl(card_id: int):
 # resurfaces at the head of the next reading round.
 #
 # Files are opt-in via the 阅读清单 (manual priority order = list order).
-# Chunking uses the vendored chunker.py over the notes corpus (ANKI_NOTES_DIR).
+# Seeding is WHOLE-FILE (user decision 2026-09-24: 预切片退役) — a file joins
+# the list as ONE segment covering all its lines; consumption happens through
+# recursive bookmark splits (spec §3.3 「大片段不等于一次读完，递归切割本身
+# 就是消费方式」), not through chunker-cut pieces. The vendored chunker.py
+# survives only for LEGACY paths: the one-time round-3/4 migrations
+# (_segments_from_legacy), old-client chunk_key re-binding (_record_card)
+# and HEADING_RE for title refresh — it never seeds a listed file again.
 #
 # Segment identity (user spec 2026-09-20 round 4): DB-issued seg_id per file
-# (PK path+seg_id, per-file counter, never reused). The chunker is now a
-# SEEDING tool only — identity no longer derives from line numbers or
-# heading paths, so edits never drift the identity. Structure (ranges,
-# status, lineage) lives in the segments table; .md files stay pure text
-# (no in-file markers). The app is the ONLY writer: in-app edits update
-# file + segments in one transaction. External drift (file_sha mismatch)
-# trips the re-anchoring fuse: segments relocate by exact fingerprint
-# (first-line index + window sha, bounded full-scan fallback); failures
-# park in rorphans (card-holding ones demote to container so provenance
-# survives) and the file is flagged needs_resync — out of dealing until
-# POST /api/reading/reseed confirms.
+# (PK path+seg_id, per-file counter, never reused). Identity no longer
+# derives from line numbers or heading paths, so edits never drift it.
+# Structure (ranges, status, lineage) lives in the segments table; .md files
+# stay pure text (no in-file markers). The app is the ONLY writer: in-app
+# edits update file + segments in one transaction. External drift (file_sha
+# mismatch) trips the re-anchoring fuse: segments relocate by exact
+# fingerprint (first-line index + window sha, bounded full-scan fallback);
+# failures park in rorphans (card-holding ones demote to container so
+# provenance survives) and the file is flagged needs_resync — out of dealing
+# until POST /api/reading/reseed confirms. Reseeding tiles uncovered line
+# ranges wholesale (no chunker either).
 #
 # All mutating endpoints run under _state_lock (same serialization as the
 # preview round); reads that may persist migrations take it too.
@@ -2091,9 +2097,10 @@ def _chunk_key(ch: dict) -> str:
 
 
 def _seed_segments(chunks: list[dict], lines: list[str], start_id: int = 1) -> list[dict]:
-    """Fresh segments (status=todo) for chunker output — the ONLY place the
-    chunker touches identity: it seeds seg rows, then never decides anything
-    again (round 4). seg_ids are per-file, issued from `start_id`."""
+    """LEGACY seeding (chunker output → segments). Since 2026-09-24 listed
+    files seed WHOLE (see _seed_whole_file); this survives only for the
+    one-time round-3/4 migrations (_segments_from_legacy), which must
+    reproduce the exact chunker tiling to re-bind legacy chunk_key states."""
     now = datetime.now().isoformat(timespec="seconds")
     segs = []
     for i, ch in enumerate(chunks):
@@ -2111,6 +2118,41 @@ def _seed_segments(chunks: list[dict], lines: list[str], start_id: int = 1) -> l
             "updated_at": now,
         })
     return segs
+
+
+def _file_title(lines: list[str], path: str) -> str:
+    """Display title for a whole-file segment: the first markdown heading in
+    the file, else the file stem."""
+    c = _chunker()
+    for line in lines:
+        m = c.HEADING_RE.match(line)
+        if m:
+            return m.group(2).strip()
+    return Path(path).stem
+
+
+def _seed_whole_file(path: str, text: str, start_id: int = 1) -> list[dict]:
+    """Whole-file seeding (user decision 2026-09-24: 预切片退役).
+
+    One segment covering lines 1..N. The file is consumed by recursive
+    bookmark splits (spec §3.3): read a bit, cut out what's worth carding,
+    the unread tail stays queued. Returns [] for an empty/whitespace-only
+    file (nothing to read — list/add rejects those before calling)."""
+    lines = text.split("\n")
+    if not _reading_worthwhile({"text": text}):
+        return []
+    return [{
+        "seg_id": start_id,
+        "start_line": 1,
+        "end_line": len(lines),
+        "fingerprint": _seg_fingerprint(lines, 1, len(lines)),
+        "first_line": lines[0] if lines else "",
+        "title": _file_title(lines, path),
+        "heading_path": [],
+        "status": "todo",
+        "parent_seg_id": None,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }]
 
 
 def _segments_from_legacy(path: str, states: dict, orphans: list) -> tuple[list[dict], str | None]:
@@ -3243,13 +3285,27 @@ async def reading_status():
 
 @app.get("/api/reading/corpus")
 async def reading_corpus():
-    """Every indexable .md in the corpus, flagged by reading-list membership."""
+    """Every indexable .md in the corpus, flagged by reading-list membership.
+
+    `archived` = a previously removed file with parked progress — adding it
+    normally restores that progress; the UI offers 重新播种 (add with
+    fresh=true) for such files (whole-file seeding escape hatch, 2026-09-24).
+    """
     _reading_guard()
     data = _reading_read()
     listed = {e["path"] for e in data.get("list", [])}
+    archived = {
+        p for p, a in (data.get("archive") or {}).items()
+        if (a or {}).get("segments")
+    }
     return {
         "files": [
-            {"path": p, "title": Path(p).stem, "in_list": p in listed}
+            {
+                "path": p,
+                "title": Path(p).stem,
+                "in_list": p in listed,
+                "archived": p in archived,
+            }
             for p in _corpus_files()
         ]
     }
@@ -3277,6 +3333,11 @@ async def files_raw(path: str):
 
 class ReadingPathBody(BaseModel):
     path: str
+    # list/add only: discard archived progress and re-seed from scratch
+    # (user decision 2026-09-24 — no data migration for the whole-file
+    # seeding change; a file pre-cut under the old regime re-joins as ONE
+    # segment via remove → add(fresh=true))
+    fresh: bool = False
 
 
 class ReadingReorderBody(BaseModel):
@@ -3292,35 +3353,41 @@ async def reading_list_add(body: ReadingPathBody):
         data = _reading_read()
         if _find_entry(data, body.path):
             raise HTTPException(status_code=409, detail="already in the reading list")
-        loaded = _chunks_for(body.path)
-        if loaded is None:
+        text = _read_note_text(body.path)
+        if text is None:
             raise HTTPException(status_code=404, detail="note file not found in the corpus")
-        chunks, sha = loaded
-        if not chunks:
-            raise HTTPException(status_code=400, detail="文件里没有可读的片段")
-        # re-adding a previously removed file restores its old progress;
-        # otherwise seed fresh segments from the chunker (round 4: the
-        # chunker's only identity job is seeding — see _seed_segments)
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="文件是空的，没有可读内容")
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        # re-adding a previously removed file restores its old progress
+        # unless `fresh` asks for a clean re-seed (whole-file seeding,
+        # 2026-09-24 — see _seed_whole_file)
         archived = (data.get("archive") or {}).pop(body.path, None) or {}
-        if archived.get("segments"):
+        if archived.get("segments") and not body.fresh:
             segments = archived.get("segments", [])
             entry_sha = archived.get("file_sha", sha)
         else:
-            text = _read_note_text(body.path) or ""
-            segments = _seed_segments(chunks, text.split("\n"))
+            segments = _seed_whole_file(body.path, text)
+            if not segments:
+                raise HTTPException(status_code=400, detail="文件里没有可读的片段")
             entry_sha = sha
         entry_new = {
             "path": body.path,
             "added_at": datetime.now().isoformat(timespec="seconds"),
             "file_sha": entry_sha,
             "segments": segments,
-            "orphans": archived.get("orphans", []),
+            "orphans": [] if body.fresh else archived.get("orphans", []),
         }
-        if archived.get("needs_resync"):
+        if archived.get("needs_resync") and not body.fresh:
             entry_new["needs_resync"] = True
         data["list"].append(entry_new)
         _reading_write(data)
-        return {"ok": True, "order": [e["path"] for e in data["list"]]}
+        return {
+            "ok": True,
+            "order": [e["path"] for e in data["list"]],
+            "segments": len(segments),
+            "fresh": bool(body.fresh) or not bool(archived.get("segments")),
+        }
 
 
 @app.post("/api/reading/list/remove")
@@ -3874,9 +3941,10 @@ async def reading_edit(body: ReadingEditBody):
 async def reading_reseed(body: ReadingPathBody):
     """Clear needs_resync after external drift: re-anchor what still matches
     and re-seed the rest. Existing segments whose fingerprint relocates keep
-    their status; everything else is rebuilt as fresh `todo` segments (cards
-    on lost segments stay anchored to stale containers — provenance never
-    deleted, per round-4 rule).
+    their status; every uncovered line range is rebuilt as ONE fresh `todo`
+    segment (whole-file seeding, 2026-09-24 — the chunker no longer tiles).
+    Cards on lost segments stay anchored to stale containers — provenance
+    never deleted, per round-4 rule.
     """
     async with _state_lock:
         _reading_guard()
@@ -3884,11 +3952,10 @@ async def reading_reseed(body: ReadingPathBody):
         entry = _find_entry(data, body.path)
         if entry is None:
             raise HTTPException(status_code=404, detail="file not in the reading list")
-        loaded = _chunks_for(body.path)
         text = _read_note_text(body.path)
-        if loaded is None or text is None:
+        if text is None:
             raise HTTPException(status_code=404, detail="note file not found")
-        chunks, sha = loaded
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
         lines = text.split("\n")
         # try to relocate every existing segment by fingerprint. Containers
         # always survive (history anchors + lineage even without cards);
@@ -3950,21 +4017,36 @@ async def reading_reseed(body: ReadingPathBody):
         entry["segments"] = surviving  # id counter must see survivors
         nid = _next_seg_id(entry)
         fresh = []
-        for ch in chunks:
-            a, b = ch["line_start"], ch["line_end"]
-            if any(l in covered for l in range(a, b + 1)):
-                continue  # overlaps a surviving segment — leave it alone
+        now = datetime.now().isoformat(timespec="seconds")
+        n = len(lines)
+        # whole-file re-seeding (2026-09-24): every maximal contiguous run of
+        # UNCOVERED lines becomes ONE fresh todo segment (no chunker tiling).
+        # Runs that are pure whitespace/heading-only are dropped (same body
+        # filter the chunker applied) so we never deal an empty card.
+        line_no = 1
+        while line_no <= n:
+            if line_no in covered:
+                line_no += 1
+                continue
+            run_start = line_no
+            while line_no <= n and line_no not in covered:
+                line_no += 1
+            run_end = line_no - 1  # inclusive
+            run_text = "\n".join(lines[run_start - 1 : run_end])
+            if not _reading_worthwhile({"text": run_text}):
+                continue
+            title = _file_title(lines[run_start - 1 : run_end], body.path)
             fresh.append({
                 "seg_id": nid,
-                "start_line": a,
-                "end_line": b,
-                "fingerprint": _seg_fingerprint(lines, a, b),
-                "first_line": lines[a - 1] if a - 1 < len(lines) else "",
-                "title": ch.get("title") or "",
-                "heading_path": ch.get("heading_path") or [],
+                "start_line": run_start,
+                "end_line": run_end,
+                "fingerprint": _seg_fingerprint(lines, run_start, run_end),
+                "first_line": lines[run_start - 1] if run_start - 1 < n else "",
+                "title": title,
+                "heading_path": [],
                 "status": "todo",
                 "parent_seg_id": None,
-                "updated_at": datetime.now().isoformat(timespec="seconds"),
+                "updated_at": now,
             })
             nid += 1
         entry["segments"] = surviving + fresh

@@ -358,6 +358,10 @@ export interface ReadingCorpusFile {
   path: string
   title: string
   in_list: boolean
+  /** a previously removed file with parked progress — adding it normally
+   * restores the progress; the picker offers 重新播种 (fresh=true) instead
+   * (whole-file seeding escape hatch, 2026-09-24) */
+  archived?: boolean
 }
 
 /** Reading fields riding on /api/status + /api/session/state. */

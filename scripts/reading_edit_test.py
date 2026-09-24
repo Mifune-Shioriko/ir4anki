@@ -119,14 +119,57 @@ def _segs(path: str) -> list[dict]:
     return sorted(_entry(path).get("segments") or [], key=lambda s: s["start_line"])
 
 
+def _todo_segs(path: str) -> list[dict]:
+    """Leaf segments that are actually dealable (whole-file seeding 2026-09-24:
+    a file joins as ONE segment; multi-segment fixtures are built by splitting,
+    which leaves background gaps — those are not 'sections')."""
+    return [s for s in _segs(path) if s.get("status") not in ("container", "background")]
+
+
+async def _split_whole_into_sections(c, path: str, whole_id: int, text: str):
+    """Cut the single whole-file segment into one todo segment per '## '
+    heading, reproducing the retired chunker's section ranges EXACTLY
+    (heading line up to the line before the next heading).
+
+    One split per section, each targeting the previous bookmark TAIL:
+    a single multi-selection split can't do it because contiguous
+    selections merge into one child (by design). Returns the last response."""
+    lines = text.split("\n")
+    heads = [i + 1 for i, l in enumerate(lines) if l.startswith("## ")]
+    cur = whole_id
+    r = None
+    for k, h in enumerate(heads):
+        end = (heads[k + 1] - 1) if k + 1 < len(heads) else len(lines)
+        r = await c.post("/api/reading/split", json={
+            "path": path, "seg_id": cur,
+            "selections": [{"start_line": h, "end_line": end}],
+            "gap_policy": "bookmark"})
+        if r.status_code != 200:
+            return r
+        tail = next((x for x in r.json().get("children", []) if x.get("tail")), None)
+        if tail is None:
+            break  # last section consumed the remainder
+        cur = tail["seg_id"]
+    return r
+
+
 async def main():
     transport = httpx.ASGITransport(app=backend.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-        print("== 1. add file + deal a round (fixture) ==")
+        print("== 1. add file (whole-file seed) + split into sections + deal ==")
         r = await c.post("/api/reading/list/add", json={"path": A_PATH})
         check("add A ok", r.json().get("ok") is True, r.text[:120])
-        segs = _segs(A_PATH)
-        check("3 sections seeded", len(segs) == 3, len(segs))
+        check("whole-file seed = 1 segment", r.json().get("segments") == 1, r.json())
+        whole = _segs(A_PATH)[0]
+        check("seeded segment covers whole file",
+              (whole["start_line"], whole["end_line"]) == (1, len(NOTE_A.split("\n"))),
+              (whole["start_line"], whole["end_line"]))
+        # build the 3-section fixture the edit/container tests rely on
+        r = await _split_whole_into_sections(c, A_PATH, whole["seg_id"], NOTE_A)
+        check("split into sections 200", r is not None and r.status_code == 200,
+              getattr(r, "text", "")[:200])
+        segs = _todo_segs(A_PATH)
+        check("3 sections after split", len(segs) == 3, len(segs))
         s1, s2, s3 = segs
         r = await c.post("/api/reading/start?mode=focus")
         dealt = r.json()["chunks"]
@@ -187,8 +230,8 @@ async def main():
         # the fuse if sha or fingerprints were inconsistent)
         r = await c.get("/api/reading/status")
         a_sum = next(s for s in r.json()["list"] if s["path"] == A_PATH)
-        check("status: 3 chunks, no orphans, no resync",
-              a_sum["total_chunks"] == 3 and a_sum["orphans"] == 0
+        check("status: 3 todo sections, no orphans, no resync",
+              a_sum["todo"] == 3 and a_sum["orphans"] == 0
               and not a_sum["needs_resync"], a_sum)
 
         print("== 3. mid-round edit keeps round membership ==")

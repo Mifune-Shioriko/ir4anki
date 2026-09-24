@@ -155,8 +155,9 @@ export const api = {
       parse<{ filename: string }>(r),
     )
   },
-  readingListAdd: (path: string) =>
-    post<{ ok: boolean; order: string[] }>('/api/reading/list/add', { path }),
+  readingListAdd: (path: string, fresh = false) =>
+    post<{ ok: boolean; order: string[]; segments?: number; fresh?: boolean }>(
+      '/api/reading/list/add', { path, ...(fresh ? { fresh: true } : {}) }),
   readingListRemove: (path: string) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/remove', { path }),
   readingListReorder: (arg: { path: string; top?: boolean } | { order: string[] }) =>

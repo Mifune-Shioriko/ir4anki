@@ -86,11 +86,12 @@ export const ReadingListScreen: Component<Props> = (props) => {
     mutate(() => api.readingListReorder({ path: s.path }))
   const moveTop = (s: ReadingFileSummary) =>
     mutate(() => api.readingListReorder({ path: s.path, top: true }))
-  const addFile = (f: { path: string }) =>
+  const addFile = (f: { path: string }, fresh = false) =>
     // keep the dialog OPEN after an add (batch adding several files is the
     // common case); the picker list refreshes via reload() and the just-added
-    // file drops out of notListed()
-    mutate(() => api.readingListAdd(f.path))
+    // file drops out of notListed(). fresh=true discards parked progress and
+    // re-seeds whole-file (2026-09-24 逃生口 for pre-cut legacy entries).
+    mutate(() => api.readingListAdd(f.path, fresh))
   const confirmRemove = () => {
     const t = removeTarget()
     if (!t) return
@@ -164,11 +165,21 @@ export const ReadingListScreen: Component<Props> = (props) => {
               when={!node.file?.in_list}
               fallback={<span class="reading-tree-added md-typescale-label-small">已加入</span>}
             >
+              {/* 有存档进度的文件：默认加入=恢复进度；重新播种=丢弃进度按
+                  整文件播种（预切片退役逃生口，2026-09-24） */}
+              <Show when={node.file?.archived}>
+                <md-text-button
+                  disabled={busyNow()}
+                  onClick={() => node.file && addFile(node.file, true)}
+                >
+                  重新播种
+                </md-text-button>
+              </Show>
               <md-text-button
                 disabled={busyNow()}
                 onClick={() => node.file && addFile(node.file)}
               >
-                加入清单
+                {node.file?.archived ? '恢复进度' : '加入清单'}
               </md-text-button>
             </Show>
           </div>

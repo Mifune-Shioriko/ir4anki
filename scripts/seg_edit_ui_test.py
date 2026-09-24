@@ -98,15 +98,41 @@ PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
            "nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
 
 
+def _seed_sections() -> dict:
+    """Seed fixture under WHOLE-FILE seeding (2026-09-24 预切片退役): the file
+    joins the list as ONE segment; cut it into the 3 '## ' sections via
+    bookmark splits (each split targets the previous tail — contiguous
+    selections in one split would merge). Returns the final deal response."""
+    api("/api/reading/list/add", "POST", {"path": A_REL})
+    d = api("/api/reading/start?mode=focus", "POST")
+    check("seed: whole-file deal = 1 chunk", len(d.get("chunks", [])) == 1, d)
+    whole_id = d["chunks"][0]["seg_id"]
+    api("/api/reading/finish", "POST")
+    lines = NOTE_A.split("\n")
+    heads = [i + 1 for i, l in enumerate(lines) if l.startswith("## ")]
+    cur = whole_id
+    for k, h in enumerate(heads):
+        end = (heads[k + 1] - 1) if k + 1 < len(heads) else len(lines)
+        r = api("/api/reading/split", "POST", {
+            "path": A_REL, "seg_id": cur,
+            "selections": [{"start_line": h, "end_line": end}],
+            "gap_policy": "bookmark"})
+        check(f"seed split section {k + 1} ok", r.get("ok") is True, r)
+        tail = next((x for x in r.get("children", []) if x.get("tail")), None)
+        if tail is None:
+            break
+        cur = tail["seg_id"]
+    return api("/api/reading/start?mode=focus", "POST")
+
+
 def run(notes: Path):
     a_file = notes / A_REL
     png = notes / ".." / "test-upload.png"
     png = png.resolve()
     png.write_bytes(base64.b64decode(PNG_B64))
 
-    # seed: add to the reading list + deal a focus round via API
-    api("/api/reading/list/add", "POST", {"path": A_REL})
-    d = api("/api/reading/start?mode=focus", "POST")
+    # seed: whole-file segment split into the 3 sections + deal a focus round
+    d = _seed_sections()
     check("seed: 3 segments dealt", len(d.get("chunks", [])) == 3, d)
 
     with sync_playwright() as p:
@@ -237,8 +263,10 @@ def run(notes: Path):
                         if s["path"] == A_REL)
         check("status: no needs_resync after edit",
               not st_after.get("needs_resync"), st_after)
-        check("status: chunk count unchanged (3)",
-              st_after["total_chunks"] == 3, st_after)
+        # whole-file seeding fixture (2026-09-24): sections are split children,
+        # so total_chunks includes the background preamble gap — count todos
+        check("status: 3 todo sections unchanged",
+              st_after["todo"] == 3, st_after)
 
         print("== 6. image upload round-trip ==")
         page.locator(

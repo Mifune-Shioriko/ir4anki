@@ -70,7 +70,7 @@ API 字段名 **chunk_key 保留**，值变为 `str(seg_id)`（前端当不透�
 ## 3. 核心流程
 
 ### 3.1 播种（seeding）
-文件加入阅读清单时（`/api/reading/list/add`）或首次 `_file_view` 时：chunker.chunk_markdown 输出逐段 INSERT 进 segments（status=todo，parent=NULL，fingerprint=区间 sha）。**chunker 从身份来源降级为初始化工具**；`_chunk_cache` 只服务播种和渲染，不再参与身份。
+**整文件播种（user decision 2026-09-24：预切片退役）**：文件加入阅读清单时（`/api/reading/list/add`）只 INSERT 一行 segment，区间 = 整个文件 1..N（status=todo，parent=NULL，title=首个标题行，fingerprint=全文 sha）。不再按标题预切片——消费方式就是 §3.3 的递归 bookmark 切割（「大片段不等于一次读完」，spec 本就预埋了这一形态）。`reseed` 同理：survivors 重锚定后，未覆盖的连续行区间各自成一个 todo segment。chunker.py 降级为**仅历史迁移工具**（`_segments_from_legacy` 的 round3/4 一次性迁移、legacy chunk_key 重绑定、HEADING_RE 借用来刷标题），永不参与新播种。历史数据不迁移（用户原则：不为旧数据迁就新设计）；旧预切片条目走 remove → add(fresh=true) 逃生口重播。
 
 ### 3.2 发牌与闸门（逻辑不变，键变了）
 `_deal_reading` 三阶段、`_reading_gates` B·二段重推、all_gated 语义、STUDY_MODES 配额全部原样，只把「遍历 chunker 输出+状态字典」换成「SELECT segments WHERE path=? AND status NOT IN ('container','background','done','skipped') ORDER BY start_line」。叶子顺序 = 文件顺序，天然成立。

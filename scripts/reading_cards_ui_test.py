@@ -205,7 +205,9 @@ def run():
     check("file listed", r.get("ok") is True, r)
     rd = api("/api/reading/start?mode=quick", "POST")
     chunks = rd.get("chunks") or []
-    check("round dealt 2 chunks", len(chunks) == 2, rd)
+    # whole-file seeding (2026-09-24 预切片退役): a listed file deals as ONE
+    # segment covering the whole .md (consumption is via recursive splits)
+    check("round dealt 1 whole-file chunk", len(chunks) == 1, rd)
     tgt = chunks[0]
 
     qa = api("/api/card/add", "POST", {

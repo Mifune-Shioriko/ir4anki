@@ -21,13 +21,14 @@ between your devices via Anki's own sync.
 ## What it adds
 
 ### Reading mode (渐进制卡 — incremental reading)
-Point it at a folder of markdown notes (`ANKI_NOTES_DIR`). Notes are chunked by
-heading; each round deals a few chunks. For each chunk you write cards by hand
-(QA or cloze, one-click into Anki). Chunk state (todo → active → done/skipped),
-segment tree (split big chunks recursively), and **exact card provenance**
-(which segment produced which cards) live in a local sqlite DB — the .md files
-stay pure text with zero markers. While reviewing any card later, the app can
-show the original source segment with full-file context.
+Point it at a folder of markdown notes (`ANKI_NOTES_DIR`). Each listed file is
+dealt as ONE whole-file segment; you consume it by recursive **bookmark
+splits** — read a bit, cut out what's worth carding, the unread tail stays
+queued. For each segment you write cards by hand (QA or cloze, one-click into
+Anki). Segment state (todo → active → done/skipped), the segment tree, and
+**exact card provenance** (which segment produced which cards) live in a local
+sqlite DB — the .md files stay pure text with zero markers. While reviewing any
+card later, the app can show the original source segment with full-file context.
 
 ### Preview mode (先看后考 — read before you're tested)
 New cards don't hit the scheduler immediately. They land **suspended** in a
@@ -136,7 +137,7 @@ as your ir4anki instance; on the others, just use desktop Anki.
 ## Layout
 
 ```
-backend/    FastAPI app (app.py) + vendored markdown chunker (chunker.py)
+backend/    FastAPI app (app.py) + vendored chunker (legacy migrations only)
 frontend/   SolidJS 1.9 + @material/web (MD3) SPA, built to frontend/dist
 deploy/     install.sh + systemd unit template + env example
 scripts/    API/E2E/UI tests (some need playwright + a live AnkiConnect)
