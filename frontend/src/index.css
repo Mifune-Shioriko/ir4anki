@@ -184,6 +184,16 @@ body {
   max-width: calc(3 * var(--content-max-width) + 2 * 24px + 2 * var(--content-padding));
 }
 
+/* Solo phase (start/loading/finished — no card on screen, so the side
+ * columns are gated off): .columns is still the centered max-width flex
+ * container, but the 680px .content column used to sit at its LEFT edge,
+ * making the start-screen card look off-center on wide screens (user
+ * report 2026-09-26). Center the lone column instead. Narrow screens are
+ * unaffected (.columns is display:block there, .content has margin auto). */
+.columns--solo {
+  justify-content: center;
+}
+
 .columns .content {
   flex: 0 0 var(--content-max-width);
   max-width: var(--content-max-width);
@@ -660,6 +670,28 @@ body {
 
 .card-content hr {
   display: none; /* template separator; the md-divider below replaces it */
+}
+
+/* Anki's cloze template markup survives cleanCardHtml() (only <style>/
+ * <script> are stripped): the question side is <span class="cloze"
+ * data-cloze="answer" data-ordinal="N">[…]</span>, the revealed answer is
+ * <span class="cloze">answer</span>. The template's own CSS (bold blue) is
+ * gone with the <style> block, so style it here — front gets a
+ * primary-container highlight pill (user request 2026-09-26), back matches
+ * the app's .cloze-a language (primary + underline). Dark mode adapts via
+ * the tokens (primary-container/on-primary-container are re-mapped). */
+.card-question .cloze {
+  color: var(--md-sys-color-on-primary-container);
+  background: var(--md-sys-color-primary-container);
+  font-weight: 600;
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  padding: 0.05em 0.35em;
+}
+
+.card-answer .cloze {
+  color: var(--md-sys-color-primary);
+  font-weight: 600;
+  border-bottom: 2px solid var(--md-sys-color-primary);
 }
 
 .card-divider {

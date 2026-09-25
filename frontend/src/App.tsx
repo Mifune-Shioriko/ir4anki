@@ -1345,7 +1345,15 @@ export const App: Component = () => {
           share a top edge on EVERY phase (the strip only rendered mid-round,
           which is why start screens used to misalign). */}
 
-      <div class="columns" classList={{ 'columns--three': isWide3() && centerOccupied() }}>
+      {/* columns--solo: no card on screen (start/loading/finished) → the side
+          columns don't render; center the lone .content column (2026-09-26) */}
+      <div
+        class="columns"
+        classList={{
+          'columns--three': isWide3() && centerOccupied(),
+          'columns--solo': !centerOccupied(),
+        }}
+      >
       {/* left column 相关卡片 (三栏重构, user spec 2026-09-21): cards made
           from the SAME note segment (exact provenance — anki-rag similarity
           is retired). Reading round / trace detour → the chunk's own cards
