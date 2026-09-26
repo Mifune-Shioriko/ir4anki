@@ -1,54 +1,47 @@
 """Anki review web app — backend (v2).
 
-Session model:
-  - TWO PACING MODES (user spec 2026-09-14, sizes retuned 2026-09-16):
-    "quick" = 5 preview + 5 new + 20 review (碎片时间, a few minutes — the
-    短视频式 rhythm of 2026-09-06), "focus" = 10 preview + 10 new + 30
-    review (整块时间, roughly 2× quick).
-    The mode is chosen per round at start and travels with round.json /
-    preview.json so a page refresh resumes the SAME mode. 'more' inherits
-    the mode of the round that just completed. Numbers are overridable via
-    env (ANKI_QUICK_REVIEW / ANKI_FOCUS_NEW / …) without code changes.
-  - one round = a PREVIEW lead-in (preview mode; since 2026-09-07
-    the preview hides the answer until revealed — a low-stakes retrieval
-    attempt), then up to {mode.review} review cards + up to {mode.new}
-    new cards
-  - PREVIEW APPROVE = NEXT-DAY RELEASE (user spec 2026-09-07): approved
-    cards stay suspended with a released-YYYYMMDD stamp and are unsuspended
-    by release_yesterday_approved() on the next calendar day, so the first
-    grading happens ≥1 night after preview. Same-day grading after reading
-    is recognition, not recall (measured: first-review pass 61% vs 88%
-    pre-preview cohort; first-Good→next-Again 33% vs 6%).
-  - new cards: NO hourly quota — every round (and 'continue') draws up to
-    the active mode's `new` count UNIFORMLY AT RANDOM from the new-card pool
-    (user
-    spec 2026-09-04; replaces the hourly quota + preview-priority funnel so
-    older released cards can't be starved by fresher ones)
-  - DOUBLE-AGAIN AUTO-RETURN (user spec 2026-09-16): a NEW card whose first
-    two consecutive gradings are both Again is automatically sent back to
-    the preview pool (same reset as the manual 移回预览池). Only the first
-    learning cycle counts; streak state persists in state/new_again.json.
+Session model (single daily flow, user spec 2026-09-24 + 2026-09-27):
+  - ONE pacing tier "daily" = read 4 segments + {new} 15 new cards +
+    DYNAMIC review ceil(D/3) (D = the day's due snapshot, see below).
+    Sizes env-overridable (ANKI_DAILY_READ / ANKI_DAILY_NEW /
+    ANKI_REVIEW_DUE_DIVISOR).
+  - the daily chain is 阅读 → 复习 — the manual PREVIEW STAGE is RETIRED
+    (user spec 2026-09-27). New cards still land in the preview pool
+    SUSPENDED when they are made, but nobody approves them by hand anymore:
+    auto_release_pool() moves every pool card whose note was created on an
+    EARLIER Anki day into the release deck unsuspended, so today's cards
+    become gradeable new cards tomorrow. The overnight gap is the point
+    (measured 2026-09-07: same-day grading after first contact is
+    recognition, not recall — 61% vs 88% first-review pass).
+  - daily release cap RELEASE_DAILY_GOAL (default 45 = 3 rounds × 15 new):
+    auto-release never unsuspends more than the cap per Anki day, so a
+    heavy card-making day can't flood the new-card queue (user spec
+    2026-09-27: 放行太多 → 复习负担太大). Oldest cards release first; the
+    overflow waits for the next day. The ledger lives in
+    state/auto_release.json ({day, released}).
+  - new cards: NO hourly quota — every round draws up to `new` cards
+    UNIFORMLY AT RANDOM from the dealable new pool (user spec 2026-09-04).
   - every answer triggers a fire-and-forget sync to the self-hosted server
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
-    a reading segment of {mode.read} note chunks (quick=2, focus=5,
-    ANKI_QUICK_READ / ANKI_FOCUS_READ) runs BEFORE preview+review. The user
-    reads their own markdown notes (~/anki-notes, chunked by the vendored
-    chunker.py) and writes cards by hand. Per chunk: todo → active(正在制卡)
-    → done(制卡完成), or skipped(无需制卡). Within a file only the frontier
-    chunk is dealt, so later chunks stay locked until the frontier is
-    finished; an `active` chunk resurfaces first every round. Files are
-    opt-in via the 阅读清单 (manual priority). State: state/reading.db
-    (SQLite; migrated automatically from the legacy reading.json).
+    a reading round of {read} note segments runs BEFORE the review stage.
+    The user reads their own markdown notes (~/anki-notes, whole-file
+    seeding + recursive bookmark splits) and writes cards by hand. Per
+    segment: todo → active(正在制卡) → done(制卡完成), or skipped(无需制卡).
+    Within a file only the frontier segment is dealt, so later segments
+    stay locked until the frontier is finished; an `active` segment
+    resurfaces first every round. Files are opt-in via the 阅读清单
+    (manual priority). State: state/reading.db (SQLite).
 
-    Reading gate (user spec 2026-09-19 round 3): an `active` chunk whose
-    created cards have NOT all left the preview pool yet (still in 预览池
-    or still suspended = not truly released) is HELD — it is not dealt and
-    blocks its file's frontier until every one of its cards is thawed
-    (out of the pool AND unsuspended, i.e. the next-day release happened).
-    Chunks without cards are never gated. AnkiConnect errors fail OPEN
-    (reading must never be blocked by a dead backend).
+    Reading gate (user spec 2026-09-19 round 3): a segment whose created
+    cards have NOT all left the preview pool yet (still in 预览池 or still
+    suspended = not truly released) is HELD — it is not dealt and blocks
+    its file's frontier until every one of its cards is thawed. With the
+    2026-09-27 auto-release this means: cards made today hold their segment
+    overnight and the frontier unlocks the next day, exactly when the cards
+    become gradeable. Segments without cards are never gated. AnkiConnect
+    errors fail OPEN (reading must never be blocked by a dead backend).
 """
 import asyncio
 import base64
@@ -92,13 +85,15 @@ ROUND_FILE = STATE_DIR / "round.json"
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
 # ---- single daily pacing (user spec 2026-09-24) ----
-# One round shape, run 早/中/晚: 4 reading segments + 15 preview + a review
-# batch of 15 new + ceil(D/3) reviews, where D = the due-card count
-# SNAPSHOTTED at the day's first review deal (daily.json, Anki-day keyed —
-# three rounds then clear the day's due pile). The old quick/focus tiers are
-# retired; `mode` survives on the wire as an opaque compat field and every
-# unknown value normalizes to "daily". review=0 in the static table means
-# "dynamic" — the wire copy carries the computed size. Sizes env-overridable.
+# One round shape, run 早/中/晚: 4 reading segments + a review batch of
+# 15 new + ceil(D/3) reviews, where D = the due-card count SNAPSHOTTED at
+# the day's first review deal (daily.json, Anki-day keyed — three rounds
+# then clear the day's due pile). The manual preview stage was retired
+# 2026-09-27: new cards auto-release from the pool overnight (see
+# auto_release_pool). The old quick/focus tiers are retired; `mode`
+# survives on the wire as an opaque compat field and every unknown value
+# normalizes to "daily". review=0 in the static table means "dynamic" —
+# the wire copy carries the computed size. Sizes env-overridable.
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
@@ -108,7 +103,6 @@ def _env_int(name: str, default: int) -> int:
 STUDY_MODES: dict[str, dict[str, int]] = {
     "daily": {
         "read": _env_int("ANKI_DAILY_READ", 4),
-        "preview": _env_int("ANKI_DAILY_PREVIEW", 15),
         "new": _env_int("ANKI_DAILY_NEW", 15),
         "review": 0,  # dynamic: ceil(due snapshot / divisor), see below
     },
@@ -169,18 +163,17 @@ async def _daily_review_size(snapshot: bool = False) -> int:
         return 0
     return -(-due // REVIEW_DUE_DIVISOR)  # ceil division
 
-# Daily goal for new-card releases (放行) — progress bar on the preview
-# start screen (user spec 2026-09-16) AND a hard cap on preview dealing
-# (user spec 2026-09-16, second iteration): round sizes of 5/10 would
-# otherwise overshoot the goal (43, 48…), so once the remaining budget
-# drops below the biggest preview size, EVERY mode deals exactly what's
-# left, and at 0 the day's previews are done. Tracks the same number as
-# the wire field `pending_release` (cards approved TODAY, still suspended,
-# released tomorrow) — cap and bar can never disagree. Deferred cards
-# (明天再看) do NOT consume the budget; undoing an approval gives it back.
-# <=0 disables both the bar and the cap. Env-overridable. Default 45 =
-# 3 rounds × 15 preview (single daily pacing, user spec 2026-09-24).
+# Daily cap for new-card releases (user spec 2026-09-16 as a preview-approve
+# goal; 2026-09-27 as an AUTO-RELEASE cap): auto_release_pool() never
+# unsuspends more than this many pool cards per Anki day, so a heavy
+# card-making day can't flood the new-card queue and blow up the review
+# burden (放行太多 → 复习负担太大). Oldest cards release first; overflow
+# waits for the next day. <=0 disables the cap. Env-overridable. Default
+# 45 = 3 rounds × 15 new per round (the user's self-designed daily budget).
 RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 45)
+# ledger for the daily cap: {"day": YYYYMMDD, "released": N} — Anki-day
+# keyed like the due snapshot, survives restarts, resets on a new day.
+AUTO_RELEASE_FILE = STATE_DIR / "auto_release.json"
 
 def study_mode(name: str | None) -> str:
     """Validate/normalize a mode name; falls back to the default.
@@ -190,50 +183,26 @@ def study_mode(name: str | None) -> str:
     round.json/preview.json mode from before the change still resolves."""
     return name if name in STUDY_MODES else DEFAULT_MODE
 
-# ---- preview mode (先看后考: read new cards before they enter testing) ----
-# Newly injected cards land in PREVIEW_DECK SUSPENDED, so they are invisible
-# to the scheduler and to normal rounds. A preview round shows the question
-# first (answer hidden until the user reveals it — a low-stakes retrieval
-# attempt, NO grading); per card the user either approves (放行) or defers
-# (tagged deferred-YYYYMMDD, hidden from today's preview rounds, resurfaces
-# tomorrow).
+# ---- preview pool (先看后考 → 次日自动放行, user spec 2026-09-27) ----
+# Newly made cards land in PREVIEW_DECK SUSPENDED, so they are invisible
+# to the scheduler and to normal rounds the day they are made. The manual
+# preview stage (approve/defer per card) is RETIRED: auto_release_pool()
+# (below) runs at the session entry points and unsuspends every pool card
+# whose note was created on an EARLIER Anki day into RELEASE_DECK, capped
+# at RELEASE_DAILY_GOAL per day. The first grading therefore happens ≥1
+# night after the card was written — the overnight gap is what makes it
+# honest recall instead of recognition (measured 2026-09-07: same-day
+# first-review pass 61% vs 88% for the pre-preview cohort).
 #
-# Approve = NEXT-DAY release (2026-09-07, user spec): the card moves to
-# RELEASE_DECK but STAYS SUSPENDED and gets tag released-YYYYMMDD. On the
-# next calendar day release_yesterday_approved() unsuspends it, so the FIRST
-# grading happens ≥1 night after preview. Rationale (measured 2026-09-07):
-# same-day grading right after reading is recognition, not recall — first-
-# review pass rate for same-day-approved cards was 61% vs 88% for the pre-
-# preview cohort, and 33% of first-Good cards failed their very next answer
-# (vs 6% before). The overnight gap makes the first grade honest, so FSRS
-# seeds stability from recall instead of a fluency illusion.
-#
-# The whole feature is gated on ANKI_PREVIEW_MODE. With it unset, preview
-# endpoints return 404 and status reports preview_mode=false — the frontend
-# then renders the exact legacy UI (system-level rollback).
-# Data-level rollback: preview cards are untouched NEW cards; unsuspend them
-# (and drop released-*/deferred-* tags) and the collection is exactly as
-# before — same-day release can be restored by unsuspensing right away in
-# the approve branch.
+# The whole feature is gated on ANKI_PREVIEW_MODE. With it unset, the pool
+# endpoints report preview_mode=false and the frontend renders the exact
+# legacy UI (system-level rollback).
+# Data-level rollback: pool cards are untouched NEW cards; unsuspend them
+# and move them out of the pool and the collection is exactly as before.
 PREVIEW_MODE = os.getenv("ANKI_PREVIEW_MODE", "").lower() in ("1", "true", "yes", "on")
 PREVIEW_DECK = os.getenv("ANKI_PREVIEW_DECK", "预览池")
 RELEASE_DECK = os.getenv("ANKI_PREVIEW_RELEASE_DECK", "2026")
-PREVIEW_FILE = STATE_DIR / "preview.json"
-
-# ---- double-Again auto-return (user spec 2026-09-16) ----
-# A NEW card whose first two consecutive gradings are both Again goes back
-# to the preview pool (先看后考 again): two honest recall failures right
-# after release mean the card was approved too early — re-learning it beats
-# grinding relearning steps. Only the FIRST learning cycle counts (初学):
-# the streak opens only while the card is still type==0 (new) and is cleared
-# by any other grade, by undo, by a manual 移回预览池, and by delete. Streak
-# state persists in state/new_again.json so it survives rounds, refreshes
-# and restarts (the two Agains usually land in DIFFERENT rounds — Anki's
-# relearning step re-deals the card minutes later).
-# Kill-switch: ANKI_NEW_AGAIN_RETURN=0; threshold: ANKI_NEW_AGAIN_LIMIT.
-NEW_AGAIN_RETURN = os.getenv("ANKI_NEW_AGAIN_RETURN", "1").lower() in ("1", "true", "yes", "on")
-NEW_AGAIN_LIMIT = max(1, _env_int("ANKI_NEW_AGAIN_LIMIT", 2))
-NEW_AGAIN_FILE = STATE_DIR / "new_again.json"
+PREVIEW_FILE = STATE_DIR / "preview.json"  # legacy round state; no longer written
 
 # ---- reading mode (渐进制卡, user spec 2026-09-19) ----
 # Progressive card-making: the user reads their own markdown notes chunk by
@@ -276,74 +245,41 @@ NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "_assets"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
 
 
-def _active_preview_per_round() -> int | None:
-    """Batch size of the ACTIVE preview round.
-
-    The round's own `total` is authoritative: it already carries whatever
-    cap applied when it was dealt (release budget, small pool). Falls back
-    to the stored mode's size for legacy rounds without a total.
-    None when there is no active preview round — the frontend then renders
-    sizes from study_modes[selected] on the start screens instead.
-    """
-    prd = _preview_read()
-    if prd is not None and prd.get("status") == "active" and prd.get("pending"):
-        total = prd.get("total")
-        if isinstance(total, int) and total > 0:
-            return total
-        return STUDY_MODES[study_mode(prd.get("mode"))]["preview"]
-    return None
-
-
-def _capped_study_modes(budget: int | None, review_size: int | None = None) -> dict[str, dict[str, int]]:
+def _capped_study_modes(review_size: int | None = None) -> dict[str, dict[str, int]]:
     """Wire copy of STUDY_MODES, adapted to live numbers:
 
-    - `preview` tracks the remaining daily release budget (user spec
-      2026-09-16): once the budget drops below the normal size, deal
-      exactly what's left — one round lands the goal instead of dragging it
-      across rounds. budget=None (goal disabled) → size unchanged.
     - `review` is DYNAMIC (single daily pacing 2026-09-24): ceil(D/3) from
       the daily due snapshot. review_size=None leaves the static 0
       placeholder (AnkiConnect unavailable — the frontend then hides the
       number instead of showing a bogus 0).
 
     The frontend renders sizes from this table only, so the rules live in
-    exactly one place.
+    exactly one place. (The old budget-capped `preview` size died with the
+    preview stage, 2026-09-27.)
     """
     out = {}
     for name, sizes in STUDY_MODES.items():
         row = dict(sizes)
-        if budget is not None:
-            row["preview"] = min(sizes["preview"], budget)
         if review_size is not None:
             row["review"] = review_size
         out[name] = row
     return out
 
 
-async def _wire_study_modes(budget: int | None) -> dict[str, dict[str, int]]:
+async def _wire_study_modes() -> dict[str, dict[str, int]]:
     """_capped_study_modes with the dynamic review size resolved (display
     mode — never persists a snapshot)."""
     try:
         review_size = await _daily_review_size(snapshot=False)
     except Exception:
         review_size = None
-    return _capped_study_modes(budget, review_size)
+    return _capped_study_modes(review_size)
 
-
-def _capped_preview_size(mode: str, budget: int | None) -> int:
-    """Preview batch size for one round: the mode's size, adapted to the
-    remaining daily release budget (see _capped_study_modes). Sync — the
-    preview size never depends on the dynamic review number."""
-    return _capped_study_modes(budget)[mode]["preview"]
-
-# stamp tag added on approve; the card is released (unsuspended) when this
-# date is strictly BEFORE today — see release_yesterday_approved()
-RELEASED_TAG_PREFIX = "released-"
 # Anki's day rollover is 4 AM (collection default, container TZ fixed to
-# Asia/Shanghai). Stamp/release comparisons use the ANKI day, not the
-# calendar day, so a card approved at 23:50 is not "released" at 00:05 —
-# it waits until the scheduler's own next day (04:00), guaranteeing a real
-# overnight gap before the first grading.
+# Asia/Shanghai). Release comparisons use the ANKI day, not the calendar
+# day, so a card made at 23:50 is not "released" at 00:05 — it waits until
+# the scheduler's own next day (04:00), guaranteeing a real overnight gap
+# before the first grading.
 ANKI_ROLLOVER_HOUR = int(os.getenv("ANKI_ROLLOVER_HOUR", "4"))
 
 
@@ -369,9 +305,9 @@ _sync_pending = False  # coalesce fire-and-forget syncs
 _sync_timer = None     # throttled tail: call_later handle (None = no tail armed)
 _sync_last_finish = 0.0  # loop.time() when the last sync completed (throttle base)
 
-# Serializes the read-modify-write cycles on round.json / preview.json in
-# the per-card mutation endpoints (answer, undo, preview act/undo, delete,
-# to-preview). The user reviews from MULTIPLE devices (phone + desktop over
+# Serializes the read-modify-write cycles on round.json in the per-card
+# mutation endpoints (answer, undo, delete). The user reviews from
+# MULTIPLE devices (phone + desktop over
 # tailscale); without this lock two concurrent mutations both read the old
 # pending list and the later write silently drops the earlier one — an
 # answered card comes back, undo slots point at stale indices. Single
@@ -619,7 +555,7 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
         return []
     infos = await anki("cardsInfo", {"cards": ids})
     # cardsInfo returns cards sorted by id — re-order to match the REQUEST
-    # order (matters for preview-priority new cards and due-order batches).
+    # order (matters for due-order batches).
     # Defensive: AnkiConnect returns [{}] (one EMPTY row) for vanished ids —
     # never index those rows directly (KeyError → 500).
     by_id = {i["cardId"]: i for i in infos or [] if i.get("cardId")}
@@ -656,7 +592,7 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
 
     New-card draw (2026-09-04 spec): up to `new_count` cards sampled
     UNIFORMLY AT RANDOM from the whole dealable pool — no hourly quota, no
-    priority for just-approved preview cards, so nothing starves.
+    priority deal, so nothing starves.
     """
     cards: list[dict] = []
 
@@ -696,12 +632,6 @@ async def status():
     try:
         due = await anki("findCards", {"query": "is:due -is:new"})
         new = await anki("findCards", {"query": new_card_query()})
-        # capped mode table (2026-09-16): preview sizes track the daily
-        # release budget, so every wire copy of study_modes agrees
-        try:
-            budget = await _release_budget_left()
-        except Exception:
-            budget = None
         out = {
             "anki": "ok",
             "due_review": len(due or []),
@@ -709,12 +639,14 @@ async def status():
             "new_per_round": STUDY_MODES[DEFAULT_MODE]["new"],
             "preview_mode": PREVIEW_MODE,
             "reading_mode": READING_MODE,
-            # two pacing modes (user spec 2026-09-14) — the frontend renders
-            # the start-screen choice from this table, never hardcoded
-            "study_modes": await _wire_study_modes(budget),
+            # single daily tier (2026-09-24) — the frontend renders the
+            # start-screen plan from this table, never hardcoded
+            "study_modes": await _wire_study_modes(),
             "default_mode": DEFAULT_MODE,
-            # daily 放行 goal for the preview-start progress bar (2026-09-16)
-            "release_daily_goal": RELEASE_DAILY_GOAL,
+            # daily auto-release cap (2026-09-27): how many pool cards may
+            # still be released into the new queue today
+            "release_daily_goal": RELEASE_DAILY_GOAL if PREVIEW_MODE else None,
+            "release_budget_left": _release_budget_left() if PREVIEW_MODE else None,
         }
         if PREVIEW_MODE:
             out["preview_pool"] = len(await preview_pool_ids() or [])
@@ -733,8 +665,8 @@ async def start_session(mode: str | None = None):
     """Deal under _state_lock; the (potentially slow) sync runs outside it
     so other devices' state polls are never blocked for minutes.
 
-    `mode` picks the pacing (quick = 碎片时间 5+5+20, focus = 整块时间
-    10+10+30); unknown/absent falls back to DEFAULT_MODE."""
+    `mode` is vestigial (single daily tier since 2026-09-24); unknown/absent
+    falls back to DEFAULT_MODE."""
     synced = await do_sync()  # do_sync acquires _sync_lock itself
     async with _state_lock:
         return await _start_session_impl(synced, study_mode(mode))
@@ -742,7 +674,9 @@ async def start_session(mode: str | None = None):
 
 async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
     if PREVIEW_MODE:
-        await release_yesterday_approved()
+        # next-day auto-release (2026-09-27): pool cards made on an earlier
+        # day become gradeable new cards now, so this deal sees them.
+        await auto_release_pool()
     m = STUDY_MODES[mode]
     # dynamic review size (2026-09-24): ceil(D/3) with D = today's due
     # snapshot, captured on the day's FIRST review deal (snapshot=True)
@@ -765,14 +699,6 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
                 "mode": mode,
             }
         )
-    # capped table (2026-09-16): the frontend stores whatever study_modes
-    # rides along, so this must match session/state's view of the budget
-    budget = None
-    if PREVIEW_MODE:
-        try:
-            budget = await _release_budget_left()
-        except Exception:
-            budget = None
     return {
         "synced": synced,
         "cards": cards,
@@ -780,7 +706,7 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": await _wire_study_modes(budget),
+        "study_modes": await _wire_study_modes(),
     }
 
 
@@ -794,9 +720,10 @@ async def session_state():
 async def _session_state_impl():
     """Page-load entry point: resume an unfinished round instead of auto-starting."""
     if PREVIEW_MODE:
-        # next-day release: cards approved on a PREVIOUS day become gradeable
-        # now, so every count below reflects today's true new-card pool
-        await release_yesterday_approved()
+        # next-day auto-release (2026-09-27): pool cards made on an earlier
+        # day become gradeable new cards now, so every count below reflects
+        # today's true new-card pool
+        await auto_release_pool()
     try:
         due = await anki("findCards", {"query": "is:due -is:new"})
         due_left = len(due or [])
@@ -808,84 +735,29 @@ async def _session_state_impl():
     except Exception:
         new_total = None
 
-    # preview-mode extras (the frontend decides from preview_mode whether to
-    # render the preview UI at all — feature flag off ⇒ exact legacy shape)
+    # preview-pool extras (the frontend decides from preview_mode whether to
+    # render the pool chip at all — feature flag off ⇒ exact legacy shape).
+    # The manual preview ROUND (state/start/act/undo/finish + resume) died
+    # 2026-09-27: releases are automatic, so there is nothing to resume.
     preview: dict = {
         "preview_mode": PREVIEW_MODE,
         # pacing table for the start screen (single daily tier, 2026-09-24) —
         # the UI renders today's plan from this, never hardcoded numbers.
-        # PREVIEW_MODE replaces this below with the budget-capped copy, so
-        # only resolve the dynamic review size once (one findCards either way).
-        "study_modes": None if PREVIEW_MODE else await _wire_study_modes(None),
+        "study_modes": await _wire_study_modes(),
         "default_mode": DEFAULT_MODE,
-        # daily 放行 goal for the preview-start progress bar (2026-09-16);
-        # the bar tracks pending_release below against this goal
-        "release_daily_goal": RELEASE_DAILY_GOAL,
+        # daily auto-release cap (user spec 2026-09-27) + how many slots are
+        # left today, so the UI can explain an overflowing pool
+        "release_daily_goal": RELEASE_DAILY_GOAL if PREVIEW_MODE else None,
     }
     if PREVIEW_MODE:
-        # batch size of the ACTIVE preview round (mode-dependent since
-        # 2026-09-14) — None when no preview round: the start screens then
-        # use study_modes[selected] to preview the sizes
-        preview["preview_per_round"] = _active_preview_per_round()
         try:
             preview["pending_release"] = await _pending_release_today()
         except Exception:
             preview["pending_release"] = None
-        # daily release budget (2026-09-16): remaining 放行 slots. The
-        # study_modes table below is capped by it, so the start screens
-        # show the ACTUAL deal size for each tier
-        try:
-            budget = await _release_budget_left()
-        except Exception:
-            budget = None
-        preview["release_budget_left"] = budget
-        preview["study_modes"] = await _wire_study_modes(budget)
+        preview["release_budget_left"] = _release_budget_left()
         try:
             pool = await preview_pool_ids()
-            deferred = await _deferred_today_cards(pool)
             preview["preview_pool"] = len(pool)
-            preview["preview_available"] = len(pool) - len(deferred)
-            prd = _preview_read()
-            if (
-                prd is not None
-                and prd.get("status") == "active"
-                and prd.get("pending")
-            ):
-                infos = await anki("cardsInfo", {"cards": prd["pending"]})
-                still = [
-                    i["cardId"]
-                    for i in infos or []
-                    if i.get("cardId")
-                    and PREVIEW_DECK in i.get("deckName", "")
-                    and i.get("type") == 0
-                ]
-                pending = [c for c in prd["pending"] if c in still]
-                if pending:
-                    prd["pending"] = pending
-                    _preview_write(prd)
-                    preview["preview_round"] = {
-                        "cards": await fetch_cards(pending),
-                        "done": prd.get("done", 0),
-                        "total": prd.get("total", len(pending)),
-                        "can_undo": bool(prd.get("last")),
-                        "approved": len(prd.get("approved") or []),
-                        "deferred": prd.get("deferred", 0),
-                        "mode": study_mode(prd.get("mode")),
-                    }
-                else:
-                    # round drained — keep the approved tombstone (if any):
-                    # the preview done-screen undo still needs it; mode rides
-                    # along so 're-preview' chains the same pacing
-                    approved = prd.get("approved") or []
-                    _preview_write(
-                        {
-                            "status": "complete",
-                            "approved": approved,
-                            "mode": study_mode(prd.get("mode")),
-                        }
-                        if approved
-                        else None
-                    )
         except Exception:
             preview["preview_pool"] = None
 
@@ -972,7 +844,7 @@ async def _session_more_impl():
     read can't corrupt the day's divisor base).
     """
     if PREVIEW_MODE:
-        await release_yesterday_approved()
+        await auto_release_pool()
     rd = current_round()
     mode = study_mode((rd or {}).get("mode"))
     m = STUDY_MODES[mode]
@@ -992,20 +864,13 @@ async def _session_more_impl():
                 "mode": mode,
             }
         )
-    # capped table (2026-09-16) — same as session/start
-    budget = None
-    if PREVIEW_MODE:
-        try:
-            budget = await _release_budget_left()
-        except Exception:
-            budget = None
     return {
         "cards": cards,
         "due_remaining": due_remaining,
         "new_per_round": m["new"],
         "new_total": new_total,
         "mode": mode,
-        "study_modes": await _wire_study_modes(budget),
+        "study_modes": await _wire_study_modes(),
     }
 
 
@@ -1088,20 +953,10 @@ async def _answer_impl(card_id: int, ease: int):
                 pass
             round_info["new_per_round"] = STUDY_MODES[study_mode(rd.get("mode"))]["new"]
 
-    # ---- double-Again auto-return (user spec 2026-09-16) ----
-    # A NEW card whose first two consecutive grades are both Again goes
-    # back to the preview pool. Non-Again grades clear the streak. Runs
-    # AFTER the round bookkeeping so the undo slot is already recorded —
-    # the hook marks it auto_return so /api/undo can reverse the move.
-    returned = None
-    if PREVIEW_MODE and NEW_AGAIN_RETURN:
-        if ease == 1:
-            returned = await _maybe_auto_return_to_preview(card_id, ease, info)
-        else:
-            _streak_clear(card_id)
-    if returned is not None:
-        fire_and_forget_sync()
-        return {"answered": True, "round": round_info, "returned_to_preview": returned}
+    # NOTE: the double-Again auto-return hook (2026-09-16) is GONE
+    # (user spec 2026-09-27): grading a new card Again twice no longer
+    # sends it back to the preview pool — the card stays in the learning
+    # queue like any other lapse.
 
     fire_and_forget_sync()
     return {"answered": True, "round": round_info}
@@ -1150,17 +1005,6 @@ async def _undo_impl():
     if not (res and res[0] is True):
         raise HTTPException(status_code=502, detail=f"restore failed: {res}")
 
-    # the answer triggered a double-Again auto-return (2026-09-16): the card
-    # was forget'd, moved to PREVIEW_DECK and suspended AFTER the snapshot.
-    # Field restore alone would leave a scheduled card sitting suspended in
-    # the pool — also undo the deck move + suspend so it's a normal due card.
-    if last.get("auto_return"):
-        try:
-            await anki("changeDeck", {"cards": [cid], "deck": RELEASE_DECK})
-            await anki("unsuspend", {"cards": [cid]})
-        except Exception:
-            pass  # best-effort: the scheduling restore above is the critical part
-
     # put the card back into the round where it was (defensive: never
     # duplicate if it somehow never left)
     pos = min(last.get("index", 0), len(rd.get("pending", [])))
@@ -1172,24 +1016,6 @@ async def _undo_impl():
     rd.pop("last", None)
     _round_write(rd)
 
-    # the undone answer had triggered a double-Again auto-return: the streak
-    # file was cleared by the hook, so put the counter back to just-below the
-    # threshold — a fresh Again after the undo correctly re-triggers the return
-    if last.get("auto_return") and PREVIEW_MODE:
-        d = _streak_read()
-        d[str(cid)] = max(1, NEW_AGAIN_LIMIT - 1)
-        _streak_write(d)
-    elif last.get("ease") == 1 and PREVIEW_MODE:
-        # plain Again answer undone (no auto-return yet): give the streak
-        # count back so the counter mirrors what actually happened
-        d = _streak_read()
-        k = str(cid)
-        if k in d:
-            d[k] -= 1
-            if d[k] <= 0:
-                d.pop(k)
-            _streak_write(d)
-
     cards = await fetch_cards([cid])
     if not cards:
         raise HTTPException(status_code=404, detail="card vanished after restore")
@@ -1197,20 +1023,10 @@ async def _undo_impl():
     # propagate the corrected scheduling to the sync server
     fire_and_forget_sync()
     out: dict = {"restored": True, "card": cards[0], "index": pos}
-    if last.get("auto_return"):
-        try:
-            out["returned_from_preview"] = {"cardId": cid, "pool": await preview_pool_count()}
-        except Exception:
-            out["returned_from_preview"] = {"cardId": cid, "pool": None}
     return out
 
 
-# ---- preview mode: pool, rounds, endpoints --------------------------------
-
-def _preview_guard():
-    """Preview endpoints only exist when the feature flag is on."""
-    if not PREVIEW_MODE:
-        raise HTTPException(status_code=404, detail="preview mode disabled")
+# ---- preview pool: helpers -------------------------------------------------
 
 
 async def preview_pool_ids() -> list[int]:
@@ -1229,557 +1045,178 @@ async def preview_pool_ids() -> list[int]:
     return sorted(ids)
 
 
-async def _deferred_today_cards(pool_ids: list[int]) -> set[int]:
-    """Cards deferred TODAY (tag deferred-YYYYMMDD) — hidden from preview."""
-    if not pool_ids:
-        return set()
-    tag = "deferred-" + datetime.now().strftime("%Y%m%d")
-    ids = await anki(
-        "findCards", {"query": f'deck:"{PREVIEW_DECK}" tag:{tag} is:new'}
-    )
-    return set(ids or [])
-
-
-def _preview_read() -> dict | None:
-    STATE_DIR.mkdir(exist_ok=True)
-    if not PREVIEW_FILE.exists():
-        return None
-    try:
-        rd = json.loads(PREVIEW_FILE.read_text())
-        return rd if rd.get("status") in ("active", "complete") else None
-    except Exception:
-        return None
-
-
-def _preview_write(rd: dict | None):
-    STATE_DIR.mkdir(exist_ok=True)
-    if rd is None:
-        PREVIEW_FILE.unlink(missing_ok=True)
-    else:
-        tmp = PREVIEW_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rd))
-        tmp.replace(PREVIEW_FILE)
+# NOTE: the manual preview-round machinery (_preview_read/_preview_write/
+# _deferred_today_cards + the /api/preview/* endpoints) was DELETED
+# 2026-09-27 — releases are automatic, there is nothing to deal, approve
+# or defer. A leftover state/preview.json from before the change is
+# ignored (no reader left).
 
 
 async def preview_pool_count() -> int:
     return len(await preview_pool_ids())
 
 
-# ---- double-Again auto-return state (user spec 2026-09-16) ---------------
-# {card_id(str): consecutive-Again count in the card's FIRST learning cycle}.
-# Lives in its own file (not round.json) because the two Agains usually land
-# in DIFFERENT rounds — Anki's relearning steps re-deal the card minutes
-# later, often into the next batch. Cleared by: any non-Again grade, undo,
-# manual 移回预览池, delete, and the auto-return itself.
+# ---- next-day auto-release (user spec 2026-09-27) --------------------------
+# The manual preview stage is retired: nobody approves pool cards by hand
+# anymore. auto_release_pool() runs at every session entry point and moves
+# pool cards whose NOTE was created on an EARLIER Anki day into RELEASE_DECK
+# unsuspended — today's cards become tomorrow's new cards. The overnight gap
+# is the whole point (2026-09-07 measurement: same-day first grading is
+# recognition, not recall — 61% vs 88% pass rate).
+#
+# "Created on an earlier day" needs NO tags: Anki's noteId IS the creation
+# timestamp in ms, so the card's age comes for free
+# (datetime.fromtimestamp(nid/1000) → Anki day). A one-time LEGACY sweep
+# covers cards approved under the old manual flow (released-YYYYMMDD stamp,
+# suspended in RELEASE_DECK) — after deploy it drains them and goes quiet.
+#
+# Daily cap: at most RELEASE_DAILY_GOAL cards released per Anki day
+# (ledger state/auto_release.json = {day, released}), oldest first; the
+# overflow waits for the next day. The cap exists because the user's pacing
+# is 3 rounds × 15 new per day — releasing more would inflate the review
+# burden (user spec 2026-09-27: 放行太多 → 复习负担太大).
 
-def _streak_read() -> dict[str, int]:
-    STATE_DIR.mkdir(exist_ok=True)
-    if not NEW_AGAIN_FILE.exists():
-        return {}
+# legacy approve stamp (pre-2026-09-27 manual flow); the sweep below is the
+# only remaining reader — no new stamps are ever written.
+RELEASED_TAG_PREFIX = "released-"
+
+
+def _auto_release_ledger() -> dict:
+    """{day: YYYYMMDD, released: N} — today's ledger, or empty."""
     try:
-        d = json.loads(NEW_AGAIN_FILE.read_text())
-        return {str(k): int(v) for k, v in d.items() if isinstance(v, int)}
+        d = json.loads(AUTO_RELEASE_FILE.read_text())
+        if isinstance(d, dict) and d.get("day") == _anki_day():
+            return {"day": d["day"], "released": int(d.get("released", 0))}
     except Exception:
-        return {}
+        pass
+    return {}
 
 
-def _streak_write(d: dict[str, int]) -> None:
+def _auto_release_write(released_today: int) -> None:
     STATE_DIR.mkdir(exist_ok=True)
-    tmp = NEW_AGAIN_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(d))
-    tmp.replace(NEW_AGAIN_FILE)
+    tmp = AUTO_RELEASE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"day": _anki_day(), "released": released_today}))
+    tmp.replace(AUTO_RELEASE_FILE)
 
 
-def _streak_clear(card_id: int) -> None:
-    d = _streak_read()
-    if str(card_id) in d:
-        d.pop(str(card_id))
-        _streak_write(d)
+def _released_today_count() -> int:
+    return _auto_release_ledger().get("released", 0)
 
 
-def _streak_note_again(card_id: int, card_is_new: bool) -> int:
-    """Record one Again grade; returns the new streak length.
-
-    The streak only tracks a NEW card's first learning cycle (初学): the
-    counter OPENS while the card is still type==0 and KEEPS counting across
-    its relearning steps (the second Again lands on a type==2 card, so the
-    guard is 'already tracking', not 'still new'). Review cards that lapse
-    never start a streak.
-    """
-    key = str(card_id)
-    d = _streak_read()
-    if card_is_new or key in d:
-        d[key] = d.get(key, 0) + 1
-        _streak_write(d)
-        return d[key]
-    return 0
-
-
-async def _maybe_auto_return_to_preview(
-    card_id: int, ease: int, info: dict | None
-) -> dict | None:
-    """Double-Again auto-return hook, called from /api/answer.
-
-    Returns {"cardId", "pool"} when the card was moved back to the preview
-    pool, else None. Fail-soft: any error degrades to 'no auto-return' —
-    the grade itself already landed, review must never break here.
-    """
-    if not (NEW_AGAIN_RETURN and PREVIEW_MODE and ease == 1):
+def _release_budget_left() -> int | None:
+    """Remaining daily release slots (cap − already released today).
+    None when the cap is disabled (<=0)."""
+    if RELEASE_DAILY_GOAL <= 0:
         return None
+    return max(0, RELEASE_DAILY_GOAL - _released_today_count())
+
+
+def _note_created_anki_day(note_id: int) -> str:
+    """Anki day (YYYYMMDD) a note was created on — noteId is the creation
+    timestamp in ms. Garbage in → "" (sorts before any real day, harmless:
+    an unparseable id would be treated as ancient and released)."""
     try:
-        streak = _streak_note_again(card_id, bool(info and info.get("type") == 0))
-        if streak < NEW_AGAIN_LIMIT:
-            return None
-        _streak_clear(card_id)
-        pool = (await _to_preview_pool_impl(card_id)).get("pool")
-        # _to_preview_pool_impl leaves the round's undo slot alone (the card
-        # already left pending when it was answered); just MARK the existing
-        # slot so /api/undo knows to also move the card back out of the pool.
-        rd = current_round()
-        if rd is not None:
-            last = rd.get("last")
-            if isinstance(last, dict) and last.get("cardId") == card_id:
-                last["auto_return"] = True
-                _round_write(rd)
-        return {"cardId": card_id, "pool": pool}
+        dt = datetime.fromtimestamp(note_id / 1000) - timedelta(hours=ANKI_ROLLOVER_HOUR)
+        return dt.strftime("%Y%m%d")
     except Exception:
-        return None
+        return ""
 
 
-async def release_yesterday_approved() -> int:
-    """Next-day release (2026-09-07): unsuspend cards approved on a PREVIOUS
-    calendar day.
+async def auto_release_pool() -> int:
+    """Next-day auto-release (2026-09-27): move pool cards created on an
+    EARLIER Anki day into RELEASE_DECK unsuspended, capped at
+    RELEASE_DAILY_GOAL per day (oldest first). Also drains legacy
+    released-* stamped cards from the retired manual-approve flow.
 
-    Approve now keeps the card SUSPENDED in RELEASE_DECK with a
-    `released-YYYYMMDD` stamp tag. This routine runs at the entry points
-    (session/state, session/start, preview/state, preview/start) and
-    unsuspends every stamped card whose date is strictly before today —
-    so a card previewed on day N first becomes gradeable on day N+1. The
-    overnight gap turns the first grade from recognition (fluency illusion)
-    into honest recall, which is what FSRS needs to seed stability.
-
-    Fail-soft: any error leaves cards suspended (they release on a later
-    run) — never blocks the caller.
+    Runs at the session entry points (session/state, session/start,
+    session/more). Fail-soft: any error leaves cards suspended (they
+    release on a later run) — never blocks the caller.
     """
+    if not PREVIEW_MODE:
+        return 0
     try:
-        # deck-scoped: a released- stamp on a card back in the preview pool
-        # (undo path) must NOT release it there — the stamp is removed on
-        # undo anyway, but scope the query too for belt-and-braces
-        ids = await anki(
-            "findCards",
-            {
-                "query": (
-                    f'deck:"{RELEASE_DECK}" is:new is:suspended tag:released-*'
-                )
-            },
-        ) or []
-        if not ids:
-            return 0
-        # NOTE: cardsInfo does NOT return tags (always None) — tags come
-        # from notesInfo. Verified against AnkiConnect 2026-09-07.
-        infos = [i for i in await anki("cardsInfo", {"cards": ids}) or [] if i.get("cardId")]
-        if not infos:
-            return 0
-        note_ids = list({i["note"] for i in infos if i.get("note")})
-        ntags: dict[int, list[str]] = {}
-        for n in await anki("notesInfo", {"notes": note_ids}) or []:
-            if n.get("noteId"):
-                ntags[n["noteId"]] = n.get("tags") or []
         today = _anki_day()
-        ready = []
-        for i in infos:
-            if i.get("type") != 0:
-                continue
-            stamps = [
-                t[len(RELEASED_TAG_PREFIX):]
-                for t in ntags.get(i.get("note"), [])
-                if t.startswith(RELEASED_TAG_PREFIX)
+        # ---- candidates -------------------------------------------------
+        # legacy: approved under the manual flow, stamped, still suspended
+        legacy_ids = await anki(
+            "findCards",
+            {"query": f'deck:"{RELEASE_DECK}" is:new is:suspended tag:{RELEASED_TAG_PREFIX}*'},
+        ) or []
+        legacy_ready: list[int] = []
+        if legacy_ids:
+            # tags come from notesInfo (cardsInfo does NOT return them)
+            linfos = [
+                i for i in await anki("cardsInfo", {"cards": legacy_ids}) or []
+                if i.get("cardId") and i.get("type") == 0
             ]
-            if stamps and min(stamps) < today:
-                ready.append(i["cardId"])
-        if not ready:
+            ntags: dict[int, list[str]] = {}
+            note_ids = list({i["note"] for i in linfos if i.get("note")})
+            if note_ids:
+                for n in await anki("notesInfo", {"notes": note_ids}) or []:
+                    if n.get("noteId"):
+                        ntags[n["noteId"]] = n.get("tags") or []
+            for i in linfos:
+                stamps = [
+                    t[len(RELEASED_TAG_PREFIX):]
+                    for t in ntags.get(i.get("note"), [])
+                    if t.startswith(RELEASED_TAG_PREFIX)
+                ]
+                if stamps and min(stamps) < today:
+                    legacy_ready.append(i["cardId"])
+        # pool cards whose note was created before today
+        pool_ids = await preview_pool_ids()  # sorted oldest-first already
+        pool_ready: list[int] = []
+        if pool_ids:
+            pinfos = [
+                i for i in await anki("cardsInfo", {"cards": pool_ids}) or []
+                if i.get("cardId") and i.get("type") == 0
+            ]
+            aged = [
+                (i.get("note") or 0, i["cardId"])
+                for i in pinfos
+                if _note_created_anki_day(i.get("note") or 0) < today
+            ]
+            aged.sort()  # oldest notes first — the cap releases in age order
+            pool_ready = [cid for _, cid in aged]
+
+        candidates = legacy_ready + pool_ready
+        if not candidates:
             return 0
-        await anki("unsuspend", {"cards": ready})
+        # ---- daily cap ----------------------------------------------------
+        budget = _release_budget_left()  # None = uncapped
+        take = candidates if budget is None else candidates[:budget]
+        if not take:
+            return 0
+        await anki("changeDeck", {"cards": take, "deck": RELEASE_DECK})
+        await anki("unsuspend", {"cards": take})
+        if budget is not None:
+            _auto_release_write(_released_today_count() + len(take))
+        log.info(
+            "auto-release: %d cards (legacy %d, pool %d; %d held by daily cap)",
+            len(take), len(legacy_ready), len(pool_ready),
+            len(candidates) - len(take),
+        )
         fire_and_forget_sync()
-        return len(ready)
-    except Exception:
+        return len(take)
+    except Exception as e:
+        log.warning("auto_release_pool failed (cards stay suspended): %s", e)
         return 0
 
 
 async def _pending_release_today() -> int:
-    """Cards approved TODAY — still suspended, will release at tomorrow's
-    first entry point. Reported in the wire payload so the UI can explain
-    why the just-approved cards are not in the new pool yet."""
-    stamp = RELEASED_TAG_PREFIX + _anki_day()
-    ids = await anki(
-        "findCards",
-        {"query": f'deck:"{RELEASE_DECK}" is:new is:suspended tag:{stamp}'},
-    )
-    return len(ids or [])
-
-
-async def _release_budget_left(pending_release: int | None = None) -> int | None:
-    """Remaining daily release budget (user spec 2026-09-16).
-
-    RELEASE_DAILY_GOAL − cards approved today (the SAME number the preview
-    start screen's progress bar shows, so cap and bar can never disagree).
-    Pass an already-computed `pending_release` to avoid a second AnkiConnect
-    round-trip. None when the goal is disabled (<=0) — no cap, legacy
-    behavior. Deferred cards (明天再看) do NOT consume the budget (they
-    aren't released); undoing an approval gives the budget back
-    automatically because pending_release is recomputed from tags on every
-    call.
-    """
-    if RELEASE_DAILY_GOAL <= 0:
-        return None
-    if pending_release is None:
-        pending_release = await _pending_release_today()
-    return max(0, RELEASE_DAILY_GOAL - pending_release)
-
-
-@app.get("/api/preview/state")
-async def preview_state():
-    """Serialized under _state_lock (see its declaration)."""
-    async with _state_lock:
-        return await _preview_state_impl()
-
-
-async def _preview_state_impl():
-    """Entry point for the preview UI: pool size + in-progress round resume."""
-    _preview_guard()
-    await release_yesterday_approved()
-    try:
-        due_left = len(
-            await anki("findCards", {"query": "is:due -is:new"}) or []
-        )
-    except Exception:
-        due_left = None
-
-    rd = _preview_read()
-    if rd is not None and rd.get("status") == "active" and rd.get("pending"):
-        infos = await anki("cardsInfo", {"cards": rd["pending"]})
-        # drop cards that left the pool since (released/deferred/moved)
-        still = {
-            i["cardId"]: i
-            for i in infos or []
-            if i.get("cardId")
-            and PREVIEW_DECK in i.get("deckName", "")
-            and i.get("type") == 0
-        }
-        pending = [c for c in rd["pending"] if c in still]
-        dropped = len(rd["pending"]) - len(pending)
-        rd["pending"] = pending
-        rd["done"] = rd.get("done", 0) + dropped
-        if pending:
-            _preview_write(rd)
-            cards = await fetch_cards(pending)
-            return {
-                "round": "active",
-                "cards": cards,
-                "done": rd.get("done", 0),
-                "total": rd.get("total", rd.get("done", 0) + len(pending)),
-                "pool": len(await preview_pool_ids()),
-                "due_remaining": due_left,
-                "can_undo": bool(rd.get("last")),
-                # approve/defer split, so a resumed round (page refresh) can
-                # still report honest numbers on the done / exit screens
-                "approved": len(rd.get("approved") or []),
-                "deferred": rd.get("deferred", 0),
-                "mode": study_mode(rd.get("mode")),
-            }
-        # round drained — keep the approved tombstone (if any)
-        approved = rd.get("approved") or []
-        _preview_write(
-            {
-                "status": "complete",
-                "approved": approved,
-                "mode": study_mode(rd.get("mode")),
-            }
-            if approved
-            else None
-        )
-
-    pool = await preview_pool_ids()
-    deferred = await _deferred_today_cards(pool)
-    available = len(pool) - len(deferred)
-    return {
-        "round": "none",
-        "pool": len(pool),
-        "available": available,
-        "due_remaining": due_left,
-    }
-
-
-@app.post("/api/preview/start")
-async def preview_start(mode: str | None = None):
-    """Serialized under _state_lock (see its declaration).
-
-    do_sync() runs OUTSIDE the lock: a cold sync can take minutes, and
-    holding the state lock that long would block every other endpoint
-    (including GET state). The lock only protects the pool read + deal.
-
-    `mode` picks the preview batch size (quick=1, focus=5); it is stored in
-    preview.json so a refresh / 'more' keeps the same pacing, and handed to
-    the frontend so 'skip to review' starts a review round of the SAME mode.
-    """
-    _preview_guard()
-    await do_sync()  # pull anything injected elsewhere
-    async with _state_lock:
-        return await _preview_start_impl(study_mode(mode))
-
-
-async def _preview_start_impl(mode: str = DEFAULT_MODE):
-    """Deal one preview batch: a random sample of pool cards not deferred today.
-
-    Release-budget cap (user spec 2026-09-16): the batch is min(mode size,
-    remaining daily budget) — once fewer cards are left than a full round,
-    EVERY mode deals exactly the remainder, so the day lands on the goal
-    instead of overshooting it. Budget exhausted → no deal at all
-    (goal_reached), the day's previews are done.
-    """
-    _preview_guard()
-    await release_yesterday_approved()
-    budget = await _release_budget_left()
-    pool = await preview_pool_ids()
-    deferred = await _deferred_today_cards(pool)
-    available = [c for c in pool if c not in deferred]
-    if budget is not None and budget <= 0:
-        return {
-            "cards": [],
-            "pool": len(pool),
-            "available": len(available),
-            "mode": mode,
-            "goal_reached": True,
-            "study_modes": await _wire_study_modes(budget),
-        }
-    # random draw (2026-09-04 spec) — mirrors the review-round new draw
-    per_round = _capped_preview_size(mode, budget)
-    pending = random.sample(available, min(per_round, len(available)))
-    if not pending:
-        return {"cards": [], "pool": len(pool), "available": 0, "mode": mode}
-    _preview_write(
-        {
-            "status": "active",
-            "created": datetime.now().isoformat(timespec="seconds"),
-            "total": len(pending),
-            "done": 0,
-            "pending": pending,
-            "mode": mode,
-        }
-    )
-    return {
-        "cards": await fetch_cards(pending),
-        "pool": len(pool),
-        "available": len(pool) - len(deferred) - len(pending),
-        "mode": mode,
-        "preview_per_round": per_round,
-        # capped table so the UI's size labels track the budget immediately
-        "study_modes": await _wire_study_modes(budget),
-    }
-
-
-@app.post("/api/preview/act")
-async def preview_act(card_id: int, action: str):
-    """Serialized under _state_lock (see its declaration)."""
-    async with _state_lock:
-        return await _preview_act_impl(card_id, action)
-
-
-async def _preview_act_impl(card_id: int, action: str):
-    """Per-card decision inside a preview round.
-
-    approve (放行): move card to RELEASE_DECK and unsuspend — it becomes a
-        regular new card in the dealable pool, from which every study round
-        draws at random (no more 先看后考 priority deal).
-    defer (明天再看): tag deferred-YYYYMMDD so today's preview skips it.
-    Both are idempotent-ish; both verify the card is still in the round.
-    """
-    _preview_guard()
-    if action not in ("approve", "defer"):
-        raise HTTPException(status_code=400, detail="action must be approve|defer")
-    rd = _preview_read()
-    if not rd or card_id not in rd.get("pending", []):
-        return {"ok": False, "reason": "stale"}
-
-    infos = await anki("cardsInfo", {"cards": [card_id]})
-    # AnkiConnect returns [{}] for a vanished id — filter before indexing,
-    # else infos[0]["note"] is a KeyError → 500 (audit hardening spot)
-    info = next((i for i in infos or [] if i.get("cardId")), None)
-    if info is None:
-        raise HTTPException(status_code=404, detail="card vanished")
-    # single-level undo slot (mirrors the review round's "last"): enough to
-    # reverse this exact act — deck+suspend for approve, note+tag for defer
-    rd["last"] = {
-        "cardId": card_id,
-        "index": rd["pending"].index(card_id),
-        "action": action,
-        "note": info["note"],
-    }
-    if action == "approve":
-        # next-day release (2026-09-07): move to RELEASE_DECK but keep it
-        # SUSPENDED with a released-YYYYMMDD stamp — release_yesterday_approved()
-        # unsuspends it the next calendar day, so the first grading happens
-        # ≥1 night after preview (honest recall, not recognition).
-        await anki("changeDeck", {"cards": [card_id], "deck": RELEASE_DECK})
-        stamp = RELEASED_TAG_PREFIX + _anki_day()
-        await anki("addTags", {"notes": [info["note"]], "tags": stamp})
-        # provenance tag: marks this note as having passed through the
-        # preview flow. The pool sweeper (anki_pool_sweep.py) uses it to
-        # tell legitimately-released cards apart from leaks that bypassed
-        # the pool (e.g. added on the desktop client straight into 2026).
-        await anki("addTags", {"notes": [info["note"]], "tags": "previewed"})
-        rd.setdefault("approved", []).append(card_id)
-    else:
-        tag = "deferred-" + datetime.now().strftime("%Y%m%d")
-        await anki("addTags", {"notes": [info["note"]], "tags": tag})
-        # explicit counter: `done` also absorbs cards that left the pool
-        # (deleted/released elsewhere), so done - approved is NOT the
-        # deferred count. The resume payload reports both (2026-09-06).
-        rd["deferred"] = rd.get("deferred", 0) + 1
-
-    # deck move / tag change must reach the sync server (and thus the
-    # user's phone + desktop) — same coalesced sync the answer path uses
-    fire_and_forget_sync()
-
-    # pending BEFORE this act — needed for the tombstone so undo can
-    # rehydrate the round exactly as it stood (返回上一张)
-    pending_before = rd.get("pending", [])
-    rd["pending"] = [c for c in rd["pending"] if c != card_id]
-    rd["done"] = rd.get("done", 0) + 1
-    if not rd["pending"]:
-        # tombstone: kept for the preview done-screen undo (the priority
-        # deal was removed 2026-09-04 — approved cards just join the pool).
-        # ALSO keep pending_before (= [card_id] here, the final card) plus
-        # done/total: the undo slot indexes into this round's deal order,
-        # and undoing the final act must restore the round's progress.
-        _preview_write(
-            {
-                "status": "complete",
-                "approved": rd.get("approved", []),
-                "pending": pending_before,
-                "done": rd.get("done", 0),
-                "total": rd.get("total", rd.get("done", 0)),
-                "last": rd.get("last"),
-                "mode": study_mode(rd.get("mode")),
-            }
-        )
-        remaining = await preview_pool_ids()
-        deferred = await _deferred_today_cards(remaining)
-        # refreshed budget + capped table (2026-09-16): the done screen's
-        # 「再预览 N 张」 label and the start screens must reflect the
-        # approvals from the round that just finished without a reload
-        try:
-            budget = await _release_budget_left()
-        except Exception:
-            budget = None
-        return {
-            "ok": True,
-            "round_complete": True,
-            "pool": len(remaining),
-            "available": len(remaining) - len(deferred),
-            "mode": study_mode(rd.get("mode")),
-            "release_budget_left": budget,
-            "study_modes": await _wire_study_modes(budget),
-        }
-    _preview_write(rd)
-    return {"ok": True, "round_complete": False}
-
-
-@app.post("/api/preview/finish")
-async def preview_finish():
-    """Serialized under _state_lock (see its declaration)."""
-    async with _state_lock:
-        return await _preview_finish_impl()
-
-
-async def _preview_finish_impl():
-    """End the preview round; untouched cards stay suspended in the pool.
-
-    Cards already approved this session are kept as a tombstone so the
-    done-screen undo keeps working.
-    """
-    _preview_guard()
-    rd = _preview_read()
-    approved = (rd or {}).get("approved") or []
-    if approved:
-        _preview_write(
-            {
-                "status": "complete",
-                "approved": approved,
-                "mode": study_mode((rd or {}).get("mode")),
-            }
-        )
-    else:
-        _preview_write(None)
-    return {"ok": True, "pool": await preview_pool_count()}
-
-
-@app.post("/api/preview/undo")
-async def preview_undo():
-    """Serialized under _state_lock (see its declaration)."""
-    async with _state_lock:
-        return await _preview_undo_impl()
-
-
-async def _preview_undo_impl():
-    """Undo the last preview act (预览环节的"返回上一张").
-
-    Exact reverse of /api/preview/act: an approved card goes back into the
-    pool suspended at its original position (and leaves the approved list);
-    a deferred card loses today's deferred tag. Single slot, same shape as
-    the review-round undo. Refuses when the card moved on since (e.g. an
-    approved card already answered in a review round) — reversing then
-    would corrupt real scheduling state.
-    """
-    _preview_guard()
-    rd = _preview_read()
-    last = (rd or {}).get("last")
-    if not rd or not last:
-        raise HTTPException(status_code=409, detail="nothing to undo")
-    cid = last["cardId"]
-    infos = await anki("cardsInfo", {"cards": [cid]})
-    info = (infos or [None])[0]
-    if info is None or not info.get("cardId"):
-        raise HTTPException(status_code=409, detail="card vanished")
-    if last.get("action") == "approve":
-        # only still-untouched new cards can be pulled back into the pool
-        if info["type"] != 0 or info["deckName"] != RELEASE_DECK:
-            raise HTTPException(status_code=409, detail="card moved on")
-        await anki("changeDeck", {"cards": [cid], "deck": PREVIEW_DECK})
-        await anki("suspend", {"cards": [cid]})
-        # drop today's released- stamp (next-day release marker, 2026-09-07)
-        # so the card never leaks into tomorrow's release batch from the pool
-        stamp = RELEASED_TAG_PREFIX + _anki_day()
-        await anki(
-            "removeTags",
-            {"notes": [last.get("note") or info["note"]], "tags": stamp},
-        )
-        rd["approved"] = [c for c in rd.get("approved", []) if c != cid]
-    else:
-        if info["type"] != 0 or PREVIEW_DECK not in info.get("deckName", ""):
-            raise HTTPException(status_code=409, detail="card moved on")
-        tag = "deferred-" + datetime.now().strftime("%Y%m%d")
-        await anki(
-            "removeTags", {"notes": [last.get("note") or info["note"]], "tags": tag}
-        )
-        rd["deferred"] = max(0, rd.get("deferred", 0) - 1)
-
-    pending = rd.get("pending") or []
-    pos = min(last.get("index", 0), len(pending))
-    if cid not in pending:
-        pending.insert(pos, cid)
-    rd["pending"] = pending
-    rd["done"] = max(0, rd.get("done", 0) - 1)
-    rd["total"] = rd["done"] + len(pending)
-    rd["status"] = "active"
-    rd.pop("last", None)  # single-level slot, consumed
-    _preview_write(rd)
-    # deck move / suspend / tag change must reach the sync server
-    fire_and_forget_sync()
-    cards = await fetch_cards([cid])
-    if not cards:
-        raise HTTPException(status_code=404, detail="card vanished after restore")
-    return {"restored": True, "card": cards[0], "index": pos, "action": last.get("action")}
+    """Pool cards created TODAY — still suspended, will release at tomorrow's
+    first entry point (subject to the daily cap). Reported in the wire
+    payload so the UI can explain why today's cards are not in the new pool
+    yet."""
+    today = _anki_day()
+    pool_ids = await preview_pool_ids()
+    if not pool_ids:
+        return 0
+    infos = [
+        i for i in await anki("cardsInfo", {"cards": pool_ids}) or []
+        if i.get("cardId") and i.get("type") == 0
+    ]
+    return sum(1 for i in infos if _note_created_anki_day(i.get("note") or 0) == today)
 
 
 @app.get("/api/note")
@@ -1834,15 +1271,15 @@ async def update_note(body: NoteUpdate):
     }
 
 
-# ---- card lifecycle: add / delete / back to preview pool ------------------
+# ---- card lifecycle: add / delete ------------------------------------------
 # Add (user spec 2026-09-04): fixed 问答题 note type (same as the add_cards.py
 # injection pipeline); the new card is routed into the preview pool SUSPENDED,
-# exactly like add_cards.py's default — it joins the real rotation only after
-# a preview round approves it.
-# Delete / to-preview are destructive per-card actions with confirmation
-# dialogs on the frontend. Both keep any active round consistent: the card
-# counts as handled (done_count +1) and the single-level undo slot is cleared
-# when it targeted the removed card (undo cannot resurrect what's gone).
+# exactly like add_cards.py's default — it joins the real rotation the NEXT
+# day via auto_release_pool (2026-09-27; used to need a manual preview approve).
+# Delete is a destructive per-card action with a confirmation dialog on the
+# frontend. It keeps any active round consistent: the card counts as handled
+# (done_count +1) and the single-level undo slot is cleared when it targeted
+# the removed card (undo cannot resurrect what's gone).
 
 ADD_MODEL = os.getenv("ANKI_ADD_MODEL", "问答题")
 # 挖空卡 (user spec 2026-09-19): cloze notes use Anki's 填空题 model —
@@ -1852,9 +1289,9 @@ ADD_CLOZE_MODEL = os.getenv("ANKI_ADD_CLOZE_MODEL", "填空题")
 
 
 def _round_remove_card(rd: dict | None, card_id: int) -> None:
-    """A card left the review round without being answered (deleted or sent
-    back to the preview pool): count it as handled so progress, the
-    review/new split and the completion detection all stay correct."""
+    """A card left the review round without being answered (deleted): count
+    it as handled so progress, the review/new split and the completion
+    detection all stay correct."""
     if not rd or rd.get("status") != "active" or card_id not in rd.get("pending", []):
         return
     rd["pending"] = [c for c in rd["pending"] if c != card_id]
@@ -1864,22 +1301,6 @@ def _round_remove_card(rd: dict | None, card_id: int) -> None:
     if not rd["pending"]:
         rd["status"] = "complete"
     _round_write(rd)
-
-
-def _preview_round_remove_card(rd: dict | None, card_id: int) -> None:
-    """Same bookkeeping for an in-flight preview round."""
-    if not rd or rd.get("status") != "active" or card_id not in rd.get("pending", []):
-        return
-    rd["pending"] = [c for c in rd["pending"] if c != card_id]
-    rd["done"] = rd.get("done", 0) + 1
-    if (rd.get("last") or {}).get("cardId") == card_id:
-        rd.pop("last", None)
-    if not rd["pending"]:
-        # round drained by removal — keep the approved tombstone so the
-        # preview done-screen undo for earlier acts keeps working
-        _preview_write({"status": "complete", "approved": rd.get("approved", [])})
-    else:
-        _preview_write(rd)
 
 
 @app.get("/api/card/add/info")
@@ -1912,9 +1333,9 @@ async def add_card(body: NoteAdd):
     route it into the preview pool.
 
     Preview mode on: lands in PREVIEW_DECK suspended — invisible to the
-    scheduler until a preview round approves it (先看后考, same route as
-    add_cards.py's default). Preview mode off: stays in RELEASE_DECK as a
-    regular new card.
+    scheduler until auto_release_pool() moves it out the next Anki day
+    (先看后考, same route as add_cards.py's default). Preview mode off:
+    stays in RELEASE_DECK as a regular new card.
     """
     if not any(html_to_text(v) for v in body.fields.values()):
         raise HTTPException(status_code=400, detail="卡片内容不能为空")
@@ -1986,69 +1407,13 @@ async def _delete_card_impl(card_id: int):
     await anki("deleteNotes", {"notes": [note_id]})
     # bookkeeping AFTER a successful delete — never strand round state
     _round_remove_card(current_round(), card_id)
-    _preview_round_remove_card(_preview_read(), card_id)
-    _streak_clear(card_id)  # a deleted card can't carry an Again streak
     fire_and_forget_sync()
     return {"deleted": True}
 
 
-@app.post("/api/card/to-preview")
-async def to_preview_pool(card_id: int):
-    """Serialized under _state_lock (see its declaration)."""
-    async with _state_lock:
-        return await _to_preview_pool_impl(card_id)
-
-
-async def _to_preview_pool_impl(card_id: int):
-    """Send a card back to the preview pool for re-learning (user spec).
-
-    The card's scheduling history is CLEARED first (forgetCards → fresh new
-    card): the pool query is `is:new is:suspended`, and 重新学习 means
-    starting over. Without the reset the card would sit suspended forever,
-    invisible to both the pool and the scheduler.
-    """
-    _preview_guard()
-    infos = await anki("cardsInfo", {"cards": [card_id]})
-    info = next((i for i in infos or [] if i.get("cardId")), None)
-    if info is None:
-        raise HTTPException(status_code=404, detail="card not found")
-    if info.get("deckName") == PREVIEW_DECK:
-        raise HTTPException(status_code=409, detail="already in the preview pool")
-    await anki("forgetCards", {"cards": [card_id]})
-    # forgetCards keeps reps/lapses by default (Anki's own Forget behavior);
-    # the user spec wants the counts ZEROED too (清零次数) — wipe explicitly
-    await anki(
-        "setSpecificValueOfCard",
-        {
-            "card": card_id,
-            "keys": ["reps", "lapses", "left"],
-            "newValues": [0, 0, 0],
-            "warning_check": True,
-        },
-    )
-    await anki("changeDeck", {"cards": [card_id], "deck": PREVIEW_DECK})
-    await anki("suspend", {"cards": [card_id]})
-    # strip any released-YYYYMMDD stamps (next-day release markers): a card
-    # re-approved later gets a FRESH stamp, and a stale old stamp would make
-    # release_yesterday_approved() release it same-day (min(stamps) < today).
-    # Tags come from notesInfo — cardsInfo does NOT return them.
-    ntags = []
-    try:
-        ninfo = [n for n in await anki("notesInfo", {"notes": [info["note"]]}) or []
-                 if n.get("noteId")]
-        ntags = ninfo[0].get("tags") or [] if ninfo else []
-    except Exception:
-        pass
-    stale_stamps = [t for t in ntags if t.startswith(RELEASED_TAG_PREFIX)]
-    if stale_stamps:
-        await anki(
-            "removeTags", {"notes": [info["note"]], "tags": " ".join(stale_stamps)}
-        )
-    _round_remove_card(current_round(), card_id)
-    _preview_round_remove_card(_preview_read(), card_id)
-    _streak_clear(card_id)  # manual return = fresh start; drop any streak
-    fire_and_forget_sync()
-    return {"moved": True, "pool": await preview_pool_count()}
+# NOTE: POST /api/card/to-preview (manual 移回预览池) is GONE (user spec
+# 2026-09-27) — with the preview stage retired there is nothing to return
+# a card to; a struggling card stays in the learning queue.
 
 
 # ---- reading mode (渐进制卡, user spec 2026-09-19) -------------------------
@@ -3040,10 +2405,11 @@ async def _reading_gates(data: dict) -> set[tuple[str, str]]:
     B·二段重推 (user spec 2026-09-19 round 3): a chunk whose created cards
     have not ALL left the preview pipeline is not re-dealt, and it blocks
     its file's frontier until they have. 「过了预览池」= truly thawed:
-    NOT in 预览池 AND NOT suspended — approval alone (which parks the card
-    in 2026 suspended with a released-YYYYMMDD stamp) does not lift the
-    gate; the next-day unsuspend does. A card sent BACK to the pool
-    (double-Again auto-return / manual 移回预览池) closes the gate again.
+    NOT in 预览池 AND NOT suspended — a card made today sits suspended in
+    the pool all day (auto_release_pool only moves cards created on an
+    EARLIER Anki day), so the frontier unlocks exactly when the card
+    becomes a gradeable new card the next day. This is the pacing spine of
+    the 2026-09-27 flow: 今天制卡 → 押住片段过夜 → 明天放行 → frontier 解锁。
 
     Only each file's frontier chunk is checked (a deeper chunk can't be
     dealt while the frontier stands, so gating it would be dead work).
@@ -3304,7 +2670,8 @@ def _reading_record_card(src: dict | None, note_id: int) -> None:
 async def _reading_extras() -> dict:
     """Reading fields for /api/session/state (mirrors the preview extras).
 
-    reading_round rides along ONLY while active (same policy as preview_round)
+    reading_round rides along ONLY while active (same policy as the old
+    preview_round)
     so a page reload resumes the reading segment; the completed tombstone is
     reachable via GET /api/reading/state.
     """
@@ -3559,13 +2926,18 @@ async def reading_start(mode: str | None = None):
 
 
 async def _reading_start_impl(mode: str = DEFAULT_MODE):
+    if PREVIEW_MODE:
+        # entry point for the daily chain (2026-09-27): run the auto-release
+        # BEFORE computing the gates, so a page left open across the 4 AM
+        # rollover unlocks gated frontiers on 开始 without a reload
+        await auto_release_pool()
     data = _reading_read()
     per_round = STUDY_MODES[mode].get("read", 0)
     gated = await _reading_gates(data)
     payloads = _deal_reading(data, per_round, gated) if per_round > 0 else []
     # resolved pacing table (dynamic review size, 2026-09-24) — the frontend
     # pipes this into its studyModes signal, so it must not carry review=0
-    modes = await _wire_study_modes(None)
+    modes = await _wire_study_modes()
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
         return {

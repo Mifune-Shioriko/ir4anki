@@ -127,7 +127,6 @@ else
         echo "ANKI_PREVIEW_RELEASE_DECK=2026"
         echo "ANKI_RELEASE_DAILY_GOAL=45"
         echo "ANKI_READING_MODE=1"
-        echo "ANKI_NEW_AGAIN_RETURN=1"
         echo "ANKI_ADD_MODEL=问答题"
         echo "ANKI_ADD_CLOZE_MODEL=填空题"
     } > "$ENV_FILE"

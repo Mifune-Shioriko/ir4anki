@@ -30,14 +30,16 @@ Anki). Segment state (todo → active → done/skipped), the segment tree, and
 sqlite DB — the .md files stay pure text with zero markers. While reviewing any
 card later, the app can show the original source segment with full-file context.
 
-### Preview mode (先看后考 — read before you're tested)
+### Preview pool (先看后考 — read before you're tested)
 New cards don't hit the scheduler immediately. They land **suspended** in a
-preview deck; you read them in a low-stakes round (question shown, answer
-hidden, no grading) and either approve (放行) or defer (明天再看). Approved
-cards are unsuspended into your main deck **the next day** — the first graded
-review happens after a night's sleep, so FSRS seeds from real recall instead of
-a recognition illusion. A daily release budget caps how many cards enter the
-queue per day.
+preview deck the moment you make them. The next day the backend
+**auto-releases** every pool card whose note was created on an earlier Anki day
+into your main deck unsuspended — so the first graded review happens after a
+night's sleep, letting FSRS seed from real recall instead of a recognition
+illusion. There is no manual approve/defer step: the overnight gap does the
+work. A daily release cap (`ANKI_RELEASE_DAILY_GOAL`, default 45) limits how
+many cards enter the queue per day — oldest first, overflow waits for the next
+day — so a heavy card-making day can't blow up your review burden.
 
 ### One daily flow (早/中/晚, one button)
 A single **开始** button runs the whole chain with no intermediate pick/stats
@@ -45,15 +47,15 @@ screens — each stage flows straight into the next, then returns to the start
 screen:
 
 ```
-阅读 (4 段)  →  预览新卡 (15)  →  复习 (15 新 + ⌈当日到期 / 3⌉)  →  开始页
+阅读 (4 段)  →  复习 (15 新 + ⌈当日到期 / 3⌉)  →  开始页
 ```
 
 The review count is **dynamic**: ⌈D/3⌉ where D is the day's due-card count,
 snapshotted at the first review deal of the Anki day (4 AM rollover) into
 `state/daily.json`. Three rounds (morning/noon/evening) therefore clear the
 day's due pile evenly. Stages with nothing to do are skipped automatically
-(list exhausted, empty preview pool, daily release goal reached). Every number
-is env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
+(list exhausted, no cards). Every number is env-overridable — see
+[`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
 
 ## Requirements
 
@@ -160,11 +162,12 @@ docs/       design documents (reading mode, round-4 segment identity)
 ```bash
 # pure-API tests (need backend deps; some need live AnkiConnect)
 backend/.venv/bin/python scripts/reading_test.py
-backend/.venv/bin/python scripts/new_again_test.py
-backend/.venv/bin/python scripts/release_budget_test.py
+backend/.venv/bin/python scripts/auto_release_test.py
+backend/.venv/bin/python scripts/reading_edit_test.py
 backend/.venv/bin/python scripts/modes_e2e.py
 backend/.venv/bin/python scripts/sync_throttle_test.py
 # UI tests additionally need: pip install playwright && playwright install chromium
+backend/.venv/bin/python scripts/modes_ui_test.py
 backend/.venv/bin/python scripts/reading_ui_test.py
 ```
 

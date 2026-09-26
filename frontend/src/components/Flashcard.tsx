@@ -4,7 +4,7 @@ import 'katex/dist/katex.min.css'
 import type { Card } from '../types'
 import { cleanCardHtml } from '../lib/clean'
 import { KATEX_OPTS } from '../lib/math'
-import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconRestartAlt, IconUndo } from './icons'
+import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconUndo } from './icons'
 
 // The study card. Uses <md-elevated-card> (labs/card) — the REAL card
 // component. The previous version misused <md-elevation> (a decorative
@@ -37,7 +37,6 @@ interface Props {
   undoBusy: boolean
   onAdd: () => void
   onDelete: () => void
-  onToPreview: () => void
 }
 
 export const Flashcard: Component<Props> = (props) => {
@@ -99,9 +98,6 @@ export const Flashcard: Component<Props> = (props) => {
               <div class="header-actions-sep" aria-hidden="true" />
               <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>
                 <md-icon><IconAdd /></md-icon>
-              </md-icon-button>
-              <md-icon-button aria-label="移回预览池，重新学习" onClick={() => props.onToPreview()}>
-                <md-icon><IconRestartAlt /></md-icon>
               </md-icon-button>
               <md-icon-button aria-label="删除卡片" onClick={() => props.onDelete()}>
                 <md-icon><IconDelete /></md-icon>

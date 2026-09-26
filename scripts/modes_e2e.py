@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""E2E for the single daily pacing tier (user spec 2026-09-24).
+"""E2E for the single daily pacing tier (user spec 2026-09-24, preview
+stage retired 2026-09-27).
 
-Replaces the old two-tier (quick/focus) modes_e2e: one round shape —
-4 reading + 15 preview + 15 new + ceil(D/3) reviews, where D is the day's
-due count snapshotted at the first review deal (state/daily.json).
+One round shape — 4 reading + 15 new + ceil(D/3) reviews, where D is the
+day's due count snapshotted at the first review deal (state/daily.json).
+The manual preview stage is GONE: session/start triggers auto_release_pool
+(pool cards made on an earlier Anki day become new cards, capped per day).
 
 In-process ASGITransport against the REAL AnkiConnect but an ISOLATED
-ANKI_STATE_DIR, so the user's live round.json/preview.json/daily.json are
-untouched. Net-zero: no card is ever answered/approved/deferred; every
-started round is finished (cleared) in teardown.
+ANKI_STATE_DIR, so the user's live round.json/daily.json/auto_release.json
+are untouched. CAUTION: this talks to the live collection — auto_release
+CAN move real pool cards (that is the deployed behaviour anyway); no card
+is ever answered/deleted, every started round is finished in teardown.
 
 Run: python scripts/modes_e2e.py   (needs the backend venv's deps + live AnkiConnect)
 """
@@ -56,7 +59,8 @@ async def main():
         check("only 'daily' tier", list(modes.keys()) == ["daily"], list(modes.keys()))
         d = modes.get("daily", {})
         check("read=4 (wire)", d.get("read") == 4, d)
-        check("preview=15 (wire)", d.get("preview") == 15, d)
+        check("no 'preview' size in the wire table (stage retired)",
+              "preview" not in d, d)
         check("new=15 (wire)", d.get("new") == 15, d)
         check("review resolved (>=0, not the static placeholder when due>0)",
               isinstance(d.get("review"), int) and d["review"] >= 0, d.get("review"))
@@ -72,8 +76,10 @@ async def main():
         s = (await c.get("/api/session/state")).json()
         check("state none", s.get("state") == "none", s.get("state"))
         check("state carries study_modes", (s.get("study_modes") or {}) == modes)
-        check("state preview_per_round None when idle", s.get("preview_per_round") is None,
-              s.get("preview_per_round"))
+        check("state has NO preview_round field (stage retired)",
+              "preview_round" not in s, list(s.keys()))
+        check("state has NO preview_per_round field",
+              "preview_per_round" not in s, list(s.keys()))
 
         print("== start deals the daily batch: 15 new + ceil(D/3) reviews ==")
         r = (await c.post("/api/session/start")).json()
@@ -117,29 +123,17 @@ async def main():
               sum(1 for x in r3["cards"] if x["isNew"]) <= 15, r3["cards"][:3])
         await c.post("/api/session/finish")
 
-        print("== preview/start deals up to 15 pool cards ==")
-        pool = st.get("preview_pool") or 0
-        p = (await c.post("/api/preview/start")).json()
-        expect_pv = min(15, pool, 45)
-        check(f"preview deals min(15, pool={pool})", len(p["cards"]) == expect_pv,
-              (len(p["cards"]), expect_pv))
-        check("preview response mode=daily", p.get("mode") == "daily", p.get("mode"))
-        prd = json.loads((Path(STATE) / "preview.json").read_text())
-        check("preview.json stores mode=daily", prd.get("mode") == "daily", prd.get("mode"))
-        s6 = (await c.get("/api/session/state")).json()
-        check("state preview_round.mode=daily",
-              (s6.get("preview_round") or {}).get("mode") == "daily")
-        # teardown: finish WITHOUT acting — cards stay suspended in the pool
-        f = (await c.post("/api/preview/finish")).json()
-        check("preview finish ok", f.get("ok") is True)
-        prd_after = json.loads((Path(STATE) / "preview.json").read_text()) \
-            if (Path(STATE) / "preview.json").exists() else {}
-        check("preview round cleared", prd_after.get("status") != "active", prd_after)
+        print("== preview endpoints are GONE (stage retired 2026-09-27) ==")
+        for ep in ("/api/preview/start", "/api/preview/finish",
+                   "/api/card/to-preview?card_id=1"):
+            rr = await c.post(ep)
+            check(f"POST {ep.split('?')[0]} → 404/405", rr.status_code in (404, 405),
+                  rr.status_code)
+        rr2 = await c.get("/api/preview/state")
+        check("GET /api/preview/state → 404/405", rr2.status_code in (404, 405),
+              rr2.status_code)
 
-        print("== net-zero: pool unchanged, isolated state dir only ==")
-        st2 = (await c.get("/api/status")).json()
-        check("preview_pool unchanged", st2.get("preview_pool") == pool,
-              f"{pool} -> {st2.get('preview_pool')}")
+        print("== net-zero: isolated state dir only, idle end state ==")
         s7 = (await c.get("/api/session/state")).json()
         check("final state none/idle", s7.get("state") == "none", s7.get("state"))
         check("no preview round left", s7.get("preview_round") is None)

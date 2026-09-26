@@ -11,12 +11,10 @@ import { FilesScreen } from './components/FilesScreen'
 import { Flashcard } from './components/Flashcard'
 import { ActionArea } from './components/ActionArea'
 import { StartScreen } from './components/StartScreen'
-import { FinishedScreen } from './components/FinishedScreen'
 import { EditDialog } from './components/EditDialog'
 import { ClozeDialog } from './components/ClozeDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { Loading } from './components/Loading'
-import { PreviewCard } from './components/PreviewCard'
 import { ReadingCard } from './components/ReadingCard'
 import { ReadingPanel } from './components/ReadingPanel'
 import { ReadingListScreen } from './components/ReadingListScreen'
@@ -74,12 +72,10 @@ type Phase =
   | 'loading'
   | 'start'
   | 'review'
-  | 'finished'
-  // 单一流水线 (user spec 2026-09-24): 阅读 → 预览 → 复习 自动链接，
-  // 中间统计页/阶段开始页（readingStart、previewStart、readingDone、
-  // previewDone、done、empty）全部退役——轮完成直接进下一段，复习完成回
-  // 开始页。中途退出仍走 finished。
-  | 'preview'
+  // 单一流水线 (user spec 2026-09-24; preview stage retired 2026-09-27):
+  // 阅读 → 复习 自动链接，中间统计页/阶段开始页（readingStart、
+  // readingDone、done、empty、finished）全部退役——轮完成直接进下一段，
+  // 复习完成回开始页。预览环节已删除：新卡次日自动放行。
   | 'reading'
 
 export const App: Component = () => {
@@ -183,8 +179,7 @@ export const App: Component = () => {
 
   // ---- review/new split for the current batch (front-end only) ----
   // Batch composition is snapshotted at load time; the setters below are
-  // maintained by answer/undo/delete/to-preview bookkeeping (double-Again
-  // auto-return moves a card between the two pools). The derived per-split
+  // maintained by answer/undo/delete bookkeeping. The derived per-split
   // counters died with the DoneScreen (2026-09-24).
   const [, setBatchNewTotal] = createSignal(0)
   const [, setBatchReviewTotal] = createSignal(0)
@@ -199,63 +194,31 @@ export const App: Component = () => {
   // ---- edit dialog ----
   const [editOpen, setEditOpen] = createSignal(false)
 
-  // ---- add card + delete + back-to-preview (user spec 2026-09-04) ----
+  // ---- add card + delete (user spec 2026-09-04; to-preview deleted
+  // 2026-09-27 together with the preview stage) ----
   // The add dialog reuses EditDialog in mode='add' (same rich editor, same
-  // bottom-sheet style); the new card lands in the preview pool suspended.
-  // Delete and to-preview both ask for confirmation first (防呆).
+  // bottom-sheet style); the new card lands in the preview pool suspended
+  // and auto-releases the next day. Delete asks for confirmation (防呆).
   const [addOpen, setAddOpen] = createSignal(false)
   const [deleteTarget, setDeleteTarget] = createSignal<{ cardId: number; preview: string } | null>(null)
   const [deleteBusy, setDeleteBusy] = createSignal(false)
-  const [toPreviewTarget, setToPreviewTarget] = createSignal<{ cardId: number; preview: string } | null>(null)
-  const [toPreviewBusy, setToPreviewBusy] = createSignal(false)
 
-  // ---- preview mode (先看后考) ----
-  // Gated entirely by the backend flag (resync reads it). Preview mode off:
-  // every preview signal stays null/false and the UI is the legacy one.
+  // ---- preview pool (先看后考 → 次日自动放行, 2026-09-27) ----
+  // The manual preview STAGE (round UI, approve/defer, undo, 移回预览池) is
+  // gone; what remains is the pool itself: cards made today sit there
+  // suspended and the backend auto-releases them the next Anki day. The
+  // chip counts on the start screen explain why today's cards are not in
+  // the new pool yet. Gated entirely by the backend flag (resync reads it).
   const [previewMode, setPreviewMode] = createSignal(false)
   const [previewPool, setPreviewPool] = createSignal<number | null>(null)
-  // setters still tracked (resync/stage bookkeeping); the getters died with
-  // the retired start/done screens (2026-09-24)
-  const [, setPreviewAvailable] = createSignal<number | null>(null)
-  const [, setPreviewPerRound] = createSignal(3)
-  const [pvCards, setPvCards] = createSignal<Card[]>([])
-  const [pvDone, setPvDone] = createSignal(0)
-  const [pvTotal, setPvTotal] = createSignal(0)
-  const [pvApproved, setPvApproved] = createSignal(0)
-  const [pvDeferred, setPvDeferred] = createSignal(0)
-  const [pvBusy, setPvBusy] = createSignal(false)
-  // undo + edit inside preview rounds — same UX as the review round
-  const [pvCanUndo, setPvCanUndo] = createSignal(false)
-  const [pvUndoBusy, setPvUndoBusy] = createSignal(false)
-  const [pvEditOpen, setPvEditOpen] = createSignal(false)
-  // preview reveal state (2026-09-07): answer hidden until the user reveals
-  // it — the preview is now a low-stakes retrieval attempt, not pure reading.
-  // Keyed BY CARD ID like the review reveal (see above) — the preview's
-  // current card is always pvCards()[0], so any act/undo/resume that swaps
-  // the head card automatically shows it face-down. A bare boolean could
-  // stay true across a card swap (async race), rendering one card's front
-  // with another card's answer.
-  const [pvRevealedFor, setPvRevealedFor] = createSignal<number | null>(null)
-  const pvRevealed = () => {
-    const c = pvCards()[0]
-    return !!c && pvRevealedFor() === c.cardId
-  }
-  // cards approved TODAY (suspended, released tomorrow) — setter still
-  // tracked for round bookkeeping; the getter died with PreviewScreen
-  const [, setPendingRelease] = createSignal<number | null>(null)
-  // daily 放行 goal (2026-09-16) — the preview start screen draws a
-  // horizontal progress bar of pendingRelease / goal; null hides the bar
-  // (old backend without the field degrades gracefully)
-  const [releaseDailyGoal, setReleaseDailyGoal] = createSignal<number | null>(null)
-  // preview-only exit stats (2026-09-06): when the user finishes straight
-  // from preview (mid-round or after the done screen), the finished screen
-  // shows THESE instead of the review count (which would be a stale/misleading
-  // 0). Null = review-path exit → show the review count as before.
-  const [finishedPreview, setFinishedPreview] = createSignal<{
-    approved: number
-    deferred: number
-    pool: number | null
-  } | null>(null)
+  // cards made TODAY still in the pool (auto-release tomorrow)
+  const [pendingRelease, setPendingRelease] = createSignal<number | null>(null)
+  // daily auto-release cap + remaining slots (wire fields; null = disabled
+  // or old backend). Setters tracked in resync; getters unused for now (the
+  // start screen's pool row doesn't render the cap — keep the signals so a
+  // future UI can surface 剩余放行 without a wire change).
+  const [, setReleaseDailyGoal] = createSignal<number | null>(null)
+  const [, setReleaseBudgetLeft] = createSignal<number | null>(null)
 
   // ---- reading mode (渐进制卡, user spec 2026-09-19) ----
   // Gated by the backend flag like preview. Pipeline (2026-09-24): reading
@@ -527,14 +490,15 @@ export const App: Component = () => {
       if (d.study_modes) {
         setStudyModes(d.study_modes)
       }
-      // preview-mode signals (absent when the backend flag is off)
+      // preview-pool signals (absent when the backend flag is off). The
+      // manual preview STAGE is gone (2026-09-27): only the pool counters
+      // survive, to explain why today's cards aren't in the new pool yet.
       setPreviewMode(!!d.preview_mode)
       if (d.preview_mode) {
         setPreviewPool(d.preview_pool ?? null)
-        setPreviewAvailable(d.preview_available ?? null)
-        if (d.preview_per_round != null) setPreviewPerRound(d.preview_per_round)
         setPendingRelease(d.pending_release ?? null)
         setReleaseDailyGoal(d.release_daily_goal ?? null)
+        setReleaseBudgetLeft(d.release_budget_left ?? null)
       }
       // reading-mode signals (absent when the backend flag is off)
       setReadingMode(!!d.reading_mode)
@@ -544,10 +508,9 @@ export const App: Component = () => {
         setReadingActive(d.reading_active ?? 0)
         setReadingGated(d.reading_gated ?? 0)
       }
-      // 单一流水线 (2026-09-24): a page load resumes an ACTIVE round where it
-      // left off; anything else lands on the single start screen (the old
-      // readingStart/previewStart/done funnel pages are retired — stages now
-      // chain automatically).
+      // 单一流水线 (2026-09-24; preview stage retired 2026-09-27): a page
+      // load resumes an ACTIVE round where it left off; an active reading
+      // round resumes too; anything else lands on the single start screen.
       if (d.state === 'active') {
         loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
       } else if (d.reading_mode && d.reading_round?.status === 'active') {
@@ -556,17 +519,6 @@ export const App: Component = () => {
         setRdTotal(d.reading_round.total ?? 0)
         setRdStats(d.reading_round.stats ?? {})
         setPhase('reading')
-      } else if (d.preview_mode && d.preview_round) {
-        setPvCards(d.preview_round.cards)
-        setPvDone(d.preview_round.done)
-        setPvTotal(d.preview_round.total)
-        // backend tracks the approve/defer split since 2026-09-06 so a
-        // resumed round can still report honest exit stats
-        setPvApproved(d.preview_round.approved ?? 0)
-        setPvDeferred(d.preview_round.deferred ?? 0)
-        setPvCanUndo(!!d.preview_round.can_undo)
-        setPvRevealedFor(null) // resumed round: card comes back face-down
-        setPhase('preview')
       } else {
         setPhase('start')
       }
@@ -578,10 +530,10 @@ export const App: Component = () => {
   // ---- init: resume an in-progress round or show the start screen ----
   createEffect(() => { resync() })
 
-  // ---- 单一流水线 (user spec 2026-09-24) ----
-  // 开始 → 阅读(4段) → 预览新卡(15) → 复习(15新+ceil(D/3)到期) → 回开始页。
-  // 每段完成自动进入下一段；某段无内容（清单读完/池空/预算达成/无卡）直接
-  // 跳到再下一段。中间统计页全部退役；中途退出仍走 FinishedScreen。
+  // ---- 单一流水线 (user spec 2026-09-24; preview stage retired 2026-09-27) ----
+  // 开始 → 阅读(4段) → 复习(15新+ceil(D/3)到期) → 回开始页。
+  // 每段完成自动进入下一段；某段无内容（清单读完/无卡）直接跳到再下一段。
+  // 预览环节已删除：今天制的卡进预览池，后端次日自动放行成新卡。
   const startReadingStage = async () => {
     setPhase('loading')
     setLoadError(false)
@@ -594,7 +546,7 @@ export const App: Component = () => {
         if (d.all_gated) {
           showSnack('正在制卡的片段都在等卡片过预览池——明天它们会重新推送')
         }
-        await startPreviewStage()
+        await startReviewStage()
         return
       }
       setRdChunks(d.chunks)
@@ -607,44 +559,6 @@ export const App: Component = () => {
       setLoadError(true)
     } finally {
       setRdBusy(false)
-    }
-  }
-
-  const startPreviewStage = async () => {
-    if (!previewMode()) {
-      await startReviewStage()
-      return
-    }
-    setPhase('loading')
-    setLoadError(false)
-    setLoadText('正在加载预览卡…')
-    setPvBusy(true)
-    try {
-      const d = await api.previewStart(selectedMode())
-      if (d.study_modes) setStudyModes(d.study_modes)
-      if (!d.cards.length) {
-        if (d.goal_reached) {
-          showSnack(`今日放行目标 ${releaseDailyGoal() ?? ''} 张已达成，明天再继续预览`)
-        }
-        await startReviewStage()
-        return
-      }
-      if (d.preview_per_round != null) setPreviewPerRound(d.preview_per_round)
-      setPvCards(d.cards)
-      setPvDone(0)
-      setPvTotal(d.cards.length)
-      setPvApproved(0)
-      setPvDeferred(0)
-      setPvCanUndo(false) // a fresh preview round has no undo slot
-      setPvRevealedFor(null) // first card starts hidden (先想后看)
-      setPreviewPool(d.pool)
-      setPreviewAvailable(d.available)
-      setPhase('preview')
-    } catch (e) {
-      setLoadText('加载失败：' + (e as Error).message)
-      setLoadError(true)
-    } finally {
-      setPvBusy(false)
     }
   }
 
@@ -677,7 +591,7 @@ export const App: Component = () => {
     if (readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
       await startReadingStage()
     } else {
-      await startPreviewStage()
+      await startReviewStage()
     }
   }
 
@@ -685,10 +599,6 @@ export const App: Component = () => {
   const chainAfterReading = async () => {
     await api.readingFinish().catch(() => {})
     rdRefreshCounts()
-    await startPreviewStage()
-  }
-  const chainAfterPreview = async () => {
-    await api.previewFinish().catch(() => {})
     await startReviewStage()
   }
   const chainAfterReview = async () => {
@@ -730,21 +640,6 @@ export const App: Component = () => {
       // backend now holds an undo slot for this answer — no time limit
       setCanUndo(true)
 
-      // double-Again auto-return (2026-09-16): a NEW card graded Again twice
-      // in its first learning cycle went back to the preview pool. Update the
-      // top-bar pool chip and tell the user why the card vanished. Undo still
-      // works (the backend marked the slot auto_return).
-      const rt = data.returned_to_preview
-      if (rt) {
-        if (previewMode()) {
-          if (rt.pool != null) setPreviewPool(rt.pool)
-          setPreviewAvailable(p => (p == null ? p : p + 1))
-        }
-        if (card.isNew) setBatchNewTotal(v => Math.max(0, v - 1))
-        else setBatchReviewTotal(v => Math.max(0, v - 1))
-        showSnack('连续两次 Again，已自动退回预览池重新学习')
-      }
-
       const roundDone = data.round != null && data.round.state === 'complete'
       if (!roundDone && idx() < cards().length) {
         setRevealedFor(null)
@@ -776,18 +671,6 @@ export const App: Component = () => {
       setTotalDone(v => Math.max(0, v - 1))
       setRevealedFor(null)
       setCanUndo(false) // the single undo slot is consumed
-      // the undone answer had auto-returned the card to the preview pool
-      // (2026-09-16): the backend moved it back out — mirror the pool chip
-      const rf = d.returned_from_preview
-      if (rf) {
-        if (previewMode()) {
-          if (rf.pool != null) setPreviewPool(rf.pool)
-          setPreviewAvailable(p => (p == null ? p : Math.max(0, p - 1)))
-        }
-        if (d.card.isNew) setBatchNewTotal(v => v + 1)
-        else setBatchReviewTotal(v => v + 1)
-        showSnack('已撤销：卡片移回了本轮复习')
-      }
     } catch (e) {
       alert('撤销失败：' + (e as Error).message)
     } finally {
@@ -849,10 +732,11 @@ export const App: Component = () => {
   }
 
   const onCardAdded = (noteId?: number) => {
-    // the new card lands suspended in the preview pool — reflect in chips
+    // the new card lands suspended in the preview pool (auto-released
+    // tomorrow) — reflect in the pool chip
     if (previewMode()) {
       setPreviewPool(p => (p == null ? p : p + 1))
-      setPreviewAvailable(p => (p == null ? p : p + 1))
+      setPendingRelease(p => (p == null ? p : p + 1))
     }
     // 渐进制卡: the backend recorded the note id on the source chunk AND
     // auto-marked a todo chunk as active — mirror both locally so 「已从本
@@ -898,15 +782,7 @@ export const App: Component = () => {
     try {
       await api.deleteCard(t.cardId)
       setDeleteTarget(null)
-      if (phase() === 'preview') {
-        setPvCards(prev => prev.filter(c => c.cardId !== t.cardId))
-        setPvDone(v => v + 1)
-        setPreviewPool(p => (p == null ? p : Math.max(0, p - 1)))
-        if (pvCards().length === 0) {
-          // deleting the last preview card drains the round — chain on
-          await chainAfterPreview()
-        }
-      } else if (phase() === 'review') {
+      if (phase() === 'review') {
         const removed = cards().find(c => c.cardId === t.cardId)
         const wasNew = removed?.isNew
         setCards(prev => prev.filter(c => c.cardId !== t.cardId))
@@ -923,34 +799,6 @@ export const App: Component = () => {
     }
   }
 
-  const confirmToPreview = async () => {
-    const t = toPreviewTarget()
-    if (!t || toPreviewBusy()) return
-    setToPreviewBusy(true)
-    try {
-      const d = await api.toPreview(t.cardId)
-      setToPreviewTarget(null)
-      if (previewMode()) {
-        setPreviewPool(d.pool)
-        setPreviewAvailable(p => (p == null ? p : p + 1))
-      }
-      if (phase() === 'review') {
-        const removed = cards().find(c => c.cardId === t.cardId)
-        const wasNew = removed?.isNew
-        setCards(prev => prev.filter(c => c.cardId !== t.cardId))
-        setTotalDone(v => v + 1)
-        if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
-        else setBatchReviewTotal(v => Math.max(0, v - 1))
-        if (cards().length === 0) await chainAfterReview()
-        else setRevealedFor(null)
-      }
-    } catch (e) {
-      alert('移动失败：' + (e as Error).message)
-    } finally {
-      setToPreviewBusy(false)
-    }
-  }
-
   // short plain-text preview of a card's front, for confirmation dialogs.
   // Template blocks (<style>/<script>) are stripped FIRST — otherwise the
   // note type's card CSS shows up as the "preview" text (found via UI test).
@@ -961,101 +809,10 @@ export const App: Component = () => {
   }
   const askDelete = (card: Card) =>
     setDeleteTarget({ cardId: card.cardId, preview: plainPreview(card.question) })
-  const askToPreview = (card: Card) =>
-    setToPreviewTarget({ cardId: card.cardId, preview: plainPreview(card.question) })
 
-  // ---- preview actions (先看后考) ----
-  const previewCard = () => pvCards()[0]
-
-  const pvAct = async (action: 'approve' | 'defer') => {
-    const card = previewCard()
-    if (!card || pvBusy()) return
-    setPvBusy(true)
-    try {
-      const d = await api.previewAct(card.cardId, action)
-      if (!d.ok) {
-        // stale (card left the pool elsewhere) — resync to the server's view
-        await resync()
-        return
-      }
-      // remove BY ID (not slice(1)): if anything else touched pvCards while
-      // the request was in flight, position-based removal would drop the
-      // wrong card and desync from the backend's pending list
-      setPvCards(prev => prev.filter(c => c.cardId !== card.cardId))
-      setPvDone(v => v + 1)
-      setPvRevealedFor(null) // next card starts hidden again (先想后看)
-      if (action === 'approve') {
-        setPvApproved(v => v + 1)
-        // approved today = suspended until tomorrow (next-day release)
-        setPendingRelease(p => (p ?? 0) + 1)
-      } else setPvDeferred(v => v + 1)
-      // the backend recorded a single-level undo slot for this act
-      setPvCanUndo(true)
-      if (d.round_complete) {
-        setPreviewPool(d.pool ?? null)
-        setPreviewAvailable(d.available ?? null)
-        if (d.study_modes) setStudyModes(d.study_modes)
-        // 单一流水线 (2026-09-24): preview drained → straight into review
-        // (no previewDone stats page). The in-round undo slot dies with the
-        // round — 放行撤销 only works while the round is on screen.
-        await chainAfterPreview()
-        return
-      }
-    } catch (e) {
-      alert('操作失败：' + (e as Error).message)
-    } finally {
-      setPvBusy(false)
-    }
-  }
-
-  // Undo the last preview act (approve→card back in the pool suspended,
-  // defer→today's deferred tag removed). In-round only since 2026-09-24
-  // (the previewDone tombstone screen is gone).
-  const pvUndo = async () => {
-    // guard against undo racing an in-flight act (both mutate the same
-    // backend state file — the button is also disabled while busy)
-    if (pvUndoBusy() || pvBusy()) return
-    setPvUndoBusy(true)
-    try {
-      const d = await api.previewUndo()
-      if (phase() === 'preview') {
-        // re-insert the restored card at its original position
-        setPvCards(prev => {
-          const next = [...prev]
-          next.splice(Math.min(d.index, next.length), 0, d.card)
-          return next
-        })
-        setPvDone(v => Math.max(0, v - 1))
-        if (d.action === 'approve') {
-          setPvApproved(v => Math.max(0, v - 1))
-          setPendingRelease(p => (p == null ? null : Math.max(0, p - 1)))
-        } else setPvDeferred(v => Math.max(0, v - 1))
-        setPvRevealedFor(null) // restored card comes back face-down
-      } else {
-        await resync()
-      }
-      setPvCanUndo(false) // single-level slot consumed
-    } catch {
-      // nothing to undo / card moved on — resync to the server's view
-      await resync()
-    } finally {
-      setPvUndoBusy(false)
-    }
-  }
-
-  // 中途退出预览 (top-level exit): reconcile via FinishedScreen — untouched
-  // cards stay suspended in the pool.
-  const pvFinish = async () => {
-    setPhase('loading')
-    setLoadText('正在同步…')
-    let pool = previewPool()
-    try {
-      const d = await api.previewFinish()
-      pool = d.pool ?? pool
-    } catch { /* not critical */ }
-    setFinishedPreview({ approved: pvApproved(), deferred: pvDeferred(), pool })
-    setPhase('finished')
-  }
+  // NOTE: the whole preview-round action block (previewCard/pvAct/pvUndo/
+  // pvFinish) and 移回预览池 (confirmToPreview/askToPreview) were deleted
+  // 2026-09-27 — the preview stage is retired, releases are automatic.
 
   // ---- reading actions (渐进制卡, 2026-09-19) ----
   const rdRefreshCounts = async () => {
@@ -1102,8 +859,8 @@ export const App: Component = () => {
       if (d.stats) setRdStats(d.stats)
       if (d.round_complete || rdChunks().length === 0) {
         setRdTotal(d.total ?? rdTotal())
-        // 单一流水线 (2026-09-24): reading drained → preview stage, no
-        // readingDone stats page
+        // 单一流水线 (2026-09-24; preview stage retired 2026-09-27):
+        // reading drained → review stage, no readingDone stats page
         await chainAfterReading()
       }
     } catch (e) {
@@ -1114,7 +871,7 @@ export const App: Component = () => {
   }
 
   // 中途退出阅读 (ReadingCard 结束阅读): park the round (untouched chunks
-  // keep their state) and reconcile via FinishedScreen.
+  // keep their state) and reconcile via resync.
   const rdFinish = async () => {
     setRdBusy(true)
     try {
@@ -1138,7 +895,7 @@ export const App: Component = () => {
   }
   const handleKeyDown = (e: KeyboardEvent) => {
     if (isTypingTarget(e.target)) return
-    if (editOpen() || pvEditOpen() || addOpen() || deleteTarget() || toPreviewTarget() || segEditOpen()) return
+    if (editOpen() || addOpen() || deleteTarget() || segEditOpen()) return
     // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
     // shortcuts (Space/1-4/approve) must not fire behind the trace card.
     // Escape = 回到复习; A/C keep working (they target the traced chunk).
@@ -1183,29 +940,6 @@ export const App: Component = () => {
       }
       return
     }
-    if (phase() === 'preview') {
-      if (pvBusy()) return
-      if (e.key === 'z' && (e.ctrlKey || e.metaKey) && pvCanUndo() && !pvUndoBusy()) {
-        e.preventDefault()
-        pvUndo()
-        return
-      }
-      // 先想后看 (2026-09-07): space reveals; Enter/D only work once revealed
-      if (e.key === ' ' && !pvRevealed()) {
-        e.preventDefault()
-        setPvRevealedFor(previewCard()?.cardId ?? null)
-        return
-      }
-      if (!pvRevealed()) return
-      if (e.key === 'Enter') {
-        e.preventDefault()
-        pvAct('approve')
-      } else if (e.key === 'd' || e.key === 'D') {
-        e.preventDefault()
-        pvAct('defer')
-      }
-      return
-    }
     if (phase() !== 'review') return
     if (e.key === ' ' && !revealed()) {
       e.preventDefault()
@@ -1237,24 +971,21 @@ export const App: Component = () => {
   // — otherwise the note jumps to the answer spot before 显示背面 (leak).
   // Applies to preview / new / review cards alike.
   const noteCard = () => {
-    if (phase() === 'preview') return pvRevealed() ? previewCard() : undefined
     if (phase() === 'review') return revealed() ? currentCard() : undefined
     return undefined
   }
   // card on screen but face-down → panel shows a "revealed 后加载" placeholder
   const noteBlocked = () =>
-    (phase() === 'preview' && !!previewCard() && !pvRevealed()) ||
     (phase() === 'review' && !!currentCard() && !revealed())
 
   // 溯源 availability (三栏重构 2026-09-21): resolve the on-screen card's
   // reading source ONCE per note id (cached). NOT reveal-gated — the button
   // state (enabled/greyed) reveals nothing about the answer; the detour
-  // itself is only reachable by an explicit click. Result feeds BOTH the
-  // Flashcard/PreviewCard 溯源 button (置灰 for orphans, per user spec —
-  // never hidden) and openTrace().
+  // itself is only reachable by an explicit click. Result feeds the
+  // Flashcard 溯源 button (置灰 for orphans, per user spec — never hidden)
+  // and openTrace().
   const screenCard = () => {
     if (phase() === 'review') return currentCard()
-    if (phase() === 'preview') return previewCard()
     return undefined
   }
   createEffect(() => {
@@ -1298,7 +1029,6 @@ export const App: Component = () => {
     // 文件/阅读清单 still tracks the active round
     if (phase() === 'review' && currentCard()) return { done: totalDone(), total: roundTotal() }
     if (phase() === 'reading' && rdCurrent()) return { done: rdDone(), total: rdTotal() }
-    if (phase() === 'preview' && previewCard()) return { done: pvDone(), total: pvTotal() }
     return null
   }
 
@@ -1307,8 +1037,7 @@ export const App: Component = () => {
   // single-column (same rule the two-column layout has always used).
   const centerOccupied = () =>
     (phase() === 'reading' && !!rdCurrent()) ||
-    (phase() === 'review' && !!currentCard()) ||
-    (phase() === 'preview' && !!previewCard())
+    (phase() === 'review' && !!currentCard())
   // left column feeds on a CHUNK when a chunk is the thing on screen
   // (reading round, or the 溯源 detour); otherwise it resolves by note id
   const leftChunk = () => (traceOpen() ? traceChunk() : (phase() === 'reading' ? rdCurrent() : null))
@@ -1426,26 +1155,6 @@ export const App: Component = () => {
           />
         </Show>
 
-        <Show when={phase() === 'preview' && previewCard() && !traceOpen()}>
-          <PreviewCard
-            card={previewCard()!}
-            busy={pvBusy()}
-            revealed={pvRevealed()}
-            traceAvailable={traceAvailable()}
-            onTrace={openTrace}
-            onReveal={() => setPvRevealedFor(previewCard()?.cardId ?? null)}
-            onApprove={() => pvAct('approve')}
-            onDefer={() => pvAct('defer')}
-            onUndo={pvUndo}
-            onEdit={() => setPvEditOpen(true)}
-            onAdd={openAdd}
-            onDelete={() => askDelete(previewCard()!)}
-            onExit={pvFinish}
-            undoEnabled={pvCanUndo()}
-            undoBusy={pvUndoBusy()}
-          />
-        </Show>
-
         <Show when={phase() === 'start'}>
           <StartScreen
             due={due()}
@@ -1453,6 +1162,7 @@ export const App: Component = () => {
             busy={false}
             onBegin={beginFlow}
             previewPool={previewMode() ? previewPool() : null}
+            pendingRelease={previewMode() ? pendingRelease() : null}
             previewMode={previewMode()}
             readingAvailable={readingMode() ? readingAvailable() : 0}
             studyModes={studyModes()}
@@ -1472,7 +1182,6 @@ export const App: Component = () => {
             undoBusy={undoBusy()}
             onAdd={openAdd}
             onDelete={() => askDelete(currentCard()!)}
-            onToPreview={() => askToPreview(currentCard()!)}
           />
           <ActionArea
             revealed={revealed()}
@@ -1481,14 +1190,10 @@ export const App: Component = () => {
             onAnswer={answer}
           />
         </Show>
-
-        <Show when={phase() === 'finished'}>
-          <FinishedScreen count={totalDone()} preview={finishedPreview()} />
-        </Show>
       </div>
 
       {/* right-hand note panel (知识成体系 Phase 1): wide screens only, and
-          only while a card is actually on screen (review or preview round).
+          only while a card is actually on screen (review round).
           During a reading round — or a 溯源 detour (2026-09-21) — the
           column switches to ReadingPanel: the whole source file anchored at
           the current chunk (user spec 2026-09-19 — 中栏只展示 chunk，右边
@@ -1531,19 +1236,6 @@ export const App: Component = () => {
         />
       </Show>
 
-      <Show when={pvEditOpen() && previewCard()}>
-        <EditDialog
-          cardId={previewCard()!.cardId}
-          onClose={() => setPvEditOpen(false)}
-          onSaved={(q, a) => {
-            const cid = previewCard()!.cardId
-            setPvCards(prev =>
-              prev.map(c => (c.cardId === cid ? { ...c, question: q, answer: a } : c)),
-            )
-          }}
-        />
-      </Show>
-
       <Show when={addOpen()}>
         <EditDialog
           mode="add"
@@ -1581,16 +1273,6 @@ export const App: Component = () => {
         busy={deleteBusy()}
         onConfirm={confirmDelete}
         onCancel={() => setDeleteTarget(null)}
-      />
-
-      <ConfirmDialog
-        open={toPreviewTarget() !== null}
-        headline="移回预览池？"
-        body={toPreviewTarget() ? `“${toPreviewTarget()!.preview}” 的复习记录会被清零，回到预览池重新学习（先看后考）。` : ''}
-        confirmLabel="移回预览池"
-        busy={toPreviewBusy()}
-        onConfirm={confirmToPreview}
-        onCancel={() => setToPreviewTarget(null)}
       />
 
       <Snackbar open={snackText() !== null} label={snackText() ?? ''} />

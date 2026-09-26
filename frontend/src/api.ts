@@ -3,9 +3,6 @@ import type {
   MoreResponse,
   NoteResponse,
   NoteUpdateResponse,
-  PreviewActResponse,
-  PreviewStartResponse,
-  PreviewUndoResponse,
   ReadingActResponse,
   ReadingCorpusFile,
   ReadingCreatedCard,
@@ -63,12 +60,9 @@ export const api = {
   tags: () => get<{ tags: string[] }>('/api/tags'),
   updateNote: (cardId: number, fields: Record<string, string>, tags: string[]) =>
     post<NoteUpdateResponse>('/api/note/update', { card_id: cardId, fields, tags }),
-  previewStart: (mode?: string) =>
-    post<PreviewStartResponse>(mode ? `/api/preview/start?mode=${mode}` : '/api/preview/start'),
-  previewAct: (cardId: number, action: 'approve' | 'defer') =>
-    post<PreviewActResponse>(`/api/preview/act?card_id=${cardId}&action=${action}`),
-  previewUndo: () => post<PreviewUndoResponse>('/api/preview/undo'),
-  previewFinish: () => post<{ ok: boolean; pool: number }>('/api/preview/finish'),
+  // NOTE: the preview-round endpoints (previewStart/Act/Undo/Finish) and
+  // toPreview were deleted 2026-09-27 — the preview stage is retired, the
+  // backend auto-releases pool cards the next day.
   addInfo: (kind?: 'qa' | 'cloze') =>
     get<{ model_name: string; fields: string[]; kind?: string }>(
       kind === 'cloze' ? '/api/card/add/info?kind=cloze' : '/api/card/add/info',
@@ -87,8 +81,6 @@ export const api = {
     }),
   deleteCard: (cardId: number) =>
     post<{ deleted: boolean }>(`/api/card/delete?card_id=${cardId}`),
-  toPreview: (cardId: number) =>
-    post<{ moved: boolean; pool: number }>(`/api/card/to-preview?card_id=${cardId}`),
   upload: (file: File): Promise<{ filename: string }> => {
     const fd = new FormData()
     fd.append('file', file)

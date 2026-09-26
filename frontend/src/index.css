@@ -264,7 +264,12 @@ body {
  * 2026-09-27): equal width (three equal columns, capped at the card width),
  * sticky full height minus the 24px breathing gaps. The RelatedPanel inside
  * is now a plain div — background → cards directly (「背景 - 卡片」, no
- * intermediate container). */
+ * intermediate container).
+ * H 形分割线 (user spec 2026-09-27): vertical rules at BOTH ends of the
+ * column, meeting the panel header's existing border-bottom (which spans
+ * the full column width — no horizontal padding) so the three lines join
+ * into an H. Same 1px outline-variant as the right column's border-left,
+ * keeping the two side columns visually symmetric around the card. */
 .related-column {
   flex: 1;
   min-width: 0;
@@ -275,6 +280,8 @@ body {
   height: calc(100vh - 48px);
   display: flex;
   flex-direction: column;
+  border-left: 1px solid var(--md-sys-color-outline-variant);
+  border-right: 1px solid var(--md-sys-color-outline-variant);
 }
 
 /* three-column mode: all three columns are equal thirds, each capped at the
