@@ -16,7 +16,7 @@ import { renderMarkdown } from '../lib/markdown'
 // original NotePanel.
 //
 // The component is a CONTENT div (not a scroll container): whichever
-// ancestor scrolls (.note-panel-inner, .reading-note-inner) receives the
+// ancestor scrolls (.note-body inside the flat side panels) receives the
 // scrollIntoView. File texts are cached module-wide (same cache NotePanel
 // used) so tab/panel switches never re-fetch.
 

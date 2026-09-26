@@ -19,9 +19,9 @@ import type { ReadingChunk, ReadingCreatedCard } from '../types'
 //                    crumb's (same pre-split rule); 404 = 无来源 orphan
 // The current card (review/preview mode) is highlighted in the list.
 //
-// Shell: md-elevated-card + .note-panel-inner, IDENTICAL to NotePanel /
-// ReadingPanel so all three columns read as one product (user spec: 长宽
-// 一致, 圆角阴影 md3 风格).
+// Shell (2026-09-27): plain flat div — the md-elevated-card container is
+// gone, cards sit DIRECTLY on the column background (「背景 - 卡片」), with
+// the header pinned at the top-left (user spec).
 //
 // Fail-soft like every enrichment panel: dead backend → count line only.
 
@@ -160,14 +160,13 @@ export const RelatedPanel: Component<Props> = (props) => {
   const title = () => (props.chunk ? '本片段已制卡片' : '相关卡片')
 
   return (
-    <md-elevated-card class="note-panel related-panel">
-      <div class="note-panel-inner">
-        <div class="note-panel-header">
-          <span class="note-panel-title md-typescale-title-small">{title()}</span>
-          <Show when={count() != null && (count() ?? 0) > 0}>
-            <span class="note-panel-score md-typescale-label-small">{count()} 张</span>
-          </Show>
-        </div>
+    <div class="note-panel related-panel">
+      <div class="note-panel-header">
+        <span class="note-panel-title md-typescale-title-small">{title()}</span>
+        <Show when={count() != null && (count() ?? 0) > 0}>
+          <span class="note-panel-score md-typescale-label-small">{count()} 张</span>
+        </Show>
+      </div>
 
         <Show when={status() === 'loading'}>
           <div class="note-panel-state">
@@ -240,7 +239,6 @@ export const RelatedPanel: Component<Props> = (props) => {
             </div>
           </Show>
         </Show>
-      </div>
-    </md-elevated-card>
+    </div>
   )
 }

@@ -88,10 +88,9 @@ export const NotePanel: Component<Props> = (props) => {
   }
 
   return (
-    <md-elevated-card class="note-panel">
-      <div class="note-panel-inner">
+    <div class="note-panel">
       <div class="note-panel-header">
-        <span class="note-panel-title md-typescale-title-small">笔记来源</span>
+        <span class="note-panel-title md-typescale-title-small">笔记</span>
         <Show when={status() === 'ready' && source()?.stale}>
           <span class="note-panel-score md-typescale-label-small" title="源文件被外部编辑过，片段按指纹重锚失败，范围可能不精确">
             来源已过期
@@ -148,7 +147,6 @@ export const NotePanel: Component<Props> = (props) => {
           onError={() => setStatus('error')}
         />
       </Show>
-      </div>
-    </md-elevated-card>
+    </div>
   )
 }

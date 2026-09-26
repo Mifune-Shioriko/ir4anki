@@ -60,6 +60,10 @@ body {
 .app-shell {
   min-height: 100vh;
   display: flex;
+  /* the note column's ::after paints its tint to the screen edge on
+   * ultra-wide viewports — clip the overshoot. `clip` (not `hidden`) so no
+   * scroll container is created and sticky columns keep working. */
+  overflow-x: clip;
 }
 
 .app {
@@ -225,24 +229,42 @@ body {
 .note-column {
   flex: 1;
   min-width: 0;
-  padding: var(--content-padding) 0;
   position: sticky;
-  top: 0; /* the top app bar is gone (left nav rail, 2026-09-19 round 3) */
+  top: 0;
   align-self: flex-start;
-  /* definite height (was max-height): the panel's scroll/clipping layer is
-   * absolutely positioned inside the md-elevated-card host, which needs a
-   * resolved height to scroll against. 100vh - 48px keeps a 24px gap above
-   * and below the viewport while sticky. */
-  height: calc(100vh - 48px);
+  /* full-bleed sidebar (user spec 2026-09-27): no card shell anymore — the
+   * column IS the surface. Its own tint (surface-container-low) separates it
+   * from the page background, a 1px solid outline-variant border-left is the
+   * divider against the center column, and the box stretches the full
+   * viewport height. The negative right margin cancels .columns' right
+   * padding so the tint reaches the screen's right edge; ::after covers the
+   * remainder on ultra-wide screens where .columns' max-width leaves dead
+   * space (.app-shell clips it with overflow-x: clip — clip, not hidden, so
+   * sticky positioning keeps working). */
+  height: 100vh;
   display: flex;
   flex-direction: column;
+  padding: var(--content-padding) 0;
+  margin-right: calc(-1 * var(--content-padding));
+  background: var(--md-sys-color-surface-container-low);
+  border-left: 1px solid var(--md-sys-color-outline-variant);
 }
 
-/* left column 相关卡片 (三栏重构, user spec 2026-09-21): SAME shell as
- * .note-column — equal width (three equal columns, capped at the card
- * width), equal height, sticky. The RelatedPanel inside is an
- * md-elevated-card with the .note-panel treatment, so 圆角阴影/MD3 match
- * the other two columns by construction. */
+.note-column::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 100%;
+  width: 100vw;
+  background: var(--md-sys-color-surface-container-low);
+}
+
+/* left column 相关卡片 (三栏重构, user spec 2026-09-21; card shell dropped
+ * 2026-09-27): equal width (three equal columns, capped at the card width),
+ * sticky full height minus the 24px breathing gaps. The RelatedPanel inside
+ * is now a plain div — background → cards directly (「背景 - 卡片」, no
+ * intermediate container). */
 .related-column {
   flex: 1;
   min-width: 0;
@@ -262,6 +284,13 @@ body {
 .columns--three .note-column {
   flex: 1 1 0;
   max-width: var(--content-max-width);
+}
+
+/* the note column's border box carries the -24px right margin (full-bleed
+ * tint), so its cap grows by the same 24px — the CONTENT width stays equal
+ * to the other two thirds */
+.columns--three .note-column {
+  max-width: calc(var(--content-max-width) + var(--content-padding));
 }
 
 @media (max-width: 1179px) {
@@ -284,29 +313,21 @@ body {
  * corner (.nav-rail__footer), so the columns share a top edge on every
  * phase. */
 
-/* ---- note panel ----
- * The panel IS a real <md-elevated-card> now (2026-09-17, user request:
- * same treatment as the study card — identical MD3 elevated-card tokens by
- * construction: surface-container-low container, corner-medium 12px shape,
- * elevation level 1 shadow rendered by the official md-elevation layer).
- * The host must NOT set overflow:hidden — that would clip its own elevation
- * shadow — so scrolling/clipping lives on .note-panel-inner, absolutely
- * positioned over the host box. That also sidesteps the shadow-DOM <slot>
- * (unstyleable from light CSS) which cannot take part in a flex height
- * chain: absolute inset:0 anchors to the host (position:relative), and
- * border-radius:inherit picks up the host's 12px corner for the clip. */
+/* ---- note panel (flat, user spec 2026-09-27) ----
+ * The md-elevated-card shell is GONE: both side panels are plain divs
+ * sitting directly on their column — the right one on its own
+ * surface-container-low tint (「背景 - 文字」, tint + border-left divider
+ * live on .note-column), the left one on the page background where the
+ * .related-item boxes are the only cards left (「背景 - 卡片」). The old
+ * absolute-positioned .note-panel-inner scroll layer (needed because the
+ * card host couldn't take part in a flex height chain) died with the card:
+ * .note-panel is a real flex column and .note-body / .related-list scroll
+ * inside it directly. */
 .note-panel {
   flex: 1;
   min-height: 0;
-}
-
-.note-panel-inner {
-  position: absolute;
-  inset: 0;
   display: flex;
   flex-direction: column;
-  overflow: hidden;
-  border-radius: inherit;
 }
 
 .note-panel-header {
@@ -362,20 +383,26 @@ body {
 }
 
 /* ---- left column 相关卡片 list (三栏重构, user spec 2026-09-21) ----
- * Scrollable list body of the RelatedPanel — same inset-absolute shell as
- * NotePanel (.note-panel-inner), items reuse the .similar-item treatment
- * (flat inline list, surface-container, small corner). The CURRENT card
- * (review/preview mode) is highlighted with a primary-container tint so the
- * user can see which of the segment's cards is on screen. */
+ * Scrollable list body of the RelatedPanel. Items keep the .similar-item
+ * shape but sit DIRECTLY on the page background now (card shell dropped
+ * 2026-09-27) — so they get surface-container-high instead of
+ * surface-container: on the dark surface (#141218) the old container color
+ * (#211f26) read as one undifferentiated text blob (user report), the
+ * higher tint gives each card a visible boundary. The CURRENT card
+ * (review/preview mode) is still highlighted with a primary-container tint. */
 .related-list {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 12px 16px 24px;
+  padding: 12px 20px 24px;
   scroll-behavior: smooth;
 }
 
-.related-item--self {
+.related-list .similar-item {
+  background: var(--md-sys-color-surface-container-high);
+}
+
+.related-list .related-item--self {
   background: var(--md-sys-color-primary-container);
 }
 

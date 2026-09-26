@@ -354,9 +354,9 @@ def run(state):
               ring_box["x"] >= rail_box["x"] and
               ring_box["x"] + ring_box["width"] <= rail_box["x"] + rail_box["width"] + 1,
               f"rail={rail_box} ring={ring_box}")
-        # top-edge alignment: card box and note box share the same top
+        # top-edge alignment: card box and note panel share the same top
         card_top = page.locator(".flashcard-wrapper md-elevated-card").bounding_box()["y"]
-        note_top = page.locator(".note-column md-elevated-card").first.bounding_box()["y"]
+        note_top = page.locator(".note-column .note-panel").first.bounding_box()["y"]
         check("card/note top edges aligned (mid-round)", abs(card_top - note_top) <= 2,
               f"card_top={card_top} note_top={note_top}")
         page.screenshot(path="/tmp/reading-ui-card.png")
