@@ -88,8 +88,42 @@ The installer will:
 
 Then open <http://127.0.0.1:8901>.
 
+### First-run checklist
+
+Before the daily flow works end to end, confirm:
+
+1. **Desktop Anki is RUNNING** with the AnkiConnect add-on installed
+   (`2055492159`) — ir4anki drives your collection through it. If Anki is
+   closed the app shows an Anki-connection error on every action.
+2. **`ANKI_PREVIEW_RELEASE_DECK` (default `2026`) exists in YOUR collection**
+   — that's where released new cards land. Rename it in
+   `~/.config/ir4anki.env` if your main deck is called something else.
+3. **`ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` note types exist** (defaults
+   `问答题` / `填空题`) — the add-card dialogs create notes with them.
+   Either create matching note types or point the env keys at yours.
+4. **`ANKI_MEDIA_DIR` points at your profile's `collection.media`** — only
+   needed for card images; the installer prompts for it.
+5. **`ANKI_ROLLOVER_HOUR` matches Anki's own "next day starts at"** setting
+   (Preferences → Scheduling), or daily budgets reset at the wrong moment.
+6. Reading mode only: put markdown notes in `ANKI_NOTES_DIR` and add files
+   via the 阅读清单 section; without them the chain skips straight to review.
+
 Useful flags: `--non-interactive` (accept defaults), `--no-service` (build +
 config only, run uvicorn yourself).
+
+### Low-resolution desktops (e.g. 1280×800)
+
+The UI is designed desktop-first and works from 1180px window width upward
+(two columns: card + notes/related tabs). On a 1280×800 panel:
+
+- run the browser **full-screen (F11)** or launch kiosk-style —
+  `chromium --kiosk http://127.0.0.1:8901` / `firefox --kiosk URL` — to give
+  the layout the whole panel;
+- the action bar (显示答案 / ease buttons) is sticky at the bottom of the
+  viewport, so long cards never push the rating buttons off screen;
+- keyboard first: `Space` reveal, `1`–`4` rate (Again/Hard/Good/Easy),
+  `Ctrl+Z` undo; reading stage adds `A` add card, `C` cloze, `S` skip,
+  `N` next.
 
 ### Manual run (no systemd)
 

@@ -9,8 +9,15 @@
  */
 
 :root {
-  --content-max-width: 680px;
+  /* 620px (2026-09-27 桌面重设计): on a 1280-wide window the old 680px card
+   * left the note column ~448px (a 25-char strip). 620 hands the supporting
+   * pane ~508px (32+ CJK chars/line) — M3 supporting-pane: hero pane stands
+   * out, the pane beside it must still be readable. */
+  --content-max-width: 620px;
   --content-padding: 24px;
+  /* compact vertical rhythm (MD3 density): 800px-tall screens lose ~120px
+   * to browser chrome — every saved vertical px goes to content. */
+  --content-pad-v: 16px;
   /* MD3 baseline shape scale (tokens.css only carries the color scheme; the
    * shape sys-tokens are the official MD3 values, needed by .mode-tile &
    * friends which reference them WITHOUT fallbacks) */
@@ -87,6 +94,7 @@ body {
   flex: 0 0 80px;
   width: 80px;
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -202,7 +210,7 @@ body {
   flex: 0 0 var(--content-max-width);
   max-width: var(--content-max-width);
   margin: 0;
-  padding: var(--content-padding) 0;
+  padding: var(--content-pad-v) 0;
 }
 
 /* three-column mode: columns are equal flexible thirds capped at the card
@@ -242,9 +250,10 @@ body {
    * space (.app-shell clips it with overflow-x: clip — clip, not hidden, so
    * sticky positioning keeps working). */
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
-  padding: var(--content-padding) 0;
+  padding: var(--content-pad-v) 0;
   margin-right: calc(-1 * var(--content-padding));
   background: var(--md-sys-color-surface-container-low);
   border-left: 1px solid var(--md-sys-color-outline-variant);
@@ -273,11 +282,12 @@ body {
 .related-column {
   flex: 1;
   min-width: 0;
-  padding: var(--content-padding) 0;
+  padding: var(--content-pad-v) 0;
   position: sticky;
   top: 0;
   align-self: flex-start;
-  height: calc(100vh - 48px);
+  height: calc(100vh - 32px);
+  height: calc(100dvh - 32px);
   display: flex;
   flex-direction: column;
   border-left: 1px solid var(--md-sys-color-outline-variant);
@@ -309,7 +319,7 @@ body {
   .columns .content {
     max-width: var(--content-max-width);
     margin: 0 auto;
-    padding: var(--content-padding);
+    padding: var(--content-pad-v) var(--content-padding);
   }
 }
 
@@ -373,6 +383,22 @@ body {
 .note-tabs {
   flex: 0 0 auto;
   --md-primary-tab-container-height: 40px;
+}
+
+/* right-column tabs container (SidePanelTabs, 2026-09-27): flex column so
+ * the mounted-but-hidden pane swap keeps a definite height chain for the
+ * inner scroll layers. */
+.side-panel-tabs {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.side-panel-body {
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
 }
 
 .note-tab-label {
@@ -582,6 +608,7 @@ body {
   justify-content: center;
   color: var(--md-sys-color-on-surface);
   font-variant-numeric: tabular-nums;
+  font-weight: 600; /* emphasized (Expressive type scale) */
 }
 
 /* the ring now sits in the nav rail's bottom-left corner (2026-09-20) */
@@ -590,6 +617,35 @@ body {
   padding-bottom: 16px;
   display: flex;
   justify-content: center;
+}
+
+/* hero moment (2026-09-27, Expressive motion): when the round completes the
+ * ring pops with the Expressive spring signature — the linear() timing
+ * function overshoots past 1 (1.12 at 56%) before settling, no JS spring
+ * library needed. transform-only so an old ThinkPad's iGPU never drops
+ * frames. */
+.progress-ring--done {
+  animation: ring-pop 0.6s linear(
+    0, 0.36 12%, 0.72 25%, 0.93 36%, 1.06 46%, 1.12 56%,
+    1.08 66%, 1.02 76%, 0.99 86%, 1 100%
+  );
+}
+
+@keyframes ring-pop {
+  from { transform: scale(0.7); }
+  to { transform: scale(1); }
+}
+
+/* respect the OS "reduce motion" preference everywhere the app animates */
+@media (prefers-reduced-motion: reduce) {
+  .progress-ring--done,
+  .snackbar {
+    animation: none;
+  }
+  .progress-ring__arc,
+  .note-hl {
+    transition: none;
+  }
 }
 
 .progress-area {
@@ -626,10 +682,38 @@ body {
 
 .card-container {
   width: 100%;
+  /* Expressive shape contrast (2026-09-27): the hero card gets the large
+   * corner; small inner elements (chips, code, keycaps) stay small. */
+  --md-elevated-card-container-shape: var(--md-sys-shape-corner-large, 16px);
+}
+
+/* stage color coding (2026-09-27): the daily chain has no intermediate
+ * pages, so the card shell itself says which stage you're in — review =
+ * primary, reading = tertiary. The bar is a host ::before (z-index 1)
+ * because the card's internal .background layer paints over host borders. */
+.stage-review .card-container::before,
+.stage-reading .card-container::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 1;
+  border-radius: var(--md-sys-shape-corner-large, 16px)
+    var(--md-sys-shape-corner-large, 16px) 0 0;
+}
+
+.stage-review .card-container::before {
+  background: var(--md-sys-color-primary);
+}
+
+.stage-reading .card-container::before {
+  background: var(--md-sys-color-tertiary);
 }
 
 .card-inner {
-  padding: 24px 28px;
+  padding: 16px 20px;
   display: flex;
   flex-direction: column;
 }
@@ -638,7 +722,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 /* undo + edit icon buttons, grouped on the right of the card header */
@@ -729,7 +813,7 @@ body {
 }
 
 .card-divider {
-  margin: 20px 0;
+  margin: 14px 0;
 }
 
 .card-answer {
@@ -737,7 +821,7 @@ body {
 }
 
 .card-meta {
-  margin-top: 20px;
+  margin-top: 12px;
   color: var(--md-sys-color-on-surface-variant);
 }
 
@@ -784,37 +868,77 @@ body {
   color: var(--md-sys-color-on-surface-variant);
 }
 
-/* ---- action area / ease buttons ---- */
+/* ---- action area / ease buttons ----
+ * Sticky floating action bar (2026-09-27 桌面重设计): on an 800px-tall
+ * screen (~700px viewport) a long answer scrolls the ease row out of
+ * reach — pin it to the viewport bottom as an M3-Expressive-style floating
+ * pill so 显示答案/1-4 are ALWAYS on screen. The pill floats over content
+ * (no full-width backdrop) like the Expressive toolbar pattern. */
 .action-area {
   width: 100%;
-  margin-top: 24px;
+  margin-top: 16px;
   display: flex;
   justify-content: center;
+  position: sticky;
+  bottom: 12px;
+  z-index: 6;
 }
 
 .ease-buttons {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--md-sys-color-surface-container-high);
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  box-shadow:
+    0 1px 2px 0 rgba(0, 0, 0, 0.2),
+    0 1px 3px 1px rgba(0, 0, 0, 0.1);
+}
+
+/* keycap hints inside buttons (快捷键可见化): Space reveal, 1-4 ease.
+ * currentColor border so the cap adapts to each button's label color. */
+.keycap {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border: 1px solid currentColor;
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  font-size: 0.78em;
+  line-height: 1.5;
+  opacity: 0.65;
+  font-variant-numeric: tabular-nums;
 }
 
 .ease-buttons md-outlined-button {
-  min-width: 96px;
+  min-width: 88px;
 }
 
+/* Good = the primary CTA: filled, taller and wider (Expressive: the key
+ * action is impossible to miss) */
 .ease-good {
-  min-width: 128px; /* Good is the primary CTA */
-}
-
-.ease-again {
-  --md-outlined-button-label-text-color: var(--md-sys-color-error);
-  --md-outlined-button-outline-color: var(--md-sys-color-error);
-}
-
-/* preview mode: approve is the primary CTA (same role as "Good") */
-.preview-approve {
   min-width: 128px;
+  --md-filled-button-container-height: 44px;
+}
+
+/* Again = destructive-ish: filled-tonal in error-container (was a red
+ * outline — the color language now grades the four buttons instead of
+ * leaving three of them identically grey) */
+.ease-again {
+  min-width: 88px;
+  --md-filled-tonal-button-container-color: var(--md-sys-color-error-container);
+  --md-filled-tonal-button-label-text-color: var(--md-sys-color-on-error-container);
+  --md-filled-tonal-button-hover-container-color: var(--md-sys-color-error-container);
+  --md-filled-tonal-button-focus-container-color: var(--md-sys-color-error-container);
+  --md-filled-tonal-button-pressed-container-color: var(--md-sys-color-error-container);
+}
+
+/* Easy = filled-tonal, whose DEFAULT container already is
+ * secondary-container — no overrides needed, listed for symmetry */
+.ease-easy {
+  min-width: 88px;
 }
 
 /* ---- generic centered screens (start/done/empty/finished/loading) ---- */
@@ -828,18 +952,23 @@ body {
 .screen-card {
   width: 100%;
   max-width: 480px;
+  /* Expressive shape: the start screen's hero container gets extra-large
+   * corners (28px) — contrast against the 16px study card and the small
+   * inner elements. */
+  --md-elevated-card-container-shape: var(--md-sys-shape-corner-extra-large, 28px);
 }
 
 .screen-content {
-  padding: 32px;
+  padding: 28px 32px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 24px;
+  gap: 20px;
 }
 
 .screen-title {
   color: var(--md-sys-color-on-surface);
+  font-weight: 700; /* emphasized (Expressive type scale) */
 }
 
 /* Wide screens (note column visible): the right panel's box starts at the
@@ -927,12 +1056,56 @@ body {
 
 .stat-value {
   color: var(--md-sys-color-on-surface);
-  font-weight: 500;
+  font-weight: 600; /* emphasized stat numbers (Expressive type scale) */
+  font-variant-numeric: tabular-nums;
 }
 
 .screen-actions {
   display: flex;
   gap: 12px;
+}
+
+/* hero start button (2026-09-27): the ONE action of this product gets the
+ * Expressive treatment — full width, taller, large shape. */
+.screen-start-button {
+  width: 100%;
+  --md-filled-button-container-height: 56px;
+  --md-filled-button-container-shape: var(--md-sys-shape-corner-large, 16px);
+  --md-filled-button-label-text-size: 1rem;
+}
+
+/* first-run empty state (2026-09-27): a fresh collection used to render
+ * "— 张" + a start button dealing an empty round; say what to do instead. */
+.screen-empty {
+  width: 100%;
+  padding: 12px 16px;
+  background: var(--md-sys-color-surface-container);
+  border-radius: var(--md-sys-shape-corner-medium, 12px);
+  color: var(--md-sys-color-on-surface-variant);
+  text-align: center;
+  line-height: 1.6;
+}
+
+/* keyboard shortcut hints (快捷键可见化, 2026-09-27): Space/1-4/Ctrl+Z
+ * already work app-wide — surface them where the round starts. */
+.screen-keys {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.screen-keys kbd {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 1px 6px;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-bottom-width: 2px;
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  background: var(--md-sys-color-surface-container-low);
+  font-family: inherit;
+  font-size: 0.9em;
 }
 
 /* ---- pacing-mode selector (two tiers, user spec 2026-09-14) ---- */

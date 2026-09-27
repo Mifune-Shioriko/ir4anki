@@ -68,7 +68,7 @@ export const Flashcard: Component<Props> = (props) => {
   const questionHtml = () => cleanCardHtml(props.card.question)
 
   return (
-    <div class="flashcard-wrapper">
+    <div class="flashcard-wrapper stage-review">
       <md-elevated-card class="card-container">
         <div class="card-inner">
           <div class="card-header">

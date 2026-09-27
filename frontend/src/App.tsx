@@ -20,6 +20,7 @@ import { ReadingPanel } from './components/ReadingPanel'
 import { ReadingListScreen } from './components/ReadingListScreen'
 import { NotePanel } from './components/NotePanel'
 import { RelatedPanel } from './components/RelatedPanel'
+import { SidePanelTabs } from './components/SidePanelTabs'
 import { SegEditDialog } from './components/SegEditDialog'
 import { invalidateFileCache } from './components/FileViewer'
 import { Snackbar } from './components/Snackbar'
@@ -1204,17 +1205,34 @@ export const App: Component = () => {
           开始学习 page. */}
       <Show when={isWide() && centerOccupied()}>
         <div class="note-column">
+          {/* two-column band (1180–1499): 相关卡片 lives in a TAB of this
+              column (its own left column only exists ≥1500px — a third
+              column at 1280 would be ~368px, too narrow to read) */}
           <Show
-            when={leftChunk()}
+            when={!isWide3()}
             fallback={
-              <NotePanel
-                noteId={noteCard()?.noteId}
-                cardKey={noteCard()?.cardId ?? null}
-                blocked={noteBlocked()}
-              />
+              <Show
+                when={leftChunk()}
+                fallback={
+                  <NotePanel
+                    noteId={noteCard()?.noteId}
+                    cardKey={noteCard()?.cardId ?? null}
+                    blocked={noteBlocked()}
+                  />
+                }
+              >
+                <ReadingPanel chunk={leftChunk()!} reloadToken={noteReloadToken()} />
+              </Show>
             }
           >
-            <ReadingPanel chunk={leftChunk()!} reloadToken={noteReloadToken()} />
+            <SidePanelTabs
+              chunk={leftChunk()}
+              noteId={noteCard()?.noteId ?? null}
+              cardKey={noteCard()?.cardId ?? null}
+              blocked={noteBlocked()}
+              refreshToken={relatedToken()}
+              noteReloadToken={noteReloadToken()}
+            />
           </Show>
         </div>
       </Show>

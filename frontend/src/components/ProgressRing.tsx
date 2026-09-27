@@ -22,9 +22,11 @@ const CIRC = 2 * Math.PI * R
 export const ProgressRing: Component<Props> = (props) => {
   const fraction = () =>
     props.total > 0 ? Math.min(props.done / props.total, 1) : 0
+  const done = () => props.total > 0 && props.done >= props.total
   return (
     <div
       class="progress-ring"
+      classList={{ 'progress-ring--done': done() }}
       role="progressbar"
       aria-valuemin={0}
       aria-valuemax={props.total}
@@ -41,7 +43,7 @@ export const ProgressRing: Component<Props> = (props) => {
           stroke-dashoffset={`${CIRC * (1 - fraction())}`}
         />
       </svg>
-      <span class="progress-ring__text md-typescale-label-large">
+      <span class="progress-ring__text md-typescale-title-small">
         {props.done}/{props.total}
       </span>
     </div>

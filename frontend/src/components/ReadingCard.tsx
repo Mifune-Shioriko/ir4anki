@@ -107,7 +107,7 @@ export const ReadingCard: Component<Props> = (props) => {
   }
 
   return (
-    <div class="flashcard-wrapper">
+    <div class="flashcard-wrapper stage-reading">
       <md-elevated-card class="card-container">
         <div class="card-inner">
           <div class="card-header">

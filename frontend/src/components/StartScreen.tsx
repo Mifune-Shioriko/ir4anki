@@ -21,30 +21,44 @@ interface Props {
   readingAvailable?: number
 }
 
-// Single unified start screen (user spec 2026-09-24): the quick/focus tiers
-// and every intermediate stats/选择 page are gone. One button runs the whole
-// daily chain — 阅读 → 复习 — then returns here (the preview stage was
-// retired 2026-09-27: today's cards sit in the pool and auto-release
-// overnight). The card just shows TODAY'S PLAN (sizes from the wire) so the
-// user knows what they're about to do; no per-stage picking.
+// Single unified start screen (user spec 2026-09-24): one button runs the
+// whole daily chain — 阅读 → 复习 — then returns here. 2026-09-27 桌面重设计:
+// headline-medium emphasized title, tabular emphasized stat values, keyboard
+// shortcut hints (Space / 1-4 / Ctrl+Z already exist in App — this makes
+// them discoverable), and first-run empty-state guidance (a fresh
+// collection with nothing due used to show "— 张" and a 开始 button that
+// deals an empty round).
 export const StartScreen: Component<Props> = (props) => {
   const sizes = () => {
     const t = props.studyModes
     const m = props.mode ?? 'daily'
     return t && t[m] ? t[m] : null
   }
+  // nothing anywhere to study TODAY: no due, no new pool, no preview pool
+  // awaiting tomorrow's release, no reading segments
+  const isEmpty = () =>
+    (props.due ?? 0) === 0 &&
+    (props.newTotal ?? 0) === 0 &&
+    (props.previewPool ?? 0) === 0 &&
+    (props.readingAvailable ?? 0) === 0
   return (
     <div class="screen">
       <md-elevated-card class="screen-card">
         <div class="screen-content">
-          <h1 class="screen-title md-typescale-headline-small">开始学习</h1>
+          <h1 class="screen-title md-typescale-headline-medium">开始学习</h1>
           <p class="screen-detail md-typescale-body-medium">
             一轮依次推进：阅读笔记 → 复习。中途不用选，做完自动进入下一段，全部完成回到这里。今天制的卡进预览池，明天自动放行为新卡。
           </p>
 
+          <Show when={isEmpty() && props.due != null}>
+            <div class="screen-empty md-typescale-body-medium">
+              牌组里暂时没有可学的东西。可以先：在桌面 Anki 里建牌组导入卡片，或在「阅读清单」里加入 markdown 笔记开始制卡。
+            </div>
+          </Show>
+
           <Show when={sizes()}>
             <div class="screen-stats md-typescale-body-medium">
-              <div class="plan-head md-typescale-label-medium">今日每轮计划</div>
+              <div class="plan-head md-typescale-label-large">今日每轮计划</div>
               <Show when={(props.readingAvailable ?? 0) > 0}>
                 <div class="stat-row">
                   <span>阅读</span>
@@ -82,9 +96,15 @@ export const StartScreen: Component<Props> = (props) => {
             </Show>
           </div>
 
-          <md-filled-button onClick={() => props.onBegin()} disabled={props.busy}>
+          <md-filled-button class="screen-start-button" onClick={() => props.onBegin()} disabled={props.busy}>
             开始
           </md-filled-button>
+
+          <div class="screen-keys md-typescale-label-small">
+            <span><kbd>Space</kbd> 显示答案</span>
+            <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd> 评分</span>
+            <span><kbd>Ctrl+Z</kbd> 撤销</span>
+          </div>
         </div>
       </md-elevated-card>
     </div>
