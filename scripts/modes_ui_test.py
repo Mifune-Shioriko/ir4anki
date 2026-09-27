@@ -74,9 +74,24 @@ def _nid(days_ago, hour=12):
     return int(dt.replace(hour=hour, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
 
+# ANKI-DAY-aware nids (fixture bug fix 2026-09-28): Anki's day rolls over at
+# 4 AM, so between 00:00 and 04:00 wall-clock, "yesterday noon" is STILL the
+# current Anki day — _nid(1) then fails the auto-release "created on an
+# EARLIER Anki day" gate and the review batch loses its released new card
+# (observed: 00:50 run dealt 1 card, step 3 timed out). Anchor the pool nids
+# to the CURRENT ANKI DAY (now − 4h) instead of wall-clock now.
+_anki_now = datetime.now() - timedelta(hours=4)
+
+
+def _anki_nid(days_back, hour):
+    dt = (_anki_now - timedelta(days=days_back)).replace(
+        hour=hour, minute=0, second=0, microsecond=0)
+    return int(dt.timestamp() * 1000)
+
+
 NID_REV = [_nid(40), _nid(41), _nid(42)]        # review cards (old notes)
-NID_YESTERDAY = _nid(1)                          # pool card made yesterday
-NID_TODAY = _nid(0, hour=max(5, datetime.now().hour))  # pool card made today (post-4AM)
+NID_YESTERDAY = _anki_nid(1, 12)                 # pool card, earlier Anki day
+NID_TODAY = _anki_nid(0, max(5, _anki_now.hour))  # pool card, current Anki day
 
 
 class FakeState:
@@ -338,10 +353,22 @@ def run():
         check("back on 开始学习 (no stats page)", "开始学习" in title2, title2)
         check("no DoneScreen rendered",
               page.locator(".screen-title", has_text="本轮完成").count() == 0)
+        # hero summary strip (P2, 2026-09-27 round 2): this round skipped 1
+        # reading segment and reviewed 2 cards (1 new) — the start card must
+        # show the completion summary, and the old shortcut-hint row must
+        # stay gone (user request: 开始页不要 1234/Ctrl+Z 那行字)
+        check("round-summary hero shown", page.locator(".round-summary").count() == 1)
+        summ = page.locator(".round-summary").inner_text().replace("\n", " ")
+        check("summary: 1 reading segment processed (skipped)",
+              "阅读段处理" in summ and "跳过 1 段" in summ, summ)
+        check("summary: 2 cards reviewed incl 1 new",
+              "卡片复习" in summ and "含新卡 1 张" in summ, summ)
+        check("no screen-keys hint row (user asked to remove it)",
+              page.locator(".screen-keys").count() == 0)
         page.screenshot(path="/tmp/daily-ui-back-to-start.png")
 
-        # H-divider (left column borders) can't be asserted here — the side
-        # columns only render with a card on screen at ≥1500px viewport;
+        # H-divider (column borders) can't be asserted here — the side
+        # column only renders with a card on screen (centerOccupied gate);
         # flat_panels_ui_test.py covers panel geometry at 1920.
         check("no JS page errors", not errors, errors[:3])
         browser.close()

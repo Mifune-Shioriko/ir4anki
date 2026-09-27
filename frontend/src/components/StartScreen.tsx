@@ -1,5 +1,6 @@
 import { Component, Show } from 'solid-js'
-import type { StudyModes } from '../types'
+import type { StudyModes, RoundSummary } from '../types'
+import { IconCheckCircle } from './icons'
 
 interface Props {
   due: number | null
@@ -19,15 +20,19 @@ interface Props {
   previewMode?: boolean
   /** reading segments available this round (渐进制卡) */
   readingAvailable?: number
+  /** what the round that just ended accomplished (hero summary strip,
+   * 2026-09-27 round 2); null until a round completes this session */
+  roundSummary?: RoundSummary | null
 }
 
 // Single unified start screen (user spec 2026-09-24): one button runs the
 // whole daily chain — 阅读 → 复习 — then returns here. 2026-09-27 桌面重设计:
-// headline-medium emphasized title, tabular emphasized stat values, keyboard
-// shortcut hints (Space / 1-4 / Ctrl+Z already exist in App — this makes
-// them discoverable), and first-run empty-state guidance (a fresh
-// collection with nothing due used to show "— 张" and a 开始 button that
-// deals an empty round).
+// headline-medium emphasized title, tabular emphasized stat values, and
+// first-run empty-state guidance (a fresh collection with nothing due used
+// to show "— 张" and a 开始 button that deals an empty round). The keyboard
+// shortcut hint row the redesign first added here was REMOVED on user
+// request (round 2) — shortcuts stay discoverable via the keycaps ON the
+// ease buttons (ActionArea), which is where they actually apply.
 export const StartScreen: Component<Props> = (props) => {
   const sizes = () => {
     const t = props.studyModes
@@ -45,6 +50,50 @@ export const StartScreen: Component<Props> = (props) => {
     <div class="screen">
       <md-elevated-card class="screen-card">
         <div class="screen-content">
+          <Show when={props.roundSummary}>
+            {/* hero moment (P2, 2026-09-27 round 2): the round that just
+                finished gets ONE big celebratory number + the stage
+                breakdown — replaces the easy-to-miss 4s snackbar. Only
+                shows stages that actually ran (reading-only or
+                review-only rounds don't list a zero row). */}
+            <div class="round-summary">
+              <span class="round-summary__hero" aria-hidden="true">
+                <IconCheckCircle size={40} />
+              </span>
+              <div class="round-summary__title md-typescale-headline-small">
+                本轮完成
+              </div>
+              <div class="round-summary__stats">
+                <Show when={(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0) > 0}>
+                  <div class="round-summary__stat">
+                    <span class="round-summary__num md-typescale-headline-medium">
+                      {(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0)}
+                    </span>
+                    <span class="round-summary__label md-typescale-label-small">阅读段处理</span>
+                    <Show when={(props.roundSummary!.readingSkipped ?? 0) > 0}>
+                      <span class="round-summary__sub md-typescale-label-small">
+                        其中跳过 {props.roundSummary!.readingSkipped} 段
+                      </span>
+                    </Show>
+                  </div>
+                </Show>
+                <Show when={(props.roundSummary!.reviewed ?? 0) > 0}>
+                  <div class="round-summary__stat">
+                    <span class="round-summary__num md-typescale-headline-medium">
+                      {props.roundSummary!.reviewed ?? 0}
+                    </span>
+                    <span class="round-summary__label md-typescale-label-small">卡片复习</span>
+                    <Show when={(props.roundSummary!.newReviewed ?? 0) > 0}>
+                      <span class="round-summary__sub md-typescale-label-small">
+                        含新卡 {props.roundSummary!.newReviewed} 张
+                      </span>
+                    </Show>
+                  </div>
+                </Show>
+              </div>
+              <md-divider />
+            </div>
+          </Show>
           <h1 class="screen-title md-typescale-headline-medium">开始学习</h1>
           <p class="screen-detail md-typescale-body-medium">
             一轮依次推进：阅读笔记 → 复习。中途不用选，做完自动进入下一段，全部完成回到这里。今天制的卡进预览池，明天自动放行为新卡。
@@ -99,12 +148,6 @@ export const StartScreen: Component<Props> = (props) => {
           <md-filled-button class="screen-start-button" onClick={() => props.onBegin()} disabled={props.busy}>
             开始
           </md-filled-button>
-
-          <div class="screen-keys md-typescale-label-small">
-            <span><kbd>Space</kbd> 显示答案</span>
-            <span><kbd>1</kbd><kbd>2</kbd><kbd>3</kbd><kbd>4</kbd> 评分</span>
-            <span><kbd>Ctrl+Z</kbd> 撤销</span>
-          </div>
         </div>
       </md-elevated-card>
     </div>

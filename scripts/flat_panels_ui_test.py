@@ -5,7 +5,7 @@ Spawns a throwaway uvicorn on :8905 (isolated ANKI_STATE_DIR + temp corpus,
 dead AnkiConnect) serving the REAL frontend/dist build, then drives it with
 Playwright at 1920x1200 dark mode (the user's display) and asserts:
 
-  right column (笔记):
+  right column (笔记 + 相关卡片 tabs, 统一双栏 2026-09-27 round 2):
     1. no md-elevated-card shell inside .note-column
     2. .note-column bg == surface-container-low (dark #1d1b20)
        != page bg (dark surface #141218)
@@ -13,8 +13,8 @@ Playwright at 1920x1200 dark mode (the user's display) and asserts:
     4. tint reaches the viewport right edge
     5. full viewport height (100vh)
     6. header title == 笔记 (reading mode too — unified)
-  left column (相关卡片):
-    7. no md-elevated-card shell inside .related-column
+    7. two tabs; the 相关卡片 tab mounts the RelatedPanel (no separate
+       .related-column — the three-column layout is retired)
     8. .related-list .similar-item bg == surface-container-high (#2b2930)
     9. header title == 本片段已制卡片 (reading mode keeps dynamic title)
 
@@ -144,11 +144,14 @@ def run():
         # start the round from the unified start screen
         page.locator("md-filled-button", has_text="开始").first.click()
         page.wait_for_selector(".reading-crumb", timeout=30000)
-        # both side columns must be up (wide3 = 1500px+, we're at 1920)
-        page.wait_for_selector(".note-column", timeout=10000)
-        page.wait_for_selector(".related-column", timeout=10000)
+        # 统一双栏 (2026-09-27 round 2): the note column with its
+        # 笔记/相关卡片 tabs is the ONLY side column — at EVERY width
+        # (the 1500px three-column path is retired)
+        page.wait_for_selector(".note-column .side-panel-tabs", timeout=10000)
         page.wait_for_timeout(800)
         page.screenshot(path="/tmp/flat-ui-wide.png")
+        check("L0 no separate related column (three-col retired)",
+              page.locator(".related-column").count() == 0)
 
         # ---- right column: flat tinted sidebar ----
         cards_in_note = page.locator(".note-column md-elevated-card").count()
@@ -168,14 +171,19 @@ def run():
               bl[0] == "1px" and bl[1] == "solid" and bl[2] == "rgb(73, 69, 79)", bl)
 
         col_box = col.bounding_box()
-        check("R4 tint reaches viewport right edge",
-              abs((col_box["x"] + col_box["width"]) - 1920) <= 2,
-              f"right edge at {col_box['x'] + col_box['width']}")
-        # ::after must paint the same tint to the edge (elementFromPoint)
+        # 统一双栏 (2026-09-27 round 2): .columns is capped at
+        # content(620)+side(560)+gaps, so on a 1920 viewport the column's
+        # BORDER BOX no longer reaches the right edge — the ::after paints
+        # the dead space with the same tint (that's exactly what it's for).
+        # The visual requirement is unchanged: tint covers to the edge.
         edge_bg = page.evaluate("""() => {
             const el = document.elementFromPoint(1918, 600);
             return el ? getComputedStyle(el).backgroundColor : 'none';
         }""")
+        check("R4 tint reaches viewport right edge (column box or ::after)",
+              abs((col_box["x"] + col_box["width"]) - 1920) <= 2
+              or edge_bg == "rgb(29, 27, 32)",
+              f"right edge at {col_box['x'] + col_box['width']}, pixel bg {edge_bg}")
         after_paints = page.evaluate("""() => {
             const col = document.querySelector('.note-column');
             const s = getComputedStyle(col, '::after');
@@ -194,17 +202,20 @@ def run():
         title = page.locator(".note-column .note-panel-title").first.inner_text()
         check("R6 header title == 笔记", title == "笔记", title)
 
-        # ---- left column: flat bg + card boxes ----
-        cards_in_related = page.locator(".related-column md-elevated-card").count()
-        check("L1 no card shell in related column", cards_in_related == 0,
-              cards_in_related)
+        # ---- 相关卡片 tab: same flat treatment inside the note column ----
+        tabs = page.locator(".note-column md-primary-tab")
+        check("R7 side column has 笔记/相关卡片 tabs", tabs.count() == 2,
+              tabs.count())
+        tabs.nth(1).click()  # 相关卡片
+        page.wait_for_timeout(400)
+        rel_panel = page.locator(".note-column .related-panel")
+        check("L1 related panel mounted in note column",
+              rel_panel.count() == 1)
+        cards_in_related = page.locator(".note-column .related-panel md-elevated-card").count()
+        check("L1b no card shell around related panel items",
+              cards_in_related == 0, cards_in_related)
 
-        rel_bg = page.locator(".related-column").first.evaluate(
-            "el => getComputedStyle(el).backgroundColor")
-        check("L1b related column sits on page bg (transparent/surface)",
-              rel_bg in ("rgba(0, 0, 0, 0)", "rgb(20, 18, 24)"), rel_bg)
-
-        rel_title = page.locator(".related-column .note-panel-title").first.inner_text()
+        rel_title = page.locator(".note-column .related-panel .note-panel-title").first.inner_text()
         check("L3 reading-mode header == 本片段已制卡片",
               rel_title == "本片段已制卡片", rel_title)
 
@@ -216,7 +227,7 @@ def run():
             const i = document.createElement('div');
             i.className = 'similar-item related-item';
             d.appendChild(i);
-            document.querySelector('.related-column .note-panel').appendChild(d);
+            document.querySelector('.note-column .related-panel').appendChild(d);
             const bg = getComputedStyle(i).backgroundColor;
             d.remove();
             return bg;

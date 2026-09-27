@@ -191,14 +191,9 @@ body {
   padding: 0 var(--content-padding);
 }
 
-.columns--three {
-  /* 3 × card width + 2 × gap + 2 × page padding (rail lives outside) */
-  max-width: calc(3 * var(--content-max-width) + 2 * 24px + 2 * var(--content-padding));
-}
-
 /* Solo phase (start/loading/finished — no card on screen, so the side
- * columns are gated off): .columns is still the centered max-width flex
- * container, but the 680px .content column used to sit at its LEFT edge,
+ * column is gated off): .columns is still the centered max-width flex
+ * container, but the 620px .content column used to sit at its LEFT edge,
  * making the start-screen card look off-center on wide screens (user
  * report 2026-09-26). Center the lone column instead. Narrow screens are
  * unaffected (.columns is display:block there, .content has margin auto). */
@@ -213,20 +208,8 @@ body {
   padding: var(--content-pad-v) 0;
 }
 
-/* three-column mode: columns are equal flexible thirds capped at the card
- * width (680px). The original spec (2026-09-21) fixed them at 680px with a
- * 2216px breakpoint, but the user's 1920×1200 display (2026-09-22) can't
- * fit that — WIDE3_QUERY is now 1500px and the flex rules below
- * (.columns--three … flex: 1 1 0) shrink the thirds to ≈581px at 1920. */
-.columns--three .related-column,
-.columns--three .note-column {
-  flex: 0 0 var(--content-max-width);
-  max-width: var(--content-max-width);
-}
-
-/* base .content (applies in BOTH modes — the column rules above only
- * override sizing/margins; flex-column layout is what the screens inside
- * have always relied on) */
+/* base .content (the column rules above only override sizing/margins;
+ * flex-column layout is what the screens inside have always relied on) */
 .content {
   flex: 1;
   width: 100%;
@@ -267,47 +250,6 @@ body {
   left: 100%;
   width: 100vw;
   background: var(--md-sys-color-surface-container-low);
-}
-
-/* left column 相关卡片 (三栏重构, user spec 2026-09-21; card shell dropped
- * 2026-09-27): equal width (three equal columns, capped at the card width),
- * sticky full height minus the 24px breathing gaps. The RelatedPanel inside
- * is now a plain div — background → cards directly (「背景 - 卡片」, no
- * intermediate container).
- * H 形分割线 (user spec 2026-09-27): vertical rules at BOTH ends of the
- * column, meeting the panel header's existing border-bottom (which spans
- * the full column width — no horizontal padding) so the three lines join
- * into an H. Same 1px outline-variant as the right column's border-left,
- * keeping the two side columns visually symmetric around the card. */
-.related-column {
-  flex: 1;
-  min-width: 0;
-  padding: var(--content-pad-v) 0;
-  position: sticky;
-  top: 0;
-  align-self: flex-start;
-  height: calc(100vh - 32px);
-  height: calc(100dvh - 32px);
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--md-sys-color-outline-variant);
-  border-right: 1px solid var(--md-sys-color-outline-variant);
-}
-
-/* three-column mode: all three columns are equal thirds, each capped at the
- * card width (user spec 2026-09-21 「就用现在卡片的那个宽度」) */
-.columns--three .content,
-.columns--three .related-column,
-.columns--three .note-column {
-  flex: 1 1 0;
-  max-width: var(--content-max-width);
-}
-
-/* the note column's border box carries the -24px right margin (full-bleed
- * tint), so its cap grows by the same 24px — the CONTENT width stays equal
- * to the other two thirds */
-.columns--three .note-column {
-  max-width: calc(var(--content-max-width) + var(--content-padding));
 }
 
 @media (max-width: 1179px) {
@@ -639,13 +581,25 @@ body {
 /* respect the OS "reduce motion" preference everywhere the app animates */
 @media (prefers-reduced-motion: reduce) {
   .progress-ring--done,
-  .snackbar {
+  .snackbar,
+  .round-summary {
     animation: none;
   }
   .progress-ring__arc,
   .note-hl {
     transition: none;
   }
+}
+
+/* keyboard focus visibility (P2, 2026-09-27 round 2): the only focus ring
+ * in the app used to be .mode-tile (a retired component). md-* web
+ * components carry their own focus styles; this covers the app's plain
+ * HTML controls (nav-rail buttons, dialog text buttons, list links). */
+button:focus-visible,
+a:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
 }
 
 .progress-area {
@@ -989,6 +943,66 @@ body {
   text-align: center;
 }
 
+/* ---- round summary hero strip (P2, 2026-09-27 round 2) ----
+ * The completion moment: big emphasized numbers instead of a 4s snackbar.
+ * Sits at the top of the start card; entrance is a soft rise (transform +
+ * opacity only — safe on the old ThinkPad's iGPU). */
+.round-summary {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  animation: summary-rise 0.45s cubic-bezier(0.2, 0, 0, 1) both;
+}
+
+@keyframes summary-rise {
+  from { opacity: 0; transform: translateY(12px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.round-summary__hero {
+  display: flex;
+  color: var(--md-sys-color-primary);
+}
+
+.round-summary__title {
+  color: var(--md-sys-color-primary);
+  font-weight: 600;
+}
+
+.round-summary__stats {
+  display: flex;
+  gap: 40px;
+  justify-content: center;
+  margin: 4px 0 8px;
+}
+
+.round-summary__stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.round-summary__num {
+  color: var(--md-sys-color-on-surface);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.round-summary__label {
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.round-summary__sub {
+  color: var(--md-sys-color-outline);
+}
+
+.round-summary md-divider {
+  width: 100%;
+}
+
 /* emphasis inside screen-detail copy (next-day release wording) */
 .screen-detail .em {
   color: var(--md-sys-color-primary);
@@ -1084,28 +1098,6 @@ body {
   color: var(--md-sys-color-on-surface-variant);
   text-align: center;
   line-height: 1.6;
-}
-
-/* keyboard shortcut hints (快捷键可见化, 2026-09-27): Space/1-4/Ctrl+Z
- * already work app-wide — surface them where the round starts. */
-.screen-keys {
-  display: flex;
-  gap: 16px;
-  flex-wrap: wrap;
-  justify-content: center;
-  color: var(--md-sys-color-on-surface-variant);
-}
-
-.screen-keys kbd {
-  display: inline-block;
-  margin-right: 4px;
-  padding: 1px 6px;
-  border: 1px solid var(--md-sys-color-outline-variant);
-  border-bottom-width: 2px;
-  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
-  background: var(--md-sys-color-surface-container-low);
-  font-family: inherit;
-  font-size: 0.9em;
 }
 
 /* ---- pacing-mode selector (two tiers, user spec 2026-09-14) ---- */
@@ -1703,18 +1695,49 @@ body {
   margin: 2px 0;
 }
 
-/* status chips: assist-chip is disabled (display-only), so tint via tokens.
- * active = secondary-container (正在制卡 stands out), done/skipped = muted */
-.reading-status-chip {
-  --md-assist-chip-label-text-color: var(--md-sys-color-on-surface-variant);
+/* info chips (P2 chip-semantics fix, 2026-09-27 round 2): the card headers
+ * used md-assist-chip with `disabled` as a hack for "display-only" — which
+ * paints every status permanently greyed-out (disabled semantics) and can't
+ * carry color meaning. They're now plain styled spans (still pill-shaped per
+ * MD3 chip anatomy: 32px target is for interactive chips; these are
+ * informational labels, height stays compact). */
+.card-chips {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
+
+.info-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.info-chip--new {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+/* status tints: active = secondary-container (正在制卡 stands out),
+ * done = primary-container, held = tertiary-container (informational
+ * "waiting" state, B·二段重推 round 3). Shared by the reading card header
+ * and the reading-list frontier badges. */
 .reading-status-active {
-  --md-assist-chip-label-text-color: var(--md-sys-color-on-secondary-container);
-  --md-assist-chip-container-color: var(--md-sys-color-secondary-container);
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
 }
 .reading-status-done {
-  --md-assist-chip-label-text-color: var(--md-sys-color-on-primary-container);
-  --md-assist-chip-container-color: var(--md-sys-color-primary-container);
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
 }
 
 /* plain-text status badge inside list rows (not an md chip — inline label) */
@@ -1819,7 +1842,16 @@ body {
 .reading-list-item__frontier .reading-status-chip {
   padding: 1px 8px;
   border-radius: var(--md-sys-shape-corner-full, 9999px);
+}
+
+/* untinted frontier statuses keep the neutral container bg (the tinted
+ * ones — active/done/held — get their colors from the status rules) */
+.reading-status-todo,
+.reading-status-skipped,
+.reading-status-background,
+.reading-status-container {
   background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface-variant);
 }
 
 .reading-frontier-done {
@@ -2017,10 +2049,11 @@ body {
 
 /* held-by-preview-gate frontier chip (B·二段重推, round 3): tertiary tint —
  * neither muted (done/skipped) nor urgent (error), it's an informational
- * "waiting" state */
+ * "waiting" state. Plain CSS since the chip-semantics fix (2026-09-27
+ * round 2) — these are spans, not md-assist-chips. */
 .reading-status-held {
-  --md-assist-chip-label-text-color: var(--md-sys-color-on-tertiary-container);
-  --md-assist-chip-container-color: var(--md-sys-color-tertiary-container);
+  background: var(--md-sys-color-tertiary-container);
+  color: var(--md-sys-color-on-tertiary-container);
 }
 
 /* ---- reading list page as a nav-rail section (round 3) ---- */

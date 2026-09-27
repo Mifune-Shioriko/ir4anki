@@ -72,10 +72,10 @@ export const Flashcard: Component<Props> = (props) => {
       <md-elevated-card class="card-container">
         <div class="card-inner">
           <div class="card-header">
-            <md-chip-set class="card-chips" aria-label="卡片信息">
-              <md-assist-chip label={props.card.deckName} disabled />
-              {props.card.isNew && <md-assist-chip label="新卡" disabled />}
-            </md-chip-set>
+            <div class="card-chips" aria-label="卡片信息">
+              <span class="info-chip md-typescale-label-small">{props.card.deckName}</span>
+              {props.card.isNew && <span class="info-chip info-chip--new md-typescale-label-small">新卡</span>}
+            </div>
             <div class="card-header-actions">
               <md-icon-button
                 aria-label="撤销上次作答"

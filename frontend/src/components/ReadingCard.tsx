@@ -111,19 +111,19 @@ export const ReadingCard: Component<Props> = (props) => {
       <md-elevated-card class="card-container">
         <div class="card-inner">
           <div class="card-header">
-            <md-chip-set class="card-chips" aria-label="片段信息">
+            <div class="card-chips" aria-label="片段信息">
               {trace() && (
-                <md-assist-chip label="溯源 · 来源片段" disabled />
+                <span class="info-chip md-typescale-label-small">溯源 · 来源片段</span>
               )}
-              <md-assist-chip
-                label={STATUS_LABEL[props.chunk.status] ?? props.chunk.status}
-                class={`reading-status-chip reading-status-${props.chunk.status}`}
-                disabled
-              />
+              <span
+                class={`info-chip reading-status-chip reading-status-${props.chunk.status} md-typescale-label-small`}
+              >
+                {STATUS_LABEL[props.chunk.status] ?? props.chunk.status}
+              </span>
               <Show when={!trace() && props.chunk.file_chunks > 0}>
-                <md-assist-chip label={`本文件进度 ${fileProgress()}`} disabled />
+                <span class="info-chip md-typescale-label-small">本文件进度 {fileProgress()}</span>
               </Show>
-            </md-chip-set>
+            </div>
             <div class="card-header-actions">
               <md-icon-button
                 aria-label="添加卡片"

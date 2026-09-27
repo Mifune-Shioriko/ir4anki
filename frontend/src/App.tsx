@@ -16,31 +16,26 @@ import { ClozeDialog } from './components/ClozeDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { Loading } from './components/Loading'
 import { ReadingCard } from './components/ReadingCard'
-import { ReadingPanel } from './components/ReadingPanel'
 import { ReadingListScreen } from './components/ReadingListScreen'
-import { NotePanel } from './components/NotePanel'
-import { RelatedPanel } from './components/RelatedPanel'
 import { SidePanelTabs } from './components/SidePanelTabs'
 import { SegEditDialog } from './components/SegEditDialog'
 import { invalidateFileCache } from './components/FileViewer'
 import { Snackbar } from './components/Snackbar'
-import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingSource } from './types'
+import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingSource, ReadingRoundStats } from './types'
+import type { RoundSummary } from './types'
 import type { SplitSelection } from './lib/split-selection'
+import { WIDE_QUERY } from './lib/breakpoints'
 
 // The note panel (知识成体系 Phase 1) only makes sense on a wide screen —
-// the user reviews from phone AND desktop, and on a phone the second column
-// would crush the card. A matchMedia signal (not CSS alone) also stops the
-// sections fetch from firing on narrow viewports.
-const WIDE_QUERY = '(min-width: 1180px)'
-// 三栏重构 (user spec 2026-09-21): the LEFT column (相关卡片 = same-segment
-// cards, exact provenance) needs a third column. The original spec kept
-// every column at the FULL card width (680px → 2216px breakpoint), but the
-// user's display is 1920×1200 (report 2026-09-22) and 3×680 doesn't fit.
-// Lowered to 1500px: above it the three columns share the viewport as equal
-// flexible thirds (CSS .columns--three is flex 1 1 0, capped at 680px) —
-// ≈581px each on a 1920 screen. Below: 1180–1499 = 中+右 two columns,
-// <1180 = phone single column.
-const WIDE3_QUERY = '(min-width: 1500px)'
+// below it the second column would crush the card. A matchMedia signal (not
+// CSS alone) also stops the sections fetch from firing on narrow viewports.
+// 统一双栏 (user spec 2026-09-27 round 2): the three-column path (WIDE3 =
+// 1500px, dedicated 相关卡片 left column) is RETIRED — at every desktop
+// width the layout is 卡片 + 右栏(笔记/相关卡片 tabs, SidePanelTabs). The
+// third column only ever rendered on the 1920 main display while the
+// 1280×800 study machine silently lost the feature; one layout everywhere.
+// Breakpoint value lives in lib/breakpoints.ts (single source, mirrors
+// index.css media queries).
 
 // Pacing tiers retired (user spec 2026-09-24): one daily flow, no mode
 // choice, no persisted selection. (The old MODE_STORAGE_KEY localStorage
@@ -115,16 +110,11 @@ export const App: Component = () => {
   const mq = window.matchMedia(WIDE_QUERY)
   const [isWide, setIsWide] = createSignal(mq.matches)
   const onMq = (e: MediaQueryListEvent) => setIsWide(e.matches)
-  const mq3 = window.matchMedia(WIDE3_QUERY)
-  const [isWide3, setIsWide3] = createSignal(mq3.matches)
-  const onMq3 = (e: MediaQueryListEvent) => setIsWide3(e.matches)
   onMount(() => {
     mq.addEventListener('change', onMq)
-    mq3.addEventListener('change', onMq3)
   })
   onCleanup(() => {
     mq.removeEventListener('change', onMq)
-    mq3.removeEventListener('change', onMq3)
   })
 
   // ---- phase & loading text ----
@@ -184,6 +174,9 @@ export const App: Component = () => {
   // counters died with the DoneScreen (2026-09-24).
   const [, setBatchNewTotal] = createSignal(0)
   const [, setBatchReviewTotal] = createSignal(0)
+  // new cards answered THIS round (round-summary hero, 2026-09-27 round 2) —
+  // incremented in answer() when the card was new, decremented on undo
+  const [newAnswered, setNewAnswered] = createSignal(0)
 
   // ---- undo ----
   // Availability mirrors the backend's single undo slot (round.json "last"):
@@ -235,8 +228,13 @@ export const App: Component = () => {
   const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
   const [rdDone, setRdDone] = createSignal(0)
   const [rdTotal, setRdTotal] = createSignal(0)
-  const [, setRdStats] = createSignal({})
+  const [rdStats, setRdStats] = createSignal<ReadingRoundStats>({})
   const [rdBusy, setRdBusy] = createSignal(false)
+  // ---- round summary (hero moment, P2 2026-09-27 round 2) ----
+  // When the daily chain lands back on the start screen, it shows what the
+  // round just accomplished (阅读 N 段 · 复习 N 张) instead of a 4-second
+  // snackbar that's easy to miss. Cleared when a new round begins.
+  const [roundSummary, setRoundSummary] = createSignal<RoundSummary | null>(null)
   // which chunk the add dialog is open FOR (provenance link); null = plain add
   const [addSource, setAddSource] = createSignal<{ path: string; chunk_key: string } | null>(null)
   const rdCurrent = () => rdChunks()[0] ?? null
@@ -575,7 +573,15 @@ export const App: Component = () => {
         // nothing left anywhere — the chain ends here
         await api.finish().catch(() => {})
         setPhase('start')
-        showSnack('本轮完成 🎉 没有更多卡片了')
+        // hero summary only when a stage actually ran (reading counts);
+        // an empty 开始 click gets a plain snackbar instead
+        const rs = rdStats()
+        if ((rs.done ?? 0) + (rs.skipped ?? 0) > 0) {
+          setRoundSummary({ readingDone: rs.done ?? 0, readingSkipped: rs.skipped, reviewed: 0 })
+        } else {
+          showSnack('没有更多卡片了')
+        }
+        setRdStats({})
         await resync()
         return
       }
@@ -589,6 +595,7 @@ export const App: Component = () => {
 
   // the single 开始 button: first stage with content wins
   const beginFlow = async () => {
+    setRoundSummary(null) // fresh round — the summary strip belongs to the last one
     if (readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
       await startReadingStage()
     } else {
@@ -604,15 +611,27 @@ export const App: Component = () => {
   }
   const chainAfterReview = async () => {
     // local batch is already drained; clear it and sync the day's progress
+    const reviewed = totalDone()
+    const stats = rdStats()
     setCards([])
     setIdx(0)
     setRevealedFor(null)
     setCanUndo(false)
+    // hero moment (2026-09-27 round 2): the start screen shows what the
+    // round just did. Reading numbers come from the round stats the backend
+    // returned on each rdAct; review count from this session's answers.
+    setRoundSummary({
+      readingDone: stats.done ?? (rdTotal() > 0 ? rdDone() : 0),
+      readingSkipped: stats.skipped,
+      reviewed,
+      newReviewed: newAnswered(),
+    })
+    setNewAnswered(0)
+    setRdStats({})
     setPhase('loading')
     setLoadText('正在同步…')
     await api.finish().catch(() => {})
     setPhase('start')
-    showSnack('本轮完成 🎉')
     await resync()
   }
 
@@ -636,6 +655,7 @@ export const App: Component = () => {
       // drifted while the request was in flight.
       setCards(prev => prev.filter(c => c.cardId !== card.cardId))
       setTotalDone(totalDone() + 1)
+      if (card.isNew) setNewAnswered(v => v + 1) // round-summary hero
       // idx now naturally points at the next card (or past the end)
 
       // backend now holds an undo slot for this answer — no time limit
@@ -670,6 +690,7 @@ export const App: Component = () => {
       })
       setIdx(Math.min(d.index, cards().length - 1))
       setTotalDone(v => Math.max(0, v - 1))
+      if (d.card?.isNew) setNewAnswered(v => Math.max(0, v - 1)) // round-summary hero
       setRevealedFor(null)
       setCanUndo(false) // the single undo slot is consumed
     } catch (e) {
@@ -1076,38 +1097,13 @@ export const App: Component = () => {
           which is why start screens used to misalign). */}
 
       {/* columns--solo: no card on screen (start/loading/finished) → the side
-          columns don't render; center the lone .content column (2026-09-26) */}
+          column doesn't render; center the lone .content column (2026-09-26) */}
       <div
         class="columns"
         classList={{
-          'columns--three': isWide3() && centerOccupied(),
           'columns--solo': !centerOccupied(),
         }}
       >
-      {/* left column 相关卡片 (三栏重构, user spec 2026-09-21): cards made
-          from the SAME note segment (exact provenance — anki-rag similarity
-          is retired). Reading round / trace detour → the chunk's own cards
-          (+ pre-split ancestors); review/preview → the revealed card's note,
-          resolved via /api/reading/source (orphan = 无来源 empty state).
-          Same reveal gate as the right NotePanel (a face-down card must not
-          leak which segment — and therefore which answer — is on screen). */}
-      <Show when={isWide3() && centerOccupied()}>
-        <div class="related-column">
-          <Show
-            when={leftChunk()}
-            fallback={
-              <RelatedPanel
-                noteId={noteCard()?.noteId ?? null}
-                cardKey={noteCard()?.cardId ?? null}
-                blocked={noteBlocked()}
-                refreshToken={relatedToken()}
-              />
-            }
-          >
-            <RelatedPanel chunk={leftChunk()!} refreshToken={relatedToken()} />
-          </Show>
-        </div>
-      </Show>
       <div class="content">
         <Show when={phase() === 'loading'}>
           <Loading
@@ -1168,6 +1164,7 @@ export const App: Component = () => {
             readingAvailable={readingMode() ? readingAvailable() : 0}
             studyModes={studyModes()}
             mode={selectedMode()}
+            roundSummary={roundSummary()}
           />
         </Show>
 
@@ -1193,47 +1190,25 @@ export const App: Component = () => {
         </Show>
       </div>
 
-      {/* right-hand note panel (知识成体系 Phase 1): wide screens only, and
-          only while a card is actually on screen (review round).
-          During a reading round — or a 溯源 detour (2026-09-21) — the
-          column switches to ReadingPanel: the whole source file anchored at
-          the current chunk (user spec 2026-09-19 — 中栏只展示 chunk，右边
-          回溯整个笔记看上下文). */}
-      {/* Gated on centerOccupied() like the left column (user request
-          2026-09-22): start/done/empty screens stay single-column — the
-          idle 笔记来源 placeholder box used to render here and clutter the
-          开始学习 page. */}
+      {/* right-hand side column (知识成体系 Phase 1): wide screens only, and
+          only while a card is actually on screen. 统一双栏 (user spec
+          2026-09-27 round 2): SidePanelTabs at EVERY desktop width — the
+          笔记 tab swaps between NotePanel (review) and ReadingPanel (reading
+          round / 溯源 detour: the whole source file anchored at the current
+          chunk, user spec 2026-09-19), and 相关卡片 lives in its own tab. */}
+      {/* Gated on centerOccupied() (user request 2026-09-22): start/done/
+          empty screens stay single-column — the idle 笔记来源 placeholder
+          box used to render here and clutter the 开始学习 page. */}
       <Show when={isWide() && centerOccupied()}>
         <div class="note-column">
-          {/* two-column band (1180–1499): 相关卡片 lives in a TAB of this
-              column (its own left column only exists ≥1500px — a third
-              column at 1280 would be ~368px, too narrow to read) */}
-          <Show
-            when={!isWide3()}
-            fallback={
-              <Show
-                when={leftChunk()}
-                fallback={
-                  <NotePanel
-                    noteId={noteCard()?.noteId}
-                    cardKey={noteCard()?.cardId ?? null}
-                    blocked={noteBlocked()}
-                  />
-                }
-              >
-                <ReadingPanel chunk={leftChunk()!} reloadToken={noteReloadToken()} />
-              </Show>
-            }
-          >
-            <SidePanelTabs
-              chunk={leftChunk()}
-              noteId={noteCard()?.noteId ?? null}
-              cardKey={noteCard()?.cardId ?? null}
-              blocked={noteBlocked()}
-              refreshToken={relatedToken()}
-              noteReloadToken={noteReloadToken()}
-            />
-          </Show>
+          <SidePanelTabs
+            chunk={leftChunk()}
+            noteId={noteCard()?.noteId ?? null}
+            cardKey={noteCard()?.cardId ?? null}
+            blocked={noteBlocked()}
+            refreshToken={relatedToken()}
+            noteReloadToken={noteReloadToken()}
+          />
         </div>
       </Show>
       </div>{/* /columns */}

@@ -4,13 +4,11 @@ import { ReadingPanel } from './ReadingPanel'
 import { RelatedPanel } from './RelatedPanel'
 import type { ReadingChunk } from '../types'
 
-// Right-column tabs (2026-09-27 桌面重设计): in the TWO-column band
-// (1180–1499px — e.g. a 1280-wide window) the old separate 相关卡片 left
-// column never renders (WIDE3 is 1500px), so its content was invisible on
-// mid-size desktops. Instead of a third column (≈368px each at 1280 — too
-// narrow to read), the right column gets 笔记 / 相关卡片 tabs. At ≥1500px
-// the three-column layout keeps its dedicated left column and this
-// component is not used.
+// Right-column tabs (2026-09-27 桌面重设计): THE side column, at every
+// desktop width (统一双栏, user spec 2026-09-27 round 2 — the separate
+// 相关卡片 left column and its 1500px breakpoint are retired). 相关卡片
+// (cards made from the SAME note segment) gets its own tab next to 笔记, so
+// nothing is width-gated into invisibility anymore.
 //
 // Both panes stay MOUNTED (display:none swap) so switching tabs doesn't
 // refetch or lose scroll position. The reveal gate lives in the props App

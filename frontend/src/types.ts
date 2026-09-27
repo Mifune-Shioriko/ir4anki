@@ -241,6 +241,19 @@ export interface ReadingRoundStats {
   next?: number
 }
 
+/** What the last completed round accomplished — rendered as the start
+ *  screen's summary strip (hero moment, 2026-09-27 round 2). */
+export interface RoundSummary {
+  /** reading chunks marked done this round */
+  readingDone?: number
+  /** reading chunks skipped */
+  readingSkipped?: number
+  /** review cards answered this round */
+  reviewed?: number
+  /** of those, how many were new cards */
+  newReviewed?: number
+}
+
 /** One card created from a reading chunk (/api/reading/cards). */
 export interface ReadingCreatedCard {
   noteId: number
