@@ -19,9 +19,11 @@ import type { ReadingChunk, ReadingCreatedCard } from '../types'
 //                    crumb's (same pre-split rule); 404 = 无来源 orphan
 // The current card (review/preview mode) is highlighted in the list.
 //
-// Shell (2026-09-27): plain flat div — the md-elevated-card container is
-// gone, cards sit DIRECTLY on the column background (「背景 - 卡片」), with
-// the header pinned at the top-left (user spec).
+// Shell (2026-09-27, header row deleted 2026-09-29): plain flat div — the
+// md-elevated-card container is gone, cards sit DIRECTLY on the column
+// background (「背景 - 卡片」), and the panel starts straight with the state
+// rows / list (the old 本片段已制卡片 + N 张 header just duplicated the tab
+// label above it).
 //
 // Fail-soft like every enrichment panel: dead backend → count line only.
 
@@ -157,17 +159,10 @@ export const RelatedPanel: Component<Props> = (props) => {
     return back ? cleanCardHtml(back) : ''
   }
 
-  const title = () => (props.chunk ? '本片段已制卡片' : '相关卡片')
-
   return (
     <div class="note-panel related-panel">
-      <div class="note-panel-header">
-        <span class="note-panel-title md-typescale-title-small">{title()}</span>
-        <Show when={count() != null && (count() ?? 0) > 0}>
-          <span class="note-panel-score md-typescale-label-small">{count()} 张</span>
-        </Show>
-      </div>
-
+      {/* the header row (title + N 张 count) is gone (user spec 2026-09-29)
+          — the tab label already says 相关卡片 */}
         <Show when={status() === 'loading'}>
           <div class="note-panel-state">
             <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />

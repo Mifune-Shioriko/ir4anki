@@ -89,15 +89,6 @@ export const NotePanel: Component<Props> = (props) => {
 
   return (
     <div class="note-panel">
-      <div class="note-panel-header">
-        <span class="note-panel-title md-typescale-title-small">笔记</span>
-        <Show when={status() === 'ready' && source()?.stale}>
-          <span class="note-panel-score md-typescale-label-small" title="源文件被外部编辑过，片段按指纹重锚失败，范围可能不精确">
-            来源已过期
-          </span>
-        </Show>
-      </div>
-
       <Show when={status() === 'loading'}>
         <div class="note-panel-state">
           <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />
@@ -137,6 +128,16 @@ export const NotePanel: Component<Props> = (props) => {
 
       <Show when={status() === 'ready' && source()}>
         <div class="note-crumb md-typescale-label-small">{crumb()}</div>
+        {/* the header row is gone (user spec 2026-09-29) — the stale flag
+            rides above the body as a small warning chip instead */}
+        <Show when={source()?.stale}>
+          <span
+            class="note-stale-chip md-typescale-label-small"
+            title="源文件被外部编辑过，片段按指纹重锚失败，范围可能不精确"
+          >
+            来源已过期
+          </span>
+        </Show>
         <FileViewer
           path={source()!.path}
           anchorLine={source()!.line_start}

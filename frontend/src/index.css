@@ -223,33 +223,20 @@ body {
   position: sticky;
   top: 0;
   align-self: flex-start;
-  /* full-bleed sidebar (user spec 2026-09-27): no card shell anymore — the
-   * column IS the surface. Its own tint (surface-container-low) separates it
-   * from the page background, a 1px solid outline-variant border-left is the
-   * divider against the center column, and the box stretches the full
-   * viewport height. The negative right margin cancels .columns' right
-   * padding so the tint reaches the screen's right edge; ::after covers the
-   * remainder on ultra-wide screens where .columns' max-width leaves dead
-   * space (.app-shell clips it with overflow-x: clip — clip, not hidden, so
-   * sticky positioning keeps working). */
+  /* Bounded sidebar (user spec 2026-09-29): no card shell — the column IS
+   * the surface, but its tint now stays BETWEEN two 1px outline-variant
+   * dividers instead of bleeding to the viewport's right edge (the old
+   * full-bleed used a negative right margin + a ::after patch; both are
+   * gone). Outside the right divider is plain page background. The box
+   * still stretches the full viewport height. */
   height: 100vh;
   height: 100dvh;
   display: flex;
   flex-direction: column;
   padding: var(--content-pad-v) 0;
-  margin-right: calc(-1 * var(--content-padding));
   background: var(--md-sys-color-surface-container-low);
   border-left: 1px solid var(--md-sys-color-outline-variant);
-}
-
-.note-column::after {
-  content: '';
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 100%;
-  width: 100vw;
-  background: var(--md-sys-color-surface-container-low);
+  border-right: 1px solid var(--md-sys-color-outline-variant);
 }
 
 @media (max-width: 1179px) {
@@ -275,13 +262,16 @@ body {
 /* ---- note panel (flat, user spec 2026-09-27) ----
  * The md-elevated-card shell is GONE: both side panels are plain divs
  * sitting directly on their column — the right one on its own
- * surface-container-low tint (「背景 - 文字」, tint + border-left divider
- * live on .note-column), the left one on the page background where the
- * .related-item boxes are the only cards left (「背景 - 卡片」). The old
+ * surface-container-low tint (「背景 - 文字」, tint + border-left/right
+ * dividers live on .note-column), the left one on the page background where
+ * the .related-item boxes are the only cards left (「背景 - 卡片」). The old
  * absolute-positioned .note-panel-inner scroll layer (needed because the
  * card host couldn't take part in a flex height chain) died with the card:
  * .note-panel is a real flex column and .note-body / .related-list scroll
- * inside it directly. */
+ * inside it directly.
+ * The .note-panel-header title row (笔记 / 本片段已制卡片 + N 张) is also
+ * GONE (user spec 2026-09-29) — it just duplicated the tab label above it;
+ * the breadcrumb (.note-crumb) is now the first row under the tabs. */
 .note-panel {
   flex: 1;
   min-height: 0;
@@ -289,22 +279,16 @@ body {
   flex-direction: column;
 }
 
-.note-panel-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 12px 20px;
-  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+/* stale-source warning (was part of the deleted header row): small
+ * error-container chip floating above the body's top-right */
+.note-stale-chip {
+  align-self: flex-end;
+  margin: 6px 20px 0;
+  padding: 2px 10px;
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
   flex: 0 0 auto;
-}
-
-.note-panel-title {
-  color: var(--md-sys-color-on-surface);
-}
-
-.note-panel-score {
-  color: var(--md-sys-color-on-surface-variant);
 }
 
 .note-panel-state {
@@ -637,14 +621,23 @@ a:focus-visible,
 .card-container {
   width: 100%;
   /* Expressive shape contrast (2026-09-27): the hero card gets the large
-   * corner; small inner elements (chips, code, keycaps) stay small. */
+   * corner; small inner elements (chips, code, keycaps) stay small.
+   * 2026-09-29 (user spec): top corners SQUARE, bottom corners large —
+   * the stage color bar sits flush on the square top edge and reads as
+   * part of the frame. The shadow-DOM layers (.background, .outline,
+   * md-elevation, slot) all `border-radius: inherit`, so overriding the
+   * host cascades to them. */
   --md-elevated-card-container-shape: var(--md-sys-shape-corner-large, 16px);
+  border-radius: 0 0 var(--md-sys-shape-corner-large, 16px)
+    var(--md-sys-shape-corner-large, 16px);
 }
 
 /* stage color coding (2026-09-27): the daily chain has no intermediate
  * pages, so the card shell itself says which stage you're in — review =
  * primary, reading = tertiary. The bar is a host ::before (z-index 1)
- * because the card's internal .background layer paints over host borders. */
+ * because the card's internal .background layer paints over host borders.
+ * Square top corners (2026-09-29) → no radius on the bar; it merges with
+ * the card's top edge. */
 .stage-review .card-container::before,
 .stage-reading .card-container::before {
   content: '';
@@ -654,8 +647,6 @@ a:focus-visible,
   right: 0;
   height: 3px;
   z-index: 1;
-  border-radius: var(--md-sys-shape-corner-large, 16px)
-    var(--md-sys-shape-corner-large, 16px) 0 0;
 }
 
 .stage-review .card-container::before {

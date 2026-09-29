@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Verify the flat side-panel redesign (user spec 2026-09-27).
+"""Verify the flat side-panel redesign (user spec 2026-09-27, updated for
+the 2026-09-29 bounded-sidebar + no-header-row pass).
 
 Spawns a throwaway uvicorn on :8905 (isolated ANKI_STATE_DIR + temp corpus,
 dead AnkiConnect) serving the REAL frontend/dist build, then drives it with
@@ -9,14 +10,15 @@ Playwright at 1920x1200 dark mode (the user's display) and asserts:
     1. no md-elevated-card shell inside .note-column
     2. .note-column bg == surface-container-low (dark #1d1b20)
        != page bg (dark surface #141218)
-    3. border-left == 1px solid outline-variant (#49454f) — the divider
-    4. tint reaches the viewport right edge
+    3. border-left AND border-right == 1px solid outline-variant (#49454f)
+    4. tint stays BETWEEN the two dividers — the pixel just outside the
+       right divider is page bg, and no ::after full-bleed patch exists
     5. full viewport height (100vh)
-    6. header title == 笔记 (reading mode too — unified)
+    6. no .note-panel-header / .note-panel-title row anywhere (deleted
+       2026-09-29 — the tab label is the only title)
     7. two tabs; the 相关卡片 tab mounts the RelatedPanel (no separate
        .related-column — the three-column layout is retired)
     8. .related-list .similar-item bg == surface-container-high (#2b2930)
-    9. header title == 本片段已制卡片 (reading mode keeps dynamic title)
 
 Run: backend/.venv/bin/python scripts/flat_panels_ui_test.py
 """
@@ -166,41 +168,64 @@ def run():
               body_bg == "rgb(20, 18, 24)", body_bg)
 
         bl = col.evaluate("el => { const s = getComputedStyle(el);"
-                          " return [s.borderLeftWidth, s.borderLeftStyle, s.borderLeftColor]; }")
+                          " return [s.borderLeftWidth, s.borderLeftStyle, s.borderLeftColor,"
+                          " s.borderRightWidth, s.borderRightStyle, s.borderRightColor]; }")
         check("R3 border-left 1px solid outline-variant #49454f",
               bl[0] == "1px" and bl[1] == "solid" and bl[2] == "rgb(73, 69, 79)", bl)
+        check("R3b border-right 1px solid outline-variant #49454f (2026-09-29)",
+              bl[3] == "1px" and bl[4] == "solid" and bl[5] == "rgb(73, 69, 79)", bl)
 
         col_box = col.bounding_box()
-        # 统一双栏 (2026-09-27 round 2): .columns is capped at
-        # content(620)+side(560)+gaps, so on a 1920 viewport the column's
-        # BORDER BOX no longer reaches the right edge — the ::after paints
-        # the dead space with the same tint (that's exactly what it's for).
-        # The visual requirement is unchanged: tint covers to the edge.
-        edge_bg = page.evaluate("""() => {
-            const el = document.elementFromPoint(1918, 600);
-            return el ? getComputedStyle(el).backgroundColor : 'none';
-        }""")
-        check("R4 tint reaches viewport right edge (column box or ::after)",
-              abs((col_box["x"] + col_box["width"]) - 1920) <= 2
-              or edge_bg == "rgb(29, 27, 32)",
-              f"right edge at {col_box['x'] + col_box['width']}, pixel bg {edge_bg}")
-        after_paints = page.evaluate("""() => {
+        # 2026-09-29 bounded sidebar: the tint must STOP at the column's
+        # right divider — the old full-bleed (negative margin + ::after
+        # patch reaching the viewport edge) is gone.
+        right_edge = col_box["x"] + col_box["width"]
+        outside_bg = page.evaluate("""(x) => {
+            const el = document.elementFromPoint(x, 600);
+            let bg = 'none', node = el;
+            while (node && node !== document.documentElement) {
+                const c = getComputedStyle(node).backgroundColor;
+                if (c && c !== 'rgba(0, 0, 0, 0)') { bg = c; break; }
+                node = node.parentElement;
+            }
+            return bg;
+        }""", min(right_edge + 6, 1918))
+        check("R4 pixel just outside the right divider is page bg #141218",
+              outside_bg == "rgb(20, 18, 24)",
+              f"right edge at {right_edge}, outside bg {outside_bg}")
+        check("R4b column does NOT bleed to the viewport right edge",
+              right_edge < 1920 - 4, right_edge)
+        after_content = page.evaluate("""() => {
             const col = document.querySelector('.note-column');
-            const s = getComputedStyle(col, '::after');
-            return [s.backgroundColor, s.position];
+            return getComputedStyle(col, '::after').content;
         }""")
-        check("R4b ::after paints container-low tint (absolute)",
-              after_paints[0] == "rgb(29, 27, 32)" and after_paints[1] == "absolute",
-              after_paints)
-        check("R4c pixel at right edge shows tint or panel content",
-              edge_bg in ("rgb(29, 27, 32)",) or edge_bg != "rgb(20, 18, 24)", edge_bg)
+        check("R4c no ::after full-bleed patch (content: none)",
+              after_content == "none", after_content)
+        inside_bg = page.evaluate("""(x) => {
+            const el = document.elementFromPoint(x, 600);
+            let bg = 'none', node = el;
+            while (node && node !== document.documentElement) {
+                const c = getComputedStyle(node).backgroundColor;
+                if (c && c !== 'rgba(0, 0, 0, 0)') { bg = c; break; }
+                node = node.parentElement;
+            }
+            return bg;
+        }""", right_edge - 6)
+        check("R4d pixel just inside the right divider shows the tint",
+              inside_bg == "rgb(29, 27, 32)", inside_bg)
 
         check("R5 note column is full viewport height",
               abs(col_box["height"] - 1200) <= 2, col_box["height"])
         check("R5b column starts at viewport top", col_box["y"] == 0, col_box["y"])
 
-        title = page.locator(".note-column .note-panel-title").first.inner_text()
-        check("R6 header title == 笔记", title == "笔记", title)
+        title_rows = page.locator(".note-column .note-panel-header").count()
+        check("R6 header title row deleted (2026-09-29)", title_rows == 0,
+              title_rows)
+        check("R6b no .note-panel-title anywhere",
+              page.locator(".note-panel-title").count() == 0)
+        crumb = page.locator(".note-column .note-crumb").first
+        check("R6c breadcrumb is the first row under the tabs",
+              crumb.count() == 1 and crumb.is_visible())
 
         # ---- 相关卡片 tab: same flat treatment inside the note column ----
         tabs = page.locator(".note-column md-primary-tab")
@@ -215,9 +240,8 @@ def run():
         check("L1b no card shell around related panel items",
               cards_in_related == 0, cards_in_related)
 
-        rel_title = page.locator(".note-column .related-panel .note-panel-title").first.inner_text()
-        check("L3 reading-mode header == 本片段已制卡片",
-              rel_title == "本片段已制卡片", rel_title)
+        check("L3 related panel has no header row either",
+              page.locator(".note-column .related-panel .note-panel-header").count() == 0)
 
         # the empty state (no cards made yet) is fine — assert item styling
         # via a DOM probe the same way reading_cards_ui_test does

@@ -27,9 +27,6 @@ export const ReadingPanel: Component<Props> = (props) => {
 
   return (
     <div class="note-panel">
-      <div class="note-panel-header">
-        <span class="note-panel-title md-typescale-title-small">笔记</span>
-      </div>
       <div class="note-crumb md-typescale-label-small">{crumb()}</div>
       <FileViewer
         path={props.chunk.path}
