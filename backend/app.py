@@ -34,13 +34,15 @@ Session model (single daily flow, user spec 2026-09-24 + 2026-09-27):
     resurfaces first every round. Files are opt-in via the 阅读清单
     (manual priority). State: state/reading.db (SQLite).
 
-    Reading gate (user spec 2026-09-19 round 3): a segment whose created
-    cards have NOT all left the preview pool yet (still in 预览池 or still
-    suspended = not truly released) is HELD — it is not dealt and blocks
-    its file's frontier until every one of its cards is thawed. With the
-    2026-09-27 auto-release this means: cards made today hold their segment
-    overnight and the frontier unlocks the next day, exactly when the cards
-    become gradeable. Segments without cards are never gated. AnkiConnect
+    Reading gate (user spec 2026-09-19 round 3; SEGMENT-LEVEL since the
+    2026-09-29 option-B ruling): a segment whose created cards have NOT all
+    left the preview pool yet (still in 预览池 or still suspended = not truly
+    released) is HELD — it is not re-dealt until every one of its cards is
+    thawed, but it NO LONGER blocks its file: the frontier skips over it and
+    later segments keep dealing normally. With the 2026-09-27 auto-release
+    this means: cards made today hold THEIR OWN segment overnight (no
+    same-day re-deal = no recognition-not-recall grading), while the rest of
+    the file flows on. Segments without cards are never gated. AnkiConnect
     errors fail OPEN (reading must never be blocked by a dead backend).
 """
 import asyncio
@@ -220,7 +222,9 @@ PREVIEW_FILE = STATE_DIR / "preview.json"  # legacy round state; no longer writt
 # gets a full round instead of exactly one chunk. Within a file, chunks
 # before the frontier are done/skipped by definition; done/skipped chunks
 # are never dealt. An `active` chunk IS dealable, so it automatically
-# resurfaces every round until the user marks it done/skipped.
+# resurfaces every round until the user marks it done/skipped. A GATED
+# chunk (preview-pool hold) is skipped by every phase but does NOT lock the
+# rest of its file (segment-level gate, option B 2026-09-29).
 #
 # 开始制卡 is GONE from the UI (2026-09-19 round 2): chunks auto-mark
 # `active` when a card or cloze is created from them (_reading_record_card).
@@ -1778,10 +1782,11 @@ def _file_view(entry: dict, gated: set | None = None):
     segments on external drift; caller persists.
 
     `gated` = set of (path, key) pairs whose created cards have not all
-    left the preview pool yet (user spec 2026-09-19 round 3, B·二段重推):
-    a gated segment is NOT the frontier — it blocks its file (later
-    segments stay locked behind it) and is excluded from dealing until its
-    cards are truly released (out of 预览池 AND unsuspended).
+    left the preview pool yet (user spec 2026-09-19 round 3, B·二段重推;
+    segment-level since the 2026-09-29 option-B ruling): a gated segment is
+    skipped by the frontier search and excluded from dealing until its cards
+    are truly released (out of 预览池 AND unsuspended) — but it does NOT
+    block its file; later segments deal normally.
     """
     gated = gated or set()
     path = entry.get("path", "")
@@ -1837,6 +1842,7 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
             "background": 0,
             "frontier": None,
             "gated": 0,
+            "gated_active": 0,
             "gated_frontier": None,
             "cards_created": 0,
         }
@@ -1844,6 +1850,7 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     cards = 0
     frontier = None
     gated_count = 0
+    gated_active = 0
     gated_frontier = None
     blocked = base["needs_resync"]  # a flagged file deals nothing
     for ch, key, st in ordered:
@@ -1857,17 +1864,22 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
         is_gated = (path, key) in gated
         if is_gated:
             gated_count += 1
+            if s == "active":
+                gated_active += 1
+            # option B (2026-09-29): a gated segment is SKIPPED, not a
+            # blocker — the frontier search continues past it and later
+            # segments deal normally. gated_frontier keeps the FIRST held
+            # segment for display (list chip when nothing else is dealable).
+            if gated_frontier is None and not blocked:
+                gated_frontier = {
+                    "chunk_key": key,
+                    "status": s,
+                    "title": ch.get("title") or Path(path).stem,
+                    "line_start": ch["line_start"],
+                }
+            continue
         if frontier is not None or blocked:
             continue  # frontier already found / file already held
-        if is_gated:
-            blocked = True
-            gated_frontier = {
-                "chunk_key": key,
-                "status": s,
-                "title": ch.get("title") or Path(path).stem,
-                "line_start": ch["line_start"],
-            }
-            continue  # held: later chunks stay locked behind it
         frontier = {
             "chunk_key": key,
             "status": s,
@@ -1881,6 +1893,7 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
         **counts,
         "frontier": frontier,
         "gated": gated_count,
+        "gated_active": gated_active,
         "gated_frontier": gated_frontier,
         "cards_created": cards,
     }
@@ -2402,17 +2415,23 @@ def _find_entry(data: dict, path: str) -> dict | None:
 async def _reading_gates(data: dict) -> set[tuple[str, str]]:
     """(path, chunk_key) pairs currently HELD by the preview-pool gate.
 
-    B·二段重推 (user spec 2026-09-19 round 3): a chunk whose created cards
-    have not ALL left the preview pipeline is not re-dealt, and it blocks
-    its file's frontier until they have. 「过了预览池」= truly thawed:
+    B·二段重推 (user spec 2026-09-19 round 3; SEGMENT-LEVEL since the
+    2026-09-29 option-B ruling): a chunk whose created cards have not ALL
+    left the preview pipeline is not re-dealt until they have — but it no
+    longer blocks its file; the frontier search skips over it and later
+    segments deal normally. 「过了预览池」= truly thawed:
     NOT in 预览池 AND NOT suspended — a card made today sits suspended in
     the pool all day (auto_release_pool only moves cards created on an
-    EARLIER Anki day), so the frontier unlocks exactly when the card
-    becomes a gradeable new card the next day. This is the pacing spine of
-    the 2026-09-27 flow: 今天制卡 → 押住片段过夜 → 明天放行 → frontier 解锁。
+    EARLIER Anki day), so the segment unlocks exactly when the card
+    becomes a gradeable new card the next day. Segment-level hold (option
+    B, 2026-09-29): 今天制卡 → 押住「这个片段」过夜（当天不重发，避免
+    recognition-not-recall）→ 明天放行 → 片段重新可发；文件其余部分照常
+    推进，不被押住的片段连坐。
 
-    Only each file's frontier chunk is checked (a deeper chunk can't be
-    dealt while the frontier stands, so gating it would be dead work).
+    Every LIVE segment with cards_created is checked (not just each file's
+    frontier — depth dealing can hand out a deeper segment while an earlier
+    todo one still stands, and the gate is segment-level since the
+    2026-09-29 option-B ruling: a held segment never blocks its file).
     Notes that no longer exist (user deleted the card) never hold —
     a chunk must not be gated forever by a deleted note. AnkiConnect
     errors fail OPEN (empty set): reading is never blocked by a dead
@@ -2493,8 +2512,9 @@ def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[
          focus=5) instead of exactly one chunk.
     Done/skipped chunks are never dealt. GATED chunks (cards still inside
     the preview pipeline — B·二段重推, 2026-09-19 round 3) are never dealt
-    either, and a gated frontier locks its whole file (the summary's
-    frontier is already gate-aware, so blocked files drop out of `views`).
+    either, but they are SEGMENT-LEVEL holds (option B, 2026-09-29): a
+    gated chunk is skipped, it does NOT lock the rest of its file — the
+    frontier and the depth pass continue past it.
     """
     gated = gated or set()
     payloads: list[dict] = []
@@ -2690,9 +2710,11 @@ async def _reading_extras() -> dict:
         # funnel signal: only NOT-held 正在制卡 chunks resurface next round
         # (a gated active chunk waits for its cards to clear the preview
         # pipeline — counting it here would pull the user into a reading
-        # start screen that deals nothing)
+        # start screen that deals nothing). gated_active counts exactly the
+        # held ACTIVE segments (option B, 2026-09-29), so a gated TODO (e.g.
+        # a promoted card-bearing background segment) no longer distorts this.
         out["reading_active"] = sum(
-            max(0, s.get("active", 0) - s.get("gated", 0)) for s in summaries
+            max(0, s.get("active", 0) - s.get("gated_active", 0)) for s in summaries
         )
         out["reading_gated"] = sum(s.get("gated", 0) for s in summaries)
         rp = _reading_round_payload(data)
@@ -2988,6 +3010,11 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
     skip:     → skipped (无需制卡). Advances; unlocks the next chunk too.
     next:     no status change (下一张, 稍后继续). Advances the round only —
         the chunk stays frontier and comes back next round.
+    promote/demote: background ⇄ todo/active salvage moves — NOT round
+        members by nature (option-B fix 2026-09-29: they bypass the
+        in-round stale check, so the salvage API works mid-round too).
+        demote of a segment that IS pending drops it from the round
+        (a background segment can never be dealt, so it must not strand).
     """
     if action not in READING_ACTIONS:
         raise HTTPException(
@@ -3000,7 +3027,15 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
     if not in_round and action in ("mark_active", "complete", "skip", "next"):
         raise HTTPException(status_code=409, detail="no active reading round")
     target = {"path": path, "chunk_key": chunk_key}
-    if in_round and target not in rd.get("pending", []) and action != "mark_active":
+    # round-advancing actions must target a pending chunk; mark_active and
+    # promote/demote are exempt (they operate on segments by status, not by
+    # round membership — blocking them mid-round silently broke the only
+    # salvage path for background segments).
+    if (
+        in_round
+        and target not in (rd or {}).get("pending", [])
+        and action not in ("mark_active", "promote", "demote")
+    ):
         return {"ok": False, "reason": "stale"}
     entry = _find_entry(data, path)
     if entry is None:
@@ -3025,6 +3060,7 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
         _reading_write(data)
         return {"ok": False, "reason": "drifted", "round_complete": complete}
     status = seg.get("status", "todo")
+    demote_completed_round = False
     if status == "container":
         raise HTTPException(status_code=409, detail="container segments are history")
     if action == "mark_active":
@@ -3046,6 +3082,16 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
             _reading_write(data)
             return {"ok": False, "reason": "not demotable", "status": status}
         seg["status"] = "background"
+        # a demoted segment can never be dealt again — if it sits in the
+        # active round, drop it so the round doesn't strand on it (option-B
+        # fix 2026-09-29; counted as done like a drift drop, NOT as skip:
+        # the user didn't decide 无需制卡, they moved it out of schedule).
+        if isinstance(rd, dict) and target in rd.get("pending", []):
+            rd["pending"] = [p for p in rd.get("pending", []) if p != target]
+            rd["done"] = rd.get("done", 0) + 1
+            if not rd["pending"]:
+                rd["status"] = "complete"
+                demote_completed_round = True
     seg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     round_complete = False
@@ -3054,6 +3100,8 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
         stats = rd.setdefault("stats", {})
         stats[stats_key] = stats.get(stats_key, 0) + 1
         round_complete = _drop_and_maybe_complete()
+    if demote_completed_round:
+        round_complete = True
     _reading_write(data)
     return {
         "ok": True,
@@ -3107,8 +3155,9 @@ async def reading_split(body: ReadingSplitBody):
       - selected ranges → todo (scheduled);
       - gaps → `extract`: all background. `bookmark` (default): gap after
         the LAST selection → todo (未读尾巴继续排队 — the cut is a bookmark;
-        the preview-pool gate on the selection's cards automatically holds
-        the tail until they're digested), other gaps → background;
+        since the 2026-09-29 option-B ruling the gate is SEGMENT-LEVEL, so
+        the tail queues and deals normally — it is NOT held behind the
+        selection's cards), other gaps → background;
       - a child can be split again — recursion is just interval refinement.
     """
     async with _state_lock:
@@ -3207,8 +3256,10 @@ async def reading_split(body: ReadingSplitBody):
         # so a mid-round split lands on the new smaller cards immediately)
         # so the round doesn't strand on a container.
         # bookmark 尾段 EXCLUDED (user spec 2026-09-22): the tail is 未读
-        # 「之后再推」— it stays in the FILE queue (frontier deals it next
-        # round, gated behind the selection's cards), NOT in this round.
+        # 「之后再推」— it stays in the FILE queue and the frontier/depth
+        # passes deal it from the NEXT round on (segment-level gate, option
+        # B 2026-09-29: the selection's cards no longer hold it back),
+        # NOT in this round.
         rd = data.get("round")
         if isinstance(rd, dict) and rd.get("status") == "active":
             pend = rd.get("pending", [])

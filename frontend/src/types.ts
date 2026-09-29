@@ -222,9 +222,13 @@ export interface ReadingFileSummary {
     line_start: number
   } | null
   /** chunks held by the preview-pool gate (cards not all released yet) —
-   * B·二段重推, user spec 2026-09-19 round 3. `gated_frontier` is the held
-   * chunk that blocks this file (null when frontier exists normally). */
+   * B·二段重推, user spec 2026-09-19 round 3; SEGMENT-LEVEL since the
+   * 2026-09-29 option-B ruling (a held chunk no longer blocks its file).
+   * `gated_active` = held chunks with status active (reading_active funnel
+   * signal); `gated_frontier` = first held chunk, for the list-screen chip
+   * when nothing else in the file is dealable. */
   gated?: number
+  gated_active?: number
   gated_frontier?: {
     chunk_key: string
     status: ReadingChunkStatus

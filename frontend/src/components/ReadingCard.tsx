@@ -185,7 +185,7 @@ export const ReadingCard: Component<Props> = (props) => {
               <md-filter-chip
                 label="书签模式"
                 selected={props.gapPolicy === 'bookmark'}
-                title="切到哪里=书签：选中部分独立成卡，后面未读的部分留在队列，消化完卡片后自动推回来"
+                title="切到哪里=书签：选中部分独立成卡，后面未读的部分留在队列照常推进（已制卡的片段自己当天不重推，次日卡片放行后恢复）"
                 onClick={() => props.onGapPolicyChange('bookmark')}
               />
               <md-filter-chip

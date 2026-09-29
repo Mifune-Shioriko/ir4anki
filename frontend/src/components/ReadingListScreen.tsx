@@ -195,7 +195,7 @@ export const ReadingListScreen: Component<Props> = (props) => {
           <h1 class="screen-title md-typescale-headline-small">阅读清单</h1>
           <p class="screen-detail md-typescale-body-medium">
             排在前面的文件先推进；一个文件内按顺序读，前一段没完成不会推后面的。
-            已制卡的片段会等它的卡过完预览池（次日放行）后再重推，补卡后点「制卡完成」解锁下一段。
+            今天制过卡的片段当天不再重推（等卡片次日放行后恢复），文件其余部分照常推进；补卡后点「制卡完成」解锁下一段。
             移出清单不会丢进度，重新添加即恢复。
           </p>
 

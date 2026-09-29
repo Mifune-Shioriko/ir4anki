@@ -392,7 +392,7 @@ export const App: Component = () => {
       const hasTail = (res.children || []).some(c => c.tail && c.status === 'todo')
       if (policy === 'bookmark' && hasTail) {
         showSnack(
-          `已分割出 ${kids.length} 个片段；未读的尾巴留在队列，消化完卡片后会自动推回来`,
+          `已分割出 ${kids.length} 个片段；未读的尾巴留在队列，之后照常推进`,
         )
       } else {
         showSnack(
