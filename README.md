@@ -6,19 +6,21 @@ backend + SolidJS/Material Design 3 frontend, driven entirely through
 [AnkiConnect](https://ankiweb.net/shared/info/2055492159) — no Anki fork, no
 database migration, no add-on code inside Anki.
 
-```
-┌──────────┐  AnkiConnect :8765  ┌─────────────┐   built-in sync   ┌──────────┐
-│ desktop  │ ◄────────────────── │   ir4anki    │                   │ AnkiWeb / │
-│ Anki     │   (cards, decks,    │  backend :8901│                   │ self-host │
-│ (yours)  │    sync, media)     │  + SPA UI     │                   │ sync srv  │
-└──────────┘                     └─────────────┘                   └──────────┘
-```
-
 You keep reviewing in desktop Anki as usual; ir4anki is an *extra* front door
 for the daily flow below. Cards always live in your collection and move
 between your devices via Anki's own sync.
 
 ## What it adds
+
+### One daily flow (早/中/晚, one button)
+A single **开始** button runs the whole day: it deals reading segments first,
+then a review batch, then returns to the start screen — no intermediate
+pick/stats pages. The review count is **dynamic**: ⌈D/3⌉ where D is the day's
+due-card count, snapshotted at the first review deal of the Anki day (4 AM
+rollover), so three rounds (morning/noon/evening) clear the day's due pile
+evenly. New cards reach the review batch through the overnight release below.
+Stages with nothing to do are skipped automatically. Every number is
+env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
 
 ### Reading mode (渐进制卡 — incremental reading)
 Point it at a folder of markdown notes (`ANKI_NOTES_DIR`). Each listed file is
@@ -29,6 +31,17 @@ Anki). Segment state (todo → active → done/skipped), the segment tree, and
 **exact card provenance** (which segment produced which cards) live in a local
 sqlite DB — the .md files stay pure text with zero markers. While reviewing any
 card later, the app can show the original source segment with full-file context.
+
+- **Segment editor** — edit a segment's text in-app (CodeMirror 6 source +
+  live markdown preview). Saves atomically rewrite the .md and re-anchor every
+  other segment in the same transaction, so line shifts never corrupt the
+  segment tree or trip the drift fuse.
+- **Images in notes** — upload images from the editor; they're stored under
+  `NOTES_DIR/_assets` and referenced by bare filename, so the .md stays clean
+  and your notes folder stays relocatable (git-friendly).
+- **文件 browser** — a read-only folder-tree view of the whole corpus with
+  rendered markdown/KaTeX, separate from the 阅读清单 (which controls what
+  gets dealt and in what priority).
 
 ### Preview pool (先看后考 — read before you're tested)
 New cards don't hit the scheduler immediately. They land **suspended** in a
@@ -41,21 +54,19 @@ work. A daily release cap (`ANKI_RELEASE_DAILY_GOAL`, default 45) limits how
 many cards enter the queue per day — oldest first, overflow waits for the next
 day — so a heavy card-making day can't blow up your review burden.
 
-### One daily flow (早/中/晚, one button)
-A single **开始** button runs the whole chain with no intermediate pick/stats
-screens — each stage flows straight into the next, then returns to the start
-screen:
+### Segment-level gate (per-segment cooldown, 2026-09-29)
+A segment whose cards are still sitting in the preview pool is held overnight:
+it won't be re-dealt the same day (grading cards you just made is recognition,
+not recall). Crucially it holds **only itself** — the rest of its file keeps
+dealing normally, so one half-finished chunk never blocks your reading
+frontier. Segments without cards are never gated.
 
-```
-阅读 (4 段)  →  复习 (15 新 + ⌈当日到期 / 3⌉)  →  开始页
-```
-
-The review count is **dynamic**: ⌈D/3⌉ where D is the day's due-card count,
-snapshotted at the first review deal of the Anki day (4 AM rollover) into
-`state/daily.json`. Three rounds (morning/noon/evening) therefore clear the
-day's due pile evenly. Stages with nothing to do are skipped automatically
-(list exhausted, no cards). Every number is env-overridable — see
-[`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
+### Friendly to desktop Anki
+Every AnkiConnect call is serialized through one queue, and the background
+sync that follows each answer is throttled (at most one sync per
+`ANKI_SYNC_MIN_INTERVAL` seconds, default 120) — so ir4anki answering never
+stutters your open Anki window. Slow calls are logged
+(`journalctl --user -u ir4anki`).
 
 ## Requirements
 
@@ -111,19 +122,15 @@ Before the daily flow works end to end, confirm:
 Useful flags: `--non-interactive` (accept defaults), `--no-service` (build +
 config only, run uvicorn yourself).
 
-### Low-resolution desktops (e.g. 1280×800)
+### Desktop-first UI
 
-The UI is designed desktop-first and works from 1180px window width upward
-(two columns: card + notes/related tabs). On a 1280×800 panel:
-
-- run the browser **full-screen (F11)** or launch kiosk-style —
-  `chromium --kiosk http://127.0.0.1:8901` / `firefox --kiosk URL` — to give
-  the layout the whole panel;
-- the action bar (显示答案 / ease buttons) is sticky at the bottom of the
-  viewport, so long cards never push the rating buttons off screen;
-- keyboard first: `Space` reveal, `1`–`4` rate (Again/Hard/Good/Easy),
-  `Ctrl+Z` undo; reading stage adds `A` add card, `C` cloze, `S` skip,
-  `N` next.
+The layout is designed for desktop widths (works from 1180px up): card in the
+center column, related cards / source note in a side column. On small panels
+(e.g. 1280×800) run the browser full-screen (F11) or kiosk-style
+(`chromium --kiosk http://127.0.0.1:8901`) to give the layout the whole
+screen; the action bar stays pinned at the bottom. Keyboard first: `Space`
+reveal, `1`–`4` rate (Again/Hard/Good/Easy), `Ctrl+Z` undo; reading stage adds
+`A` add card, `C` cloze, `S` skip, `N` next.
 
 ### Manual run (no systemd)
 
@@ -168,9 +175,10 @@ Defaults that most people will want to change:
 | `ANKI_MEDIA_DIR` | *(prompted)* | profile's `collection.media` — needed for card images |
 | `ANKI_NOTES_DIR` | `~/anki-notes` | markdown corpus for reading mode |
 | `ANKI_PREVIEW_DECK` | `预览池` | where suspended preview cards live |
-| `ANKI_PREVIEW_RELEASE_DECK` | `2026` | where approved cards move |
+| `ANKI_PREVIEW_RELEASE_DECK` | `2026` | where released cards land |
 | `ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` | `问答题` / `填空题` | note types used by the add-card dialogs — must exist in your collection |
 | `ANKI_ROLLOVER_HOUR` | `4` | must match Anki's own "next day starts at" |
+| `ANKI_RELEASE_DAILY_GOAL` | `45` | max auto-released cards per day |
 
 ## Multiple machines
 
@@ -186,7 +194,7 @@ as your ir4anki instance; on the others, just use desktop Anki.
 ```
 backend/    FastAPI app (app.py) + vendored chunker (legacy migrations only)
 frontend/   SolidJS 1.9 + @material/web (MD3) SPA, built to frontend/dist
-deploy/     install.sh + systemd unit template + env example
+deploy/     install.sh + update.sh + systemd unit template + env example
 scripts/    API/E2E/UI tests (some need playwright + a live AnkiConnect)
 docs/       design documents (reading mode, round-4 segment identity)
 ```
@@ -198,6 +206,7 @@ docs/       design documents (reading mode, round-4 segment identity)
 backend/.venv/bin/python scripts/reading_test.py
 backend/.venv/bin/python scripts/auto_release_test.py
 backend/.venv/bin/python scripts/reading_edit_test.py
+backend/.venv/bin/python scripts/gate_segment_level_test.py
 backend/.venv/bin/python scripts/modes_e2e.py
 backend/.venv/bin/python scripts/sync_throttle_test.py
 # UI tests additionally need: pip install playwright && playwright install chromium
