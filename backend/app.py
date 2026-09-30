@@ -1929,6 +1929,10 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict,
         "line_start": ch["line_start"],
         "line_end": ch["line_end"],
         "text": ch["text"],
+        # stale-coordinate guard (2026-09-30): the frontend echoes these back
+        # on /api/reading/split so the backend can detect a moved/changed
+        # segment instead of slicing the wrong lines.
+        "fingerprint": st.get("fingerprint", ""),
         "status": st.get("status", "todo"),
         "cards_created": list(st.get("cards_created") or []),
         "ancestor_cards": ancestor_cards,
@@ -3126,6 +3130,14 @@ async def reading_finish():
         return {"ok": True, "stats": stats}
 
 
+# Stale-coordinate sentinel: the client's view of the parent segment no longer
+# matches the file on disk (an in-app edit shifted later segments, or the .md
+# was edited externally). The frontend catches this prefix, re-fetches the
+# round, and asks the user to re-select — it must NOT silently retry, because
+# the selection's line numbers were computed against the OLD rendering.
+SPLIT_STALE = "stale: 片段坐标已过期，请刷新后重新选择"
+
+
 class ReadingSplitBody(BaseModel):
     path: str
     seg_id: int
@@ -3141,6 +3153,14 @@ class ReadingSplitBody(BaseModel):
     # Pure DB operation — the file is untouched.
     selections: list[dict]
     gap_policy: str = "bookmark"
+    # Stale-coordinate guard (2026-09-30): the client echoes the parent's
+    # fingerprint + line_start as it saw them when the chunk was dealt. If
+    # either differs from the segment's CURRENT (post-reanchor) state, the
+    # selection's absolute line numbers can't be trusted → 409 SPLIT_STALE.
+    # Both OPTIONAL: an old client / a trace chunk without them skips that
+    # half of the guard (backwards compatible).
+    fingerprint: str | None = None
+    line_start: int | None = None
 
 
 @app.post("/api/reading/split")
@@ -3169,23 +3189,55 @@ async def reading_split(body: ReadingSplitBody):
         entry = _find_entry(data, body.path)
         if entry is None:
             raise HTTPException(status_code=404, detail="file not in the reading list")
+        text = _read_note_text(body.path)
+        if text is None:
+            raise HTTPException(status_code=404, detail="note file not found")
+        lines = text.split("\n")
+        # Re-anchor on external drift BEFORE touching coordinates (2026-09-30):
+        # split used to trust the stored start_line against a freshly-read
+        # file, so an external .md edit silently misaligned every cut. Now we
+        # reconcile segments against the current text first (pure shifts
+        # re-anchor cleanly via fingerprint); a content edit that can't
+        # relocate flags needs_resync.
+        sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if entry.get("file_sha") != sha:
+            _reanchor_entry(entry, lines, sha)
         if entry.get("needs_resync"):
+            _reading_write(data)  # persist the re-anchor/needs_resync flag
             raise HTTPException(status_code=409, detail="file needs reseed first")
         segs = entry.get("segments") or []
         parent = next(
             (s for s in segs if s.get("seg_id") == body.seg_id), None
         )
         if parent is None:
+            _reading_write(data)
             raise HTTPException(status_code=404, detail="segment not found")
         if parent.get("status") == "container":
+            _reading_write(data)
             raise HTTPException(status_code=409, detail="segment already split")
-        text = _read_note_text(body.path)
-        if text is None:
-            raise HTTPException(status_code=404, detail="note file not found")
-        lines = text.split("\n")
+        # Stale-coordinate guard (2026-09-30): the client echoes the parent
+        # fingerprint + line_start it rendered against. After the re-anchor
+        # above, a mismatch means the segment moved or changed since the card
+        # was dealt (in-app edit shifted it, or external drift relocated it) —
+        # the selection's absolute lines are computed against the OLD layout,
+        # so cutting now would slice the wrong text. Refuse; the frontend
+        # re-fetches and asks the user to re-select.
+        if (
+            body.fingerprint is not None
+            and parent.get("fingerprint", "") != body.fingerprint
+        ):
+            _reading_write(data)
+            raise HTTPException(status_code=409, detail=SPLIT_STALE)
+        if (
+            body.line_start is not None
+            and int(parent.get("start_line", 0)) != int(body.line_start)
+        ):
+            _reading_write(data)
+            raise HTTPException(status_code=409, detail=SPLIT_STALE)
         p_start, p_end = parent["start_line"], parent["end_line"]
         # normalize + validate selections inside the parent range
         sels = []
+        sels_raw = False  # any selection intersected the parent before trim
         for sel in body.selections:
             try:
                 a = int(sel.get("start_line"))  # type: ignore[arg-type]
@@ -3194,8 +3246,20 @@ async def reading_split(body: ReadingSplitBody):
                 raise HTTPException(status_code=400, detail="selections need int start_line/end_line")
             if a < 1 or b < a or b > len(lines):
                 raise HTTPException(status_code=400, detail=f"selection out of file range: {a}-{b}")
-            sels.append((max(a, p_start), min(b, p_end)))
-        sels = [(a, b) for a, b in sels if a <= b]
+            a = max(a, p_start)
+            b = min(b, p_end)
+            if a > b:
+                continue
+            sels_raw = True
+            # trim leading/trailing blank lines off the selection (markdown-it
+            # list/paragraph maps carry trailing blank lines; cutting them in
+            # yields a child that starts/ends on whitespace).
+            while a <= b and not lines[a - 1].strip():
+                a += 1
+            while b >= a and not lines[b - 1].strip():
+                b -= 1
+            if a <= b:
+                sels.append((a, b))
         sels.sort()
         merged: list[tuple[int, int]] = []
         for a, b in sels:
@@ -3204,7 +3268,28 @@ async def reading_split(body: ReadingSplitBody):
             else:
                 merged.append((a, b))
         if not merged:
+            # distinguish "the selection was only blank lines" (the
+            # 「切出来完全空」 report — trimmed away above) from "the range
+            # didn't intersect the parent at all"
+            if sels_raw:
+                raise HTTPException(
+                    status_code=400,
+                    detail="选区没有实质内容（只有空行）",
+                )
             raise HTTPException(status_code=400, detail="no valid selection inside the segment")
+        # Reject an empty / heading-only selection: without this a cut landing
+        # between paragraphs (the "切出来完全空" report) builds a child that
+        # renders blank and queues as a pointless card. The selection's own
+        # body must clear MIN_READING_BODY, same bar a whole-file seed and the
+        # bookmark tail already meet.
+        sel_text = "\n".join(
+            "\n".join(lines[a - 1 : b]) for a, b in merged
+        )
+        if not _reading_worthwhile({"text": sel_text}):
+            raise HTTPException(
+                status_code=400,
+                detail="选区没有实质内容（太短或只有空行/标题）",
+            )
         now = datetime.now().isoformat(timespec="seconds")
         nid = _next_seg_id(entry)
         children: list[dict] = []
@@ -3599,6 +3684,7 @@ async def reading_source(note_id: int):
                     "stale": bool(s.get("stale")),
                     "line_start": a,
                     "line_end": b,
+                    "fingerprint": s.get("fingerprint", ""),
                     "text": "\n".join(lines[a - 1 : b]) if lines else "",
                     # every note id created from THIS segment (三栏左栏
                     # 「相关卡片」, 2026-09-21) — feed to /api/reading/cards

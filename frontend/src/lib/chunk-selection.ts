@@ -50,9 +50,22 @@ export function trackChunkSelection(
   const onSelChange = () => {
     const sel = window.getSelection()
     const body = getBody()
-    if (!sel || sel.isCollapsed || !sel.rangeCount || !body) return
+    if (!sel || !sel.rangeCount || !body) return
     const r = sel.getRangeAt(0)
-    if (!body.contains(r.commonAncestorContainer)) return
+    if (!body.contains(r.commonAncestorContainer)) {
+      // selection moved OUT of the card body (e.g. into the right-column
+      // full text): a non-empty outside selection clears the tracked state
+      // so 分割 can't fire on a stale range and 挖空 can't seed from stale
+      // text (2026-09-30 stickiness bug). Collapsed selections (a mere
+      // click — including clicking a toolbar button, which collapses the
+      // in-body selection before onClick fires) are ignored, preserving the
+      // cloze dialog's seed text.
+      if (!sel.isCollapsed && sel.toString().trim()) {
+        reset()
+      }
+      return
+    }
+    if (sel.isCollapsed) return
     const text = sel.toString().trim()
     if (!text) return
     setSelText(text)

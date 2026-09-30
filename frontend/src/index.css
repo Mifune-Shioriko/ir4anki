@@ -1615,6 +1615,31 @@ a:focus-visible,
   opacity: 0.85;
 }
 
+/* 切割预览 (2026-09-30): the actual cut range, shown the moment a selection
+ * is tracked (block/line expansion can differ from what the user selected). */
+.split-preview {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: -4px 0 10px;
+  padding: 6px 10px;
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+.split-preview__range {
+  font-weight: 500;
+  white-space: nowrap;
+}
+.split-preview__text {
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 .reading-chunk-body {
   /* the chunk IS the reading surface — cap very long sections so the action
    * row stays reachable; the full file is always in the right panel */

@@ -1,6 +1,7 @@
 import { Component, Show } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
+import { previewCutText } from '../lib/split-selection'
 import type { ReadingChunk, ReadingChunkStatus } from '../types'
 import { IconAdd, IconArrowBack, IconContentCut, IconEdit, IconPassword } from './icons'
 
@@ -201,6 +202,28 @@ export const ReadingCard: Component<Props> = (props) => {
                 : '未选中部分沉入背景'}
             </span>
           </div>
+
+          {/* 切割预览 (2026-09-30): block/line expansion means the actual cut
+              range can differ from what the user selected (atomic blocks snap
+              whole; a partial paragraph line expands to full lines). Show the
+              truth BEFORE the click: relative line range + a snippet of the
+              text that would be cut. */}
+          <Show when={sel.selLines()}>
+            {(s) => {
+              const n = () => s().end_line - s().start_line + 1
+              const snippet = () => previewCutText(props.chunk.text, s())
+              return (
+                <div class="split-preview md-typescale-label-small" aria-live="polite">
+                  <span class="split-preview__range">将切出第 {s().start_line}–{s().end_line} 行（{n()} 行）</span>
+                  <Show when={snippet()}>
+                    <span class="split-preview__text" title={snippet()}>
+                      {snippet().length > 40 ? snippet().slice(0, 40) + '…' : snippet()}
+                    </span>
+                  </Show>
+                </div>
+              )
+            }}
+          </Show>
 
           <div
             class="card-content reading-chunk-body note-body md-typescale-body-medium"

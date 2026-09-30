@@ -127,8 +127,11 @@ export const api = {
     segId: number,
     selections: { start_line: number; end_line: number }[],
     gapPolicy: 'bookmark' | 'extract' = 'bookmark',
+    guard?: { fingerprint?: string; line_start?: number } | null,
   ) => post<ReadingSplitResponse>('/api/reading/split', {
     path, seg_id: segId, selections, gap_policy: gapPolicy,
+    ...(guard?.fingerprint != null ? { fingerprint: guard.fingerprint } : {}),
+    ...(guard?.line_start != null ? { line_start: guard.line_start } : {}),
   }),
   /** In-app segment edit (user spec 2026-09-23): replace the segment's
    *  line range in the .md; backend re-anchors all segments in the same

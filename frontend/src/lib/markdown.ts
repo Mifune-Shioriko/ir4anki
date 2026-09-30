@@ -47,6 +47,32 @@ md.renderer.renderToken = ((tokens: TokenLike[], idx: number, options: unknown, 
   return baseRenderToken(tokens, idx, options, env, self)
 }) as typeof md.renderer.renderToken
 
+// ATOMIC blocks bypass renderToken (markdown-it dispatches them to dedicated
+// renderer rules), so the override above never sees them — `hr` is nesting 0,
+// and fence/code_block/math_block have their own rules. Left untagged, a
+// selection touching a code block, a $$ display formula or an <hr> lost its
+// source-line mapping entirely (2026-09-30 split-misalignment bug). Wrap each
+// rule and inject data-src-line/end into the FIRST opening tag of its output —
+// robust regardless of whether the underlying rule uses renderAttrs (the katex
+// block rule hardcodes `<p class="katex-block">`, the fence rule puts attrs on
+// the inner <code>). token.map is present on all four (verified via probe).
+type RuleFn = (
+  tokens: TokenLike[], idx: number, options: unknown, env: unknown, self: { renderToken: Function },
+) => string
+const wrapAtomicRule = (name: string) => {
+  const base = (md.renderer.rules[name] as unknown as RuleFn | undefined)
+    ?? ((tokens: TokenLike[], idx: number, options: unknown, _env: unknown, self: { renderToken: Function }) =>
+      self.renderToken(tokens, idx, options) as string)
+  md.renderer.rules[name] = ((tokens, idx, options, env, self) => {
+    const out = base(tokens, idx, options, env, self)
+    const map = tokens[idx]?.map as [number, number] | null | undefined
+    if (!map) return out
+    const attrs = ` data-src-line="${map[0] + 1}" data-src-end="${map[1]}"`
+    return out.replace(/^<([a-zA-Z][\w-]*)/, (_m, tag: string) => `<${tag}${attrs}`)
+  }) as unknown as typeof md.renderer.renderToken
+}
+for (const r of ['hr', 'fence', 'code_block', 'math_block']) wrapAtomicRule(r)
+
 // Note-corpus images (P5, user spec 2026-09-23): notes reference images by
 // BARE BASENAME (Anki collection.media convention, keeps .md pure and notes
 // relocatable): `![](paste-x.png)` or `![](2026/局部解剖学/_assets/x.png)`.

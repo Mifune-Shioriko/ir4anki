@@ -283,6 +283,7 @@ export const App: Component = () => {
       line_start: s.line_start,
       line_end: s.line_end,
       text: s.text,
+      fingerprint: s.fingerprint ?? '',
       status: (s.status as ReadingChunkStatus) || 'todo',
       cards_created: own,
       ancestor_cards: anc,
@@ -337,6 +338,12 @@ export const App: Component = () => {
         line_start: c.start_line,
         line_end: c.end_line,
         text: lines.slice(c.start_line - 1, c.end_line).join('\n'),
+        // the parent's fingerprint does NOT describe the child's window, and
+        // the server can't be reached for a fresh one here (old-backend
+        // fallback path; crypto.subtle is unavailable on plain-http origins)
+        // — undefined disables that half of the stale guard, line_start still
+        // catches in-app-edit shifts
+        fingerprint: undefined,
         status: 'todo' as ReadingChunkStatus,
         cards_created: [],
         // pre-split cards live on the (now container) parent — carry them as
@@ -356,7 +363,13 @@ export const App: Component = () => {
     const policy = gapPolicy()
     setRdBusy(true)
     try {
-      const res = await api.readingSplit(chunk.path, chunk.seg_id, selections, policy)
+      const res = await api.readingSplit(
+        chunk.path, chunk.seg_id, selections, policy,
+        // stale-coordinate guard (2026-09-30): echo what the card rendered
+        // against; the backend refuses (409 stale) if the segment moved —
+        // the selection's line numbers would slice the wrong text.
+        { fingerprint: chunk.fingerprint, line_start: chunk.line_start },
+      )
       let kids = res.child_chunks || []
       if (kids.length === 0) kids = await buildFallbackChildren(chunk, res.children || [])
       if (kids.length === 0) {
@@ -402,7 +415,31 @@ export const App: Component = () => {
         )
       }
     } catch (e) {
-      showSnack('分割失败：' + (e as Error).message)
+      const msg = (e as Error).message || ''
+      if (msg.startsWith('stale:')) {
+        // the segment moved/changed since this card was dealt (in-app edit
+        // shifted later segments, or the .md drifted externally): refresh
+        // the round mirror + trace detour and ask for a fresh selection.
+        // NO auto-retry — the selection lines were computed against the
+        // OLD rendering, re-cutting them would slice the wrong text.
+        invalidateFileCache(chunk.path)
+        setNoteReloadToken(t => t + 1)
+        srcCache.clear()
+        try {
+          const st = await api.readingState()
+          if (st.round?.status === 'active') {
+            setRdChunks(st.round.chunks ?? [])
+            setRdDone(st.round.done)
+            setRdTotal(st.round.total)
+          }
+        } catch { /* next resync fixes it */ }
+        if (wasTrace) {
+          closeTrace()
+        }
+        showSnack('笔记内容有更新，片段已刷新——请重新选中再分割')
+      } else {
+        showSnack('分割失败：' + msg)
+      }
     } finally {
       setRdBusy(false)
     }
@@ -434,6 +471,21 @@ export const App: Component = () => {
         )
       }
     }
+    // the edit shifts EVERY later segment's line numbers server-side, so the
+    // OTHER chunks still on screen hold stale coordinates — a split from one
+    // of them would slice the wrong lines (2026-09-30 「切出来完全空」 root
+    // cause). Re-fetch the round mirror so every pending chunk carries fresh
+    // line_start/fingerprint; silent on failure (the split stale-guard is the
+    // backstop). Trace variant: its chunk came from /api/reading/source —
+    // drop the source cache so a re-opened detour re-fetches fresh coords.
+    srcCache.clear()
+    api.readingState().then(st => {
+      if (st.round?.status === 'active') {
+        setRdChunks(st.round.chunks ?? [])
+        setRdDone(st.round.done)
+        setRdTotal(st.round.total)
+      }
+    }).catch(() => { /* next resync / stale-guard fixes it */ })
     // the .md changed on disk → the right column must re-fetch the file
     invalidateFileCache(old.path)
     setNoteReloadToken(t => t + 1)

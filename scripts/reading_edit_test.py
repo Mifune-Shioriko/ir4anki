@@ -246,7 +246,9 @@ async def main():
         cur = _segs(A_PATH)
         cs1, cs2, cs3 = (next(s for s in cur if s["seg_id"] == x["seg_id"])
                          for x in (s1, s2, s3))
-        short = "## 二、颈筋膜\n\n浅、中、深三层。"
+        # 2 lines vs the section's 3 (heading+blank+body after the trailing-
+        # blank trim) → genuinely negative delta
+        short = "## 二、颈筋膜\n浅、中、深三层。"
         r = await c.post("/api/reading/edit", json={
             "path": A_PATH, "seg_id": s2["seg_id"], "new_text": short})
         d2 = r.json()
@@ -268,7 +270,10 @@ async def main():
         print("== 5. split → container read-only; child edit stretches parent ==")
         cur = _segs(A_PATH)
         cs3 = next(s for s in cur if s["seg_id"] == s3["seg_id"])
-        mid = (cs3["start_line"] + cs3["end_line"]) // 2
+        # select the FULL section (heading+body is substantial; a heading-only
+        # or empty selection is rejected since 2026-09-30). One child, no tail
+        # — the test only needs a child to edit so the parent stretches.
+        mid = cs3["end_line"]
         r = await c.post("/api/reading/split", json={
             "path": A_PATH, "seg_id": s3["seg_id"],
             "selections": [{"start_line": cs3["start_line"], "end_line": mid}],
