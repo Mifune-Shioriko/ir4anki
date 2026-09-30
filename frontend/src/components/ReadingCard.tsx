@@ -1,9 +1,14 @@
-import { Component, Show } from 'solid-js'
+import { Component, Show, createEffect, createSignal, on } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
-import { previewCutText } from '../lib/split-selection'
+import {
+  annotateLines,
+  annotatedItems,
+  previewHeadTail,
+  type SplitSelection,
+} from '../lib/split-selection'
 import type { ReadingChunk, ReadingChunkStatus } from '../types'
-import { IconAdd, IconArrowBack, IconContentCut, IconEdit, IconPassword } from './icons'
+import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign round 2;
 // 三栏重构 2026-09-21). One note chunk to read and turn into cards BY HAND.
@@ -14,26 +19,30 @@ import { IconAdd, IconArrowBack, IconContentCut, IconEdit, IconPassword } from '
 //
 // Layout mirrors Flashcard/PreviewCard:
 //   header  = status chips (left) + icon actions (right):
-//             添加卡片 / 添加挖空 / 分割文段 (+ 回到复习 in trace mode)
+//             添加卡片 / 添加挖空 (+ 编辑片段, + 回到复习 in trace mode)
 //   bottom  = status buttons ONLY: 结束阅读 | 无需制卡，跳过 |
 //             下一张（稍后继续） | 制卡完成 (filled)
 // The old 开始制卡 gate is GONE — chunks auto-mark 正在制卡 when a card or
 // cloze is created from them (backend _reading_record_card).
 //
-// 分割文段 (round-4 split, 2026-09-21; gap_policy 2026-09-22): select text
-// in the chunk body → the icon maps the selection to source lines
-// (block-granular, see lib/split-selection.ts) → POST /api/reading/split.
-// Gap disposition follows the 切割语义 chips: 书签模式 (bookmark, DEFAULT) =
-// the selection becomes a smaller todo reading card, the UNREAD tail stays
-// todo (queued — the cut is a bookmark, gate paces it behind the selection's
-// cards), the read prefix sinks to background; 提炼模式 (extract) = only the
-// selection survives, all gaps sink to background (promotable later). The
-// parent always becomes a container keeping all provenance. Disabled without
-// a selection inside the body.
+// 分割文段 (LINE-HANDLE model, 2026-10-01 — replaces the text-selection
+// flow): every rendered source line carries a small dot handle in the left
+// gutter (atomic blocks — code fences, tables, $$ formulas, <hr> — get ONE
+// handle for the whole block). Click the first line's handle, click the last
+// line's handle (further clicks re-adjust the far end), the lines highlight
+// and an inline confirm bar appears above the body with the exact cut range
+// + a HEAD and TAIL line preview (the old head-only snippet couldn't
+// confirm where the cut ended — user spec). 确认分割 → POST
+// /api/reading/split with the whole-line range. No DOM-selection guessing:
+// the handles ARE the backend's line model, so what you click is what gets
+// cut. Gap disposition still follows the 切割语义 chips: 书签模式 (bookmark,
+// DEFAULT) = the cut lines become a smaller todo reading card, the UNREAD
+// tail stays todo (queued), the read prefix sinks to background; 提炼模式
+// (extract) = only the cut lines survive, all gaps sink to background.
 //
-// 添加挖空 captures the CURRENT text selection inside the chunk body
-// (tracked via selectionchange — clicking the toolbar button clears the
-// live selection before onClick fires; tracking also survives keyboard
+// 添加挖空 still captures the CURRENT text selection inside the chunk body
+// (tracked via selectionchange — clicking a toolbar button clears the live
+// selection before onClick fires; tracking also survives keyboard
 // activation of the icon button).
 //
 // Two variants:
@@ -73,9 +82,9 @@ interface Props {
    * The block disambiguates WHICH occurrence of a repeated word the user
    * meant when wrapping in {{c1::}}. */
   onCloze: (selText: string, selBlock: string) => void
-  /** 分割文段: selection mapped to source-line range RELATIVE to the chunk
-   *  text (caller adds line_start-1 for file lines) */
-  onSplit: (sel: { start_line: number; end_line: number }) => void
+  /** 分割文段: whole-line range RELATIVE to the chunk text (caller adds
+   *  line_start-1 for file lines). Comes from the line-handle picker. */
+  onSplit: (sel: SplitSelection) => void
   /** 编辑片段 (user spec 2026-09-23): open the SegEditDialog for this chunk */
   onEdit?: () => void
   /** 切割语义 (gap_policy, 2026-09-22): bookmark = 进度声明（未读尾巴留在
@@ -96,6 +105,99 @@ export const ReadingCard: Component<Props> = (props) => {
     () => bodyRef,
     () => [props.chunk.chunk_key, props.chunk.path] as const,
   )
+
+  // ---- line-handle split picker (2026-10-01) ----
+  // First click pins one endpoint; every later click moves the NEAREST
+  // endpoint of the pending range (so 4→5→3 yields 3–5, not 3–4 — a
+  // mis-click or a late "also need the line above" just needs one more
+  // click without losing the other end). A single click already forms a
+  // valid 1-line (or 1-block) range — the confirm bar appears immediately.
+  // 取消 clears the pick.
+  const [pick, setPick] = createSignal<SplitSelection | null>(null)
+
+  const clearPick = () => setPick(null)
+
+  const pickHandle = (start: number, end: number) => {
+    if (props.busy) return
+    const p = pick()
+    if (!p) {
+      setPick({ start_line: start, end_line: end })
+      return
+    }
+    const mid = start + (end - start) / 2
+    const dStart = Math.abs(mid - p.start_line)
+    const dEnd = Math.abs(mid - p.end_line)
+    if (dStart <= dEnd) {
+      // move the start endpoint; keep order normalized
+      setPick({
+        start_line: Math.min(start, p.end_line),
+        end_line: Math.max(end, p.end_line),
+      })
+    } else {
+      setPick({
+        start_line: Math.min(start, p.start_line),
+        end_line: Math.max(end, p.start_line),
+      })
+    }
+  }
+
+  const onBodyMouseDown = (e: MouseEvent) => {
+    const h = (e.target as HTMLElement | null)?.closest?.('.line-handle')
+    // preventDefault keeps the click from focusing the button (Space must
+    // stay 制卡完成) and from starting a text selection (the cloze seed).
+    if (h) e.preventDefault()
+  }
+
+  const onBodyClick = (e: MouseEvent) => {
+    const h = (e.target as HTMLElement | null)?.closest?.(
+      '.line-handle',
+    ) as HTMLElement | null
+    if (!h) return
+    const s = parseInt(h.dataset.lineStart || '0', 10)
+    const en = parseInt(h.dataset.lineEnd || h.dataset.lineStart || '0', 10)
+    if (s) pickHandle(s, Math.max(en, s))
+  }
+
+  const applySelClasses = () => {
+    if (!bodyRef) return
+    const p = pick()
+    for (const { el, start, end } of annotatedItems(bodyRef)) {
+      const hit =
+        p !== null && start <= p.end_line && end >= p.start_line
+      el.classList.toggle('line-sel', hit)
+    }
+  }
+
+  // annotate after every (re)render of the body; the token is the chunk
+  // text itself — identical text re-annotating is a no-op, a chunk swap
+  // re-runs the walk. queueMicrotask: Solid's innerHTML binding is itself an
+  // effect created AFTER this one (same batch, creation order), so the
+  // annotation must wait one microtask to see the NEW rendered content.
+  createEffect(
+    on(
+      () => [props.chunk.text, props.chunk.chunk_key, props.chunk.path] as const,
+      () => {
+        clearPick()
+        const text = props.chunk.text
+        queueMicrotask(() => {
+          if (!bodyRef) return
+          annotateLines(bodyRef, text)
+          applySelClasses()
+        })
+      },
+    ),
+  )
+  createEffect(() => {
+    pick()
+    applySelClasses()
+  })
+
+  const confirmSplit = () => {
+    const p = pick()
+    if (!p || props.busy) return
+    clearPick()
+    props.onSplit(p)
+  }
 
   const crumb = () => {
     const file = props.chunk.path.replace(/^\d{4}\//, '').replace(/\.md$/, '')
@@ -140,17 +242,6 @@ export const ReadingCard: Component<Props> = (props) => {
               >
                 <md-icon><IconPassword /></md-icon>
               </md-icon-button>
-              <md-icon-button
-                aria-label="分割文段（先选中正文）"
-                title="先在正文选中要独立成卡的段落，再点击分割"
-                disabled={props.busy || sel.selLines() === null}
-                onClick={() => {
-                  const s = sel.selLines()
-                  if (s) props.onSplit(s)
-                }}
-              >
-                <md-icon><IconContentCut /></md-icon>
-              </md-icon-button>
               {/* 编辑片段 (user spec 2026-09-23): CM6 弹窗改 .md 原文；
                   container 只读（历史锚，后端也会 409），trace 卡片无 seg 时可编辑 */}
               <Show when={props.onEdit}>
@@ -178,7 +269,7 @@ export const ReadingCard: Component<Props> = (props) => {
           <div class="reading-crumb md-typescale-label-small">{crumb()}</div>
 
           {/* 切割语义开关 (gap_policy, 2026-09-22): bookmark = 未读尾巴留在
-              队列（默认，user spec「切到哪里=书签」）; extract = 未选中部分
+              队列（默认，user spec「切到哪里=书签」); extract = 未选中部分
               全部沉背景。状态由 App 持有并持久化（localStorage），round 和
               trace 两个变体共用。 */}
           <div class="gap-policy-row">
@@ -203,23 +294,46 @@ export const ReadingCard: Component<Props> = (props) => {
             </span>
           </div>
 
-          {/* 切割预览 (2026-09-30): block/line expansion means the actual cut
-              range can differ from what the user selected (atomic blocks snap
-              whole; a partial paragraph line expands to full lines). Show the
-              truth BEFORE the click: relative line range + a snippet of the
-              text that would be cut. */}
-          <Show when={sel.selLines()}>
-            {(s) => {
-              const n = () => s().end_line - s().start_line + 1
-              const snippet = () => previewCutText(props.chunk.text, s())
+          {/* 分割确认条 (line-handle picker, 2026-10-01): appears once a
+              line handle is clicked; shows the EXACT whole-line cut range
+              plus a head AND tail preview of the source lines (user spec:
+              the head-only snippet couldn't confirm where the cut ended).
+              取消 clears the pick; 确认分割 fires onSplit. */}
+          <Show when={pick()}>
+            {(p) => {
+              const n = () => p().end_line - p().start_line + 1
+              const pv = () => previewHeadTail(props.chunk.text, p())
               return (
-                <div class="split-preview md-typescale-label-small" aria-live="polite">
-                  <span class="split-preview__range">将切出第 {s().start_line}–{s().end_line} 行（{n()} 行）</span>
-                  <Show when={snippet()}>
-                    <span class="split-preview__text" title={snippet()}>
-                      {snippet().length > 40 ? snippet().slice(0, 40) + '…' : snippet()}
+                <div class="split-confirm md-typescale-label-small" aria-live="polite">
+                  <div class="split-confirm__info">
+                    <span class="split-confirm__range">
+                      将切出第 {p().start_line}–{p().end_line} 行（{n()} 行）
                     </span>
-                  </Show>
+                    <span class="split-confirm__preview" title={pv().headFull}>
+                      头：{pv().head || '（空行）'}
+                    </span>
+                    <Show when={n() > 1}>
+                      <span class="split-confirm__preview" title={pv().tailFull}>
+                        尾：{pv().tail || '（空行）'}
+                      </span>
+                    </Show>
+                  </div>
+                  <div class="split-confirm__actions">
+                    <md-text-button
+                      class="split-confirm__cancel"
+                      disabled={props.busy}
+                      onClick={clearPick}
+                    >
+                      取消
+                    </md-text-button>
+                    <md-filled-tonal-button
+                      class="split-confirm__ok"
+                      disabled={props.busy}
+                      onClick={confirmSplit}
+                    >
+                      确认分割
+                    </md-filled-tonal-button>
+                  </div>
                 </div>
               )
             }}
@@ -229,6 +343,8 @@ export const ReadingCard: Component<Props> = (props) => {
             class="card-content reading-chunk-body note-body md-typescale-body-medium"
             ref={bodyRef}
             innerHTML={renderMarkdown(props.chunk.text)}
+            onMouseDown={onBodyMouseDown}
+            onClick={onBodyClick}
           />
         </div>
       </md-elevated-card>

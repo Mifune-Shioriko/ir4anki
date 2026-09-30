@@ -1,153 +1,256 @@
-// 分割文段 (segment split, round 4): map a text selection inside the
-// rendered markdown chunk body back to SOURCE line numbers.
+// 分割文段 (segment split) — LINE-HANDLE model (2026-10-01).
 //
-// Every block element rendered by lib/markdown.ts carries
-// [data-src-line] (1-based first line) + [data-src-end] (1-based inclusive
-// last line). A selection's start/end containers are walked up to their
-// nearest tagged block.
+// SUPERSEDES the text-selection→line-range mapping (selectionToLines):
+// guessing source lines from a caret selection (soft-break counting,
+// atomic-block snapping, sticky selectionchange state) never fully matched
+// the backend's whole-line segment model. Now every rendered source line
+// carries a small handle button in the left gutter; the user clicks the
+// first line, clicks the last line, gets an inline confirm bar with a
+// head+tail preview, and confirms. The cut range is the union of the two
+// clicked items — no DOM-selection heuristics at all.
 //
-// Granularity (2026-09-30, 行级映射):
-//  - SOFT-WRAPPED blocks (p / li / h1-6 / blockquote): markdown-it renders
-//    soft breaks as '\n' inside the block's text, so the exact line of the
-//    selection start/end = block.data-src-line + (number of '\n' before the
-//    caret inside the block). Selecting lines 2-4 of a 5-line paragraph now
-//    cuts exactly those lines. The user's notes average ~19 chars/line, so
-//    line-level ≈ sentence-level in practice.
-//  - ATOMIC blocks (pre / table / .katex-block): a sub-range cut would
-//    corrupt the markdown construct, so a selection touching one snaps to
-//    the WHOLE block (its own tagged range). Their textContent newlines
-//    (code lines, table rows, formula source) must NOT be counted as soft
-//    breaks.
-//  - selections spanning several blocks include everything between (the
-//    split API merges touching/overlapping ranges server-side anyway).
-//  - character-level (mid-line) cuts are deliberately NOT supported: the
-//    segment model stores whole lines, and character offsets rot under
-//    external edits. Sub-sentence extraction is what 添加挖空 is for.
+// How lines are found (annotateLines):
+//  - lib/markdown.ts tags every block element with data-src-line /
+//    data-src-end (1-based, relative to the chunk text).
+//  - ATOMIC blocks (pre / table / hr / .katex-block) cannot be cut
+//    mid-block without corrupting the markdown construct, so each gets ONE
+//    handle covering its whole line range (same semantic as the old
+//    atomic snap). They are wrapped in a div.line-anchor carrying
+//    data-line-start/end.
+//  - SOFT blocks (p / li / h1-6 / blockquote …): markdown-it renders soft
+//    breaks as '\n' text nodes, so a walk that counts '\n' maps every
+//    rendered fragment to its exact source line. Each line's runs are
+//    wrapped in span.line (also data-line-start/end); the FIRST span of a
+//    line gets the handle. The user's notes average ~19 chars/line, so one
+//    handle ≈ one sentence.
+//  - Blank source lines render nothing → no handle (the split API trims
+//    blank edges anyway).
+//  - Nested blocks (li > ul > li, blockquote > p) are handled by resetting
+//    the line counter from each tagged child's authoritative data-src-line.
+//  - Inline .katex spans are treated as indivisible (their MathML
+//    annotation carries the TeX source; its newlines are not soft breaks).
+//
+// Character-level (mid-line) cuts remain deliberately unsupported: the
+// segment model stores whole lines. Sub-sentence extraction is 添加挖空.
 
 export interface SplitSelection {
   start_line: number
   end_line: number
 }
 
-/** Elements whose interior line structure must not be refined — snap to
- *  the whole block instead. */
-const ATOMIC_SEL = 'pre, table, .katex-block'
+/** Blocks that must be cut whole (one handle for the entire range). */
+const ATOMIC_SEL = 'pre, table, hr, .katex-block'
 
-/** Resolve a live selection inside `body` to an inclusive source-line
- *  range. Returns null when there is no usable selection inside body. */
-export function selectionToLines(
-  body: HTMLElement,
-  sel: Selection,
-): SplitSelection | null {
-  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null
-  const r = sel.getRangeAt(0)
-  if (!body.contains(r.commonAncestorContainer)) return null
-  if (!sel.toString().trim()) return null
+// annotate is idempotent per rendered content: the body element survives
+// chunk swaps (only innerHTML changes), so remember what we annotated.
+const annotatedToken = new WeakMap<HTMLElement, string>()
 
-  const blockOf = (node: Node): HTMLElement | null => {
-    let n: Node | null = node
-    while (n && n !== body) {
-      if (n.nodeType === Node.ELEMENT_NODE) {
-        const hit = (n as HTMLElement).closest<HTMLElement>('[data-src-line]')
-        if (hit) return hit
+function makeHandle(start: number, end: number): HTMLButtonElement {
+  const b = document.createElement('button')
+  b.type = 'button'
+  b.className = 'line-handle'
+  b.tabIndex = -1
+  b.dataset.lineStart = String(start)
+  b.dataset.lineEnd = String(end)
+  b.title =
+    start === end
+      ? `选择第 ${start} 行作为分割起点/终点`
+      : `选择第 ${start}–${end} 行（整块）作为分割起点/终点`
+  return b
+}
+
+/** Split every text node containing '\n' into ['piece', '\n', 'piece', …]
+ *  sibling text nodes so the main walk only ever sees newline-free text and
+ *  standalone '\n' separators. Skips .katex interiors. */
+function splitNewlines(root: Element): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  const targets: Text[] = []
+  let n = walker.nextNode() as Text | null
+  while (n) {
+    if ((n.textContent || '').includes('\n') && !n.parentElement?.closest('.katex')) {
+      targets.push(n)
+    }
+    n = walker.nextNode() as Text | null
+  }
+  for (const t of targets) {
+    let node: Text = t
+    let idx = (node.textContent || '').indexOf('\n')
+    while (idx >= 0) {
+      const nl = node.splitText(idx) // nl starts with '\n'
+      const rest = nl.splitText(1) // nl == '\n', rest == remainder
+      node = rest
+      idx = (node.textContent || '').indexOf('\n')
+    }
+  }
+}
+
+interface WalkState {
+  line: number
+}
+
+function runHasContent(run: Node[]): boolean {
+  for (const n of run) {
+    if (n.nodeType === Node.ELEMENT_NODE) {
+      const tag = (n as HTMLElement).tagName
+      if (tag === 'IMG' || tag === 'BR') return true
+    }
+    if ((n.textContent || '').trim() !== '') return true
+  }
+  return false
+}
+
+function wrapRun(
+  run: Node[],
+  line: number,
+  handled: Set<number>,
+): void {
+  const span = document.createElement('span')
+  span.className = 'line'
+  span.dataset.lineStart = String(line)
+  span.dataset.lineEnd = String(line)
+  run[0].parentNode!.insertBefore(span, run[0])
+  for (const n of run) span.appendChild(n)
+  if (!handled.has(line)) {
+    handled.add(line)
+    span.prepend(makeHandle(line, line))
+  }
+}
+
+/** Wrap an atomic block in a positioned div.line-anchor with ONE handle. */
+function wrapAtomic(el: HTMLElement): void {
+  const start = parseInt(el.dataset.srcLine || '0', 10)
+  const end = parseInt(el.dataset.srcEnd || el.dataset.srcLine || '0', 10)
+  if (!start) return
+  const w = document.createElement('div')
+  w.className = 'line-anchor'
+  w.dataset.lineStart = String(start)
+  w.dataset.lineEnd = String(Math.max(end, start))
+  el.replaceWith(w)
+  w.appendChild(el)
+  w.appendChild(makeHandle(start, Math.max(end, start)))
+}
+
+/** Recursive walk. Every tagged (data-src-line) element resets the counter
+ *  authoritatively, so stray '\n' whitespace between blocks (markdown-it
+ *  joins block outputs with newlines) can't corrupt the mapping: inside a
+ *  soft leaf block there are no tagged children, so '\n' counting there is
+ *  exact. */
+function walk(parent: Element, st: WalkState, handled: Set<number>): void {
+  let run: Node[] = []
+  let runLine = st.line
+
+  const flush = () => {
+    if (run.length && runHasContent(run)) wrapRun(run, runLine, handled)
+    run = []
+  }
+
+  for (const node of Array.from(parent.childNodes)) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const data = node.textContent || ''
+      if (data === '\n') {
+        // soft break (or inter-block whitespace — corrected by the next
+        // tagged sibling's data-src-line reset): ends the current line.
+        run.push(node)
+        flush()
+        st.line += 1
+        runLine = st.line
+      } else {
+        run.push(node)
       }
-      n = n.parentNode
+      continue
     }
-    return null
-  }
+    if (node.nodeType !== Node.ELEMENT_NODE) continue
+    const el = node as HTMLElement
 
-  let startEl = blockOf(r.startContainer)
-  let endEl = blockOf(r.endContainer)
-
-  if (!startEl || !endEl) {
-    // selection not inside any tagged block (shouldn't happen for rendered
-    // markdown; guard anyway) — use the first/last tagged block the range
-    // actually covers
-    const all = r.cloneContents().querySelectorAll<HTMLElement>('[data-src-line]')
-    if (!all.length) return null
-    startEl = startEl ?? all[0]
-    endEl = endEl ?? all[all.length - 1]
-  }
-
-  // snap an endpoint sitting inside an atomic construct out to the whole
-  // atomic block (tr → table, code → pre, katex internals → .katex-block)
-  const atomicOf = (el: HTMLElement): HTMLElement | null => {
-    const hit = el.closest<HTMLElement>(ATOMIC_SEL)
-    // only meaningful when the atomic block itself is inside body and tagged
-    return hit && body.contains(hit) && hit.dataset.srcLine ? hit : null
-  }
-
-  const blockStart = (el: HTMLElement): number =>
-    parseInt(el.dataset.srcLine || '0', 10)
-  const blockEnd = (el: HTMLElement): number =>
-    parseInt(el.dataset.srcEnd || el.dataset.srcLine || '0', 10)
-
-  /** Count soft-break '\n' between the block's start and an endpoint of the
-   *  selection. cloneContents keeps DOM structure; toString() then yields the
-   *  soft-break newlines (inline katex MathML carries none — verified against
-   *  the render pipeline). atLineStart = the endpoint sits exactly after a
-   *  '\n' (i.e. flush at the start of the next source line). */
-  const newlineOffset = (
-    el: HTMLElement,
-    container: Node,
-    offset: number,
-  ): { n: number; atLineStart: boolean } => {
-    try {
-      const sub = document.createRange()
-      sub.selectNodeContents(el)
-      sub.setEnd(container, offset)
-      const text = sub.toString()
-      let n = 0
-      for (let i = 0; i < text.length; i++) if (text[i] === '\n') n++
-      return { n, atLineStart: text.endsWith('\n') }
-    } catch {
-      return { n: 0, atLineStart: false } // endpoint outside block → no refine
+    if (el.dataset.srcLine) {
+      // a tagged block: reset to its authoritative start line
+      flush()
+      st.line = parseInt(el.dataset.srcLine, 10)
+      runLine = st.line
+      if (el.matches(ATOMIC_SEL)) {
+        wrapAtomic(el)
+      } else {
+        walk(el, st, handled)
+      }
+      st.line = parseInt(el.dataset.srcEnd || el.dataset.srcLine, 10) + 1
+      runLine = st.line
+      continue
     }
-  }
 
-  // ---- start line ----
-  let a: number
-  const startAtomic = atomicOf(startEl)
-  if (startAtomic) {
-    a = blockStart(startAtomic)
-  } else {
-    // caret at the start of line k belongs to line k
-    a = blockStart(startEl) + newlineOffset(startEl, r.startContainer, r.startOffset).n
-  }
+    if (el.tagName === 'BR') {
+      run.push(el)
+      flush()
+      st.line += 1
+      runLine = st.line
+      continue
+    }
 
-  // ---- end line ----
-  let b: number
-  const endAtomic = atomicOf(endEl)
-  if (endAtomic) {
-    b = blockEnd(endAtomic)
-  } else {
-    const { n, atLineStart } = newlineOffset(endEl, r.endContainer, r.endOffset)
-    // endpoint flush at the start of line n → last selected char is on n-1
-    b = blockStart(endEl) + n - (atLineStart && n > 0 ? 1 : 0)
-  }
+    if (el.matches('.katex, img')) {
+      run.push(el)
+      continue
+    }
 
-  if (!a || !b || b < a) return null
-  return { start_line: a, end_line: b }
+    const text = el.textContent || ''
+    if (text.includes('\n') && !el.closest('.katex')) {
+      // inline element spanning a soft break (e.g. **bold over two
+      // lines**) — descend so both lines get their own spans inside it
+      flush()
+      walk(el, st, handled)
+      runLine = st.line
+      continue
+    }
+    run.push(el)
+  }
+  flush()
 }
 
-/** Clamp a line-range to the parent segment. The split API clamps too;
- *  this is for the UI's preview copy (将切出…). */
-export function clampToSegment(
+/** Annotate every rendered source line inside `body` with a span.line (or
+ *  div.line-anchor for atomic blocks) carrying data-line-start/end plus a
+ *  gutter handle button. Idempotent per (element, token). */
+export function annotateLines(body: HTMLElement, token: string): void {
+  if (annotatedToken.get(body) === token) return
+  splitNewlines(body)
+  const handled = new Set<number>()
+  const st: WalkState = { line: 1 }
+  walk(body, st, handled)
+  annotatedToken.set(body, token)
+}
+
+/** All annotated items in the body, as line ranges. */
+export function annotatedItems(
+  body: HTMLElement,
+): { el: HTMLElement; start: number; end: number }[] {
+  const out: { el: HTMLElement; start: number; end: number }[] = []
+  for (const el of Array.from(
+    body.querySelectorAll<HTMLElement>('.line, .line-anchor'),
+  )) {
+    const s = parseInt(el.dataset.lineStart || '0', 10)
+    const e = parseInt(el.dataset.lineEnd || el.dataset.lineStart || '0', 10)
+    if (s) out.push({ el, start: s, end: e })
+  }
+  return out
+}
+
+function ellipsizeMiddle(s: string, head = 26, tail = 18): string {
+  if (s.length <= head + tail + 3) return s
+  return `${s.slice(0, head)} … ${s.slice(-tail)}`
+}
+
+/** Head+tail preview of the cut range (user spec 2026-10-01: the old
+ *  head-only snippet couldn't confirm where the cut ENDED). Each of the
+ *  first/last source lines is itself middle-ellipsized when very long, and
+ *  returned raw for the title tooltip. */
+export function previewHeadTail(
+  chunkText: string,
   sel: SplitSelection,
-  segStart: number,
-  segEnd: number,
-): SplitSelection {
-  return {
-    start_line: Math.max(sel.start_line, segStart),
-    end_line: Math.min(sel.end_line, segEnd),
-  }
-}
-
-/** The text a split would actually cut (relative-line range into the chunk
- *  text) — the P4 preview: block/line expansion means the selection and the
- *  cut range can differ, show the truth before the click. */
-export function previewCutText(chunkText: string, sel: SplitSelection): string {
+): { head: string; tail: string; headFull: string; tailFull: string } {
   const lines = chunkText.split('\n')
-  const cut = lines.slice(sel.start_line - 1, sel.end_line)
-  return cut.join(' ⏎ ').trim()
+  const headFull = (lines[sel.start_line - 1] ?? '').trim()
+  const tailFull = (lines[sel.end_line - 1] ?? '').trim()
+  return {
+    head: ellipsizeMiddle(headFull),
+    tail: ellipsizeMiddle(tailFull),
+    headFull,
+    tailFull,
+  }
 }

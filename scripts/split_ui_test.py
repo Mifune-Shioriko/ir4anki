@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
-"""Playwright E2E: 分割文段 selection→line mapping + stale/sticky fixes (2026-09-30).
+"""Playwright E2E: 分割文段 LINE-HANDLE picker (2026-10-01).
+
+SUPERSEDES the selection→line-mapping test: the split flow no longer reads
+the DOM selection. Every rendered source line carries a small handle button
+(.line-handle, injected by lib/split-selection.ts annotateLines); atomic
+blocks (fence/table/hr/$$ formula) get ONE handle for the whole block
+(.line-anchor). Click first line → click last line → inline confirm bar with
+range + HEAD and TAIL previews → 确认分割 → POST /api/reading/split.
 
 SELF-CONTAINED: throwaway uvicorn on :8904 with isolated ANKI_STATE_DIR, a
 temporary corpus (ANKI_NOTES_DIR) and a DEAD AnkiConnect — the live app
 (:8901), the real collection and ~/anki-notes are untouched.
 
-Covers the FRONTEND half of the split-misalignment fix (the backend half is
-split_guard_test.py):
-  1. line-level refinement — selecting lines 2-3 of a 3-line soft-wrapped
-     paragraph cuts EXACTLY those source lines (not the whole <p> block).
-  2. atomic snap — selecting one line inside a ``` code block snaps to the
-     WHOLE block range (a sub-range cut would corrupt the fence).
-  3. atomic snap — selecting inside a $$ display formula snaps to the whole
-     katex-block (the formula token used to carry NO data-src-line at all).
-  4. the 切割预览 row shows the real cut range before the click.
-  5. sticky-selection fix — after selecting in the card body, selecting text
-     in the RIGHT-COLUMN full-file viewer clears the split selection (the
-     分割 button greys out) instead of keeping the stale in-card range.
+Covers:
+  1. handle rendering — one handle per non-blank source line; a 3-line
+     soft-wrapped paragraph gets THREE handles (line-level granularity);
+     atomic blocks get ONE handle spanning the whole block range.
+  2. two-click range pick — click line 4 then line 5 → confirm bar shows
+     4–5, both lines tint (.line-sel), 头/尾 previews show the right text.
+  3. 取消 clears the pick (confirm bar gone, no tint).
+  4. 确认分割 persists the exact whole-line child (lines 4–5) via the API.
+  5. post-split rounds: the soft-paragraph child re-renders with per-line
+     handles; the tail child shows the fence and katex-block as single
+     whole-block handles; a cross-block pick tints every overlapped item.
+  6. the old selection-driven scissors button is GONE.
 
 Run: backend/.venv/bin/python scripts/split_ui_test.py
 (needs playwright + chromium; both present in backend/.venv)
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -30,6 +38,7 @@ import tempfile
 import time
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 from playwright.sync_api import sync_playwright
 
@@ -39,14 +48,14 @@ PASS = 0
 FAIL = 0
 
 
-def check(name, cond, detail=""):
+def check(name: str, cond: Any, detail: Any = "") -> None:
     global PASS, FAIL
     if cond:
         PASS += 1
         print(f"  ok  {name}")
     else:
         FAIL += 1
-        print(f"  FAIL {name} {detail}")
+        print(f"  FAIL {name} {detail!r}")
 
 
 def api(path, method="GET", body=None):
@@ -74,8 +83,7 @@ def wait_ready(timeout=45):
     raise RuntimeError("test backend never came up")
 
 
-# A fixture whose paragraph soft-wraps over 3 distinct lines (no inline markup
-# → one text node with embedded '\n', exactly what selectionToLines refines).
+# Fixture (whole-file seeding → ONE segment covering 1..18).
 # 1-based source lines:
 #   1 # 测试笔记
 #   2 (blank)
@@ -129,140 +137,70 @@ def _seed_and_deal():
     return chunks[0] if chunks else None
 
 
-# --- DOM selection helpers (run in the page) ---------------------------------
+# --- line-handle helpers (run against the page) ------------------------------
 
-def _select_paragraph_lines(page, line_from, line_to):
-    """Select from the start of source line `line_from` to the end of
-    `line_to` INSIDE the first <p data-src-line] of the card body. Returns the
-    relative line range the app computed (read back off the preview row)."""
-    return page.evaluate(
-        """([from, to]) => {
-          const body = document.querySelector('.reading-chunk-body');
-          // the soft-wrapped 3-line paragraph is the <p> whose text has 2 '\\n'
-          const p = [...body.querySelectorAll('p[data-src-line]')]
-            .find(e => (e.textContent.match(/\\n/g) || []).length === 2);
-          const tn = p.firstChild;  // single text node with embedded newlines
-          const text = tn.textContent;
-          const idxs = [];
-          for (let i = 0; i < text.length; i++) if (text[i] === '\\n') idxs.push(i);
-          // line k (1-based within p) starts after the (k-1)-th newline
-          const lineStart = (k) => k === 1 ? 0 : idxs[k - 2] + 1;
-          const lineEnd = (k) => k >= idxs.length + 1 ? text.length : idxs[k - 1];
-          const r = document.createRange();
-          r.setStart(tn, lineStart(from));
-          r.setEnd(tn, lineEnd(to));
-          const sel = window.getSelection();
-          sel.removeAllRanges(); sel.addRange(r);
-          sel.getRangeAt(0); // force selectionchange consumers
-          return { selected: sel.toString() };
-        }""",
-        [line_from, line_to],
-    )
+def _handles(page):
+    """All handle ranges on the current card, in DOM order."""
+    return page.evaluate("""() => Array.from(
+        document.querySelectorAll('.reading-chunk-body .line-handle')
+    ).map(h => [
+        parseInt(h.dataset.lineStart), parseInt(h.dataset.lineEnd),
+    ])""")
 
 
-def _select_in_atomic(page, kind):
-    """Select text INSIDE a code block (kind='code') or a $$ formula
-    (kind='math') of the card body."""
-    return page.evaluate(
-        """(kind) => {
-          const body = document.querySelector('.reading-chunk-body');
-          const host = kind === 'code'
-            ? body.querySelector('pre')
-            : body.querySelector('.katex-block');
-          const tn = [...host.childNodes].find(n => n.nodeType === 3 && n.textContent.trim())
-            || host.querySelector('*') || host;
-          let node = tn, off0 = 0, off1 = 1;
-          if (kind === 'code') {
-            // <pre><code>text\\n</code></pre> — select inside the <code> text
-            const code = host.querySelector('code');
-            node = code.firstChild; off0 = 0; off1 = Math.min(4, node.textContent.length);
-          } else {
-            // katex renders nested spans; select the annotation text
-            const ann = host.querySelector('annotation') || host.querySelector('mi') || host;
-            node = ann.firstChild && ann.firstChild.nodeType === 3 ? ann.firstChild : ann;
-            off0 = 0; off1 = 1;
-          }
-          const r = document.createRange();
-          r.setStart(node, off0); r.setEnd(node, off1);
-          const sel = window.getSelection();
-          sel.removeAllRanges(); sel.addRange(r);
-          return { hostTag: host.tagName, hostClass: host.className };
-        }""",
-        kind,
-    )
+def _click_handle(page, start, end=None):
+    sel = f'.reading-chunk-body .line-handle[data-line-start="{start}"]'
+    if end is not None:
+        sel += f'[data-line-end="{end}"]'
+    loc = page.locator(sel)
+    assert loc.count() >= 1, f"no handle {sel}"
+    loc.first.click()
+    page.wait_for_timeout(150)
 
 
-def _select_any_in_body(page):
-    """Select a few chars inside ANY paragraph of the card body (section 4
-    just needs an in-body selection to exist before testing the sticky clear;
-    it must not assume the 3-line paragraph is on the current card)."""
-    return page.evaluate(
-        """() => {
-          const body = document.querySelector('.reading-chunk-body');
-          if (!body) return { ok: false };
-          const ps = [...body.querySelectorAll('p[data-src-line]')];
-          for (const p of ps) {
-            // walk to the first real TEXT node (firstChild may be an inline
-            // element like a katex span, where offsets count children)
-            const w = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
-            let tn = w.nextNode();
-            while (tn && !tn.textContent.trim()) tn = w.nextNode();
-            if (tn) {
-              const r = document.createRange();
-              r.setStart(tn, 0);
-              r.setEnd(tn, Math.min(3, tn.textContent.length));
-              const sel = window.getSelection();
-              sel.removeAllRanges(); sel.addRange(r);
-              return { ok: true, text: sel.toString() };
-            }
-          }
-          return { ok: false };
-        }"""
-    )
+def _confirm(page):
+    """{range, previews[], n_sel} of the inline confirm bar, or None."""
+    return page.evaluate("""() => {
+        const bar = document.querySelector('.split-confirm');
+        if (!bar) return null;
+        return {
+            range: (bar.querySelector('.split-confirm__range') || {}).textContent || '',
+            previews: Array.from(bar.querySelectorAll('.split-confirm__preview'))
+                .map(e => e.textContent),
+            n_sel: document.querySelectorAll(
+                '.reading-chunk-body .line-sel').length,
+        };
+    }""")
 
 
-def _select_in_right_column(page):
-    """Select text in the RIGHT-COLUMN full-file viewer (.note-column)."""
-    return page.evaluate(
-        """() => {
-          const body = document.querySelector('.note-column .note-body');
-          if (!body) return { ok: false };
-          const ps = [...body.querySelectorAll('p[data-src-line]')];
-          for (const p of ps.reverse()) {
-            const w = document.createTreeWalker(p, NodeFilter.SHOW_TEXT);
-            let tn = w.nextNode();
-            while (tn && !tn.textContent.trim()) tn = w.nextNode();
-            if (tn) {
-              const r = document.createRange();
-              r.setStart(tn, 0);
-              r.setEnd(tn, Math.min(3, tn.textContent.length));
-              const sel = window.getSelection();
-              sel.removeAllRanges(); sel.addRange(r);
-              return { ok: true, text: sel.toString() };
-            }
-          }
-          return { ok: false };
-        }"""
-    )
+def _range_nums(txt):
+    m = re.search(r"第\s*(\d+)–(\d+)\s*行（(\d+)\s*行）", txt or "")
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
-def _preview(page):
-    """Read the 切割预览 row (or null when absent)."""
-    return page.evaluate(
-        """() => {
-          const el = document.querySelector('.split-preview__range');
-          return el ? el.textContent : null;
-        }"""
-    )
+def _cancel(page):
+    page.locator(".split-confirm__cancel").click()
+    page.wait_for_timeout(150)
 
 
-def _split_enabled(page):
-    return page.evaluate(
-        """() => {
-          const b = document.querySelector('md-icon-button[data-aria-label^=\"分割文段\"]');
-          return b ? !b.disabled : null;
-        }"""
-    )
+def _confirm_ok(page):
+    page.locator(".split-confirm__ok").click()
+    page.wait_for_timeout(900)
+
+
+def _goto_card_with(page, needle, max_next=8):
+    """Click 下一张 until the card body contains needle (or options run out)."""
+    for _ in range(max_next):
+        txt = page.locator(".reading-chunk-body").first.inner_text()
+        if needle in txt:
+            return True
+        nxt = page.locator('md-text-button:has-text("下一张")')
+        if nxt.count() and nxt.first.is_enabled():
+            nxt.first.click()
+            page.wait_for_timeout(400)
+        else:
+            break
+    return needle in page.locator(".reading-chunk-body").first.inner_text()
 
 
 def run(notes: Path):
@@ -277,136 +215,149 @@ def run(notes: Path):
         js_errors = []
         page.on("pageerror", lambda e: js_errors.append(str(e)))
         page.goto(BASE + "/", wait_until="networkidle")
-        page.wait_for_selector(".reading-chunk-body", timeout=30000)
-        check("reading card body rendered", True)
-        # the whole-file segment covers 1..18 → chunk.line_start == 1, so the
-        # preview's RELATIVE lines equal absolute file lines (base = 0).
+        page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
+        check("reading card rendered WITH line handles", True)
         check("dealt chunk is the whole file (line_start 1)",
               chunk["line_start"] == 1, chunk.get("line_start"))
 
-        print("== 1. line-level refinement: select para lines 2-3 ==")
-        # source lines 4-5 (para occupies 3-5; its line 2 = src 4, line 3 = src 5)
-        sel = _select_paragraph_lines(page, 2, 3)
-        check("paragraph lines 2-3 selected", "己庚辛壬癸" in sel["selected"]
-              and "子丑寅卯辰" in sel["selected"]
-              and "甲乙丙丁戊" not in sel["selected"], sel["selected"])
-        page.wait_for_function("() => document.querySelector('.split-preview__range')", timeout=5000)
-        pv = _preview(page)
-        check("preview shows lines 4–5 (NOT whole para 3–5)",
-              pv is not None and "4" in pv and "5" in pv and "3" not in pv, pv)
-        # click split, verify the persisted child range via state
-        page.locator('md-icon-button[data-aria-label^="分割文段"]').click()
-        page.wait_for_timeout(800)
+        print("== 1. handle rendering ==")
+        hs = _handles(page)
+        # 8 handles: h1(1) + para lines(3,4,5) + h2(7) + fence(9-12, ONE)
+        #          + katex(14-16, ONE) + closing line(18)
+        expect = [[1, 1], [3, 3], [4, 4], [5, 5], [7, 7],
+                  [9, 12], [14, 16], [18, 18]]
+        check("one handle per source line; atomic blocks ONE whole-block handle",
+              hs == expect, hs)
+        soft = page.evaluate("""() => {
+            const p = document.querySelector('.reading-chunk-body p');
+            return p ? p.querySelectorAll(':scope > span.line > .line-handle').length : 0;
+        }""")
+        check("3-line soft paragraph has 3 handles (line granularity)",
+              soft == 3, soft)
+        anchors = page.evaluate("""() => Array.from(
+            document.querySelectorAll('.reading-chunk-body .line-anchor')
+        ).map(a => [
+            a.firstElementChild ? a.firstElementChild.tagName : '',
+            parseInt(a.dataset.lineStart), parseInt(a.dataset.lineEnd),
+            a.querySelectorAll(':scope > .line-handle').length,
+        ])""")
+        check("fence + katex wrapped in .line-anchor with exactly 1 handle each",
+              len(anchors) == 2
+              and all(a[3] == 1 for a in anchors)
+              and {tuple(a[1:3]) for a in anchors} == {(9, 12), (14, 16)},
+              anchors)
+        check("old selection-driven 分割文段 scissors button is GONE",
+              page.locator('md-icon-button[data-aria-label^="分割文段"]').count() == 0)
+        check("old .split-preview row is GONE",
+              page.locator(".split-preview").count() == 0)
+
+        print("== 2. two-click pick: line 4 then line 5 ==")
+        _click_handle(page, 4)
+        c = _confirm(page)
+        check("single click → confirm bar with 1-line range 4–4",
+              c is not None and _range_nums(c["range"]) == (4, 4, 1), c)
+        check("head preview = line 4 text",
+              c is not None and any("己庚辛壬癸" in p_ for p_ in c["previews"]),
+              c and c["previews"])
+        check("no tail preview for a 1-line cut",
+              c is not None and len(c["previews"]) == 1, c and c["previews"])
+        check("clicked line tinted", c is not None and c["n_sel"] == 1, c)
+
+        _click_handle(page, 5)
+        c = _confirm(page)
+        check("second click extends range to 4–5 (2 lines)",
+              c is not None and _range_nums(c["range"]) == (4, 5, 2), c)
+        check("head preview = 己庚辛壬癸 AND tail preview = 子丑寅卯辰",
+              c is not None and len(c["previews"]) == 2
+              and "己庚辛壬癸" in c["previews"][0]
+              and "子丑寅卯辰" in c["previews"][1],
+              c and c["previews"])
+        check("both lines tinted (.line-sel == 2)",
+              c is not None and c["n_sel"] == 2, c)
+        # re-adjust: clicking line 3 moves the far end back
+        _click_handle(page, 3)
+        c = _confirm(page)
+        check("further click re-adjusts far end → 3–5",
+              c is not None and _range_nums(c["range"]) == (3, 5, 3), c)
+
+        print("== 3. 取消 clears the pick ==")
+        _cancel(page)
+        c = _confirm(page)
+        check("confirm bar gone after 取消", c is None, c)
+        check("no tint left after 取消",
+              page.locator(".reading-chunk-body .line-sel").count() == 0)
+
+        print("== 4. 确认分割 persists the exact whole-line child ==")
+        _click_handle(page, 4)
+        _click_handle(page, 5)
+        _confirm_ok(page)
         st = api("/api/reading/state")
         round_segs = st.get("round", {}).get("chunks", [])
-        # the selected todo child should be exactly source lines 4-5
-        todo = [c for c in round_segs
-                if c["path"] == A_REL and c.get("status") == "todo"]
-        cut = next((c for c in todo if c["line_start"] == 4 and c["line_end"] == 5), None)
-        check("persisted cut = lines 4-5 (line-level, not whole block)",
-              cut is not None, [(c["line_start"], c["line_end"]) for c in todo])
+        todo = [c2 for c2 in round_segs
+                if c2["path"] == A_REL and c2.get("status") == "todo"]
+        cut = next((c2 for c2 in todo
+                    if c2["line_start"] == 4 and c2["line_end"] == 5), None)
+        check("persisted child = lines 4–5", cut is not None,
+              [(c2["line_start"], c2["line_end"]) for c2 in todo])
         if cut:
-            check("cut text is exactly para lines 2-3",
+            check("child text is exactly the two clicked lines",
                   "己庚辛壬癸" in cut["text"] and "子丑寅卯辰" in cut["text"]
-                  and "甲乙丙丁戊" not in cut["text"], cut["text"])
+                  and "甲乙丙丁戊" not in cut["text"], cut["text"][:80])
+        bg = [c2 for c2 in round_segs if c2.get("status") == "background"]
+        check("prefix NOT dealt in-round (bookmark sinks it to file queue)",
+              len(bg) == 0, [(c2["line_start"], c2["line_end"]) for c2 in bg])
+        # the read prefix (1–3) sank to BACKGROUND in the FILE's segment store
+        # (not the round) — verify via the list summary's background count.
+        entry = next((s for s in st.get("list", [])
+                      if s.get("path") == A_REL), None)
+        check("prefix (1–3) counted as background (bookmark policy)",
+              entry is not None and entry.get("background") == 1,
+              entry and {k: entry.get(k) for k in
+                         ("background", "todo", "active", "done")})
 
-        print("== 2. atomic snap: one line inside a ``` code block ==")
-        # re-deal so a fresh whole-file segment is on screen
+        print("== 5. post-split rounds: children re-render handles ==")
         api("/api/reading/finish", "POST")
-        d = api("/api/reading/start?mode=focus", "POST")
-        # the code block may be its own segment after the previous cut; find a
-        # chunk whose text contains the fence and select inside it
+        api("/api/reading/start?mode=focus", "POST")
         page.reload(wait_until="networkidle")
-        page.wait_for_selector(".reading-chunk-body", timeout=30000)
-        # advance to a card that shows the code block
-        found = False
-        for _ in range(8):
-            body_txt = page.locator(".reading-chunk-body").first.inner_text()
-            if "echo line-one" in body_txt or "```" in body_txt or "E = mc" in body_txt:
-                found = True
-                break
-            nxt = page.locator('md-text-button:has-text("下一张")')
-            if nxt.count() and nxt.first.is_enabled():
-                nxt.first.click(); page.wait_for_timeout(400)
-            else:
-                break
-        has_code = page.evaluate(
-            "() => !!document.querySelector('.reading-chunk-body pre')")
-        if has_code:
-            _select_in_atomic(page, "code")
-            page.wait_for_timeout(300)
-            pv = _preview(page)
-            # the fence spans 3 source lines within its own segment; the cut
-            # must be the WHOLE block, so the preview range covers ≥3 lines
-            # (start..end with end-start+1 >= 3) OR the whole segment.
-            check("code-block selection → preview present (atomic snap)",
-                  pv is not None, pv)
-            # verify it snapped: selecting 4 chars still yields the full block
-            if pv:
-                import re
-                nums = re.findall(r"\d+", pv)
-                if len(nums) >= 2:
-                    a, b = int(nums[0]), int(nums[1])
-                    check("code-block snap spans the whole fence (>=3 lines)",
-                          b - a + 1 >= 3, pv)
-        else:
-            check("code block present in some dealt card", False, "no <pre> found")
+        page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
+        # first dealt child = lines 4–5 (the cut): one <p> with 2 soft lines
+        hs = _handles(page)
+        check("cut child card: 2 per-line handles (rel 1–2)",
+              hs == [[1, 1], [2, 2]], hs)
+        _click_handle(page, 1)
+        _click_handle(page, 2)
+        c = _confirm(page)
+        check("child pick 1–2 shows head 己庚 + tail 子丑",
+              c is not None and _range_nums(c["range"]) == (1, 2, 2)
+              and "己庚辛壬癸" in c["previews"][0]
+              and "子丑寅卯辰" in c["previews"][1], c)
+        _cancel(page)
 
-        print("== 3. atomic snap: $$ display formula ==")
-        has_math = page.evaluate(
-            "() => !!document.querySelector('.reading-chunk-body .katex-block')")
-        if not has_math:
-            # advance to the card carrying the formula
-            for _ in range(8):
-                if page.evaluate("() => !!document.querySelector('.reading-chunk-body .katex-block')"):
-                    has_math = True
-                    break
-                nxt = page.locator('md-text-button:has-text("下一张")')
-                if nxt.count() and nxt.first.is_enabled():
-                    nxt.first.click(); page.wait_for_timeout(400)
-                else:
-                    break
-        check("katex-block rendered WITH data-src-line (P3b tagging)",
-              page.evaluate("""() => {
-                const k = document.querySelector('.reading-chunk-body .katex-block');
-                return !!k && !!k.getAttribute('data-src-line');
-              }"""),
-              "no data-src-line on .katex-block")
-        if has_math:
-            _select_in_atomic(page, "math")
-            page.wait_for_timeout(300)
-            pv = _preview(page)
-            check("formula selection → preview present (atomic snap, non-null)",
-                  pv is not None, pv)
-
-        print("== 4. sticky fix: right-column selection clears the split ==")
-        # make sure we're on a card with selectable body text
-        for _ in range(8):
-            if _select_any_in_body(page).get("ok"):
-                break
-            nxt = page.locator('md-text-button:has-text("下一张")')
-            if nxt.count() and nxt.first.is_enabled():
-                nxt.first.click(); page.wait_for_timeout(400)
-            else:
-                break
-        body_ok = _select_any_in_body(page).get("ok")
-        check("found a card with selectable body paragraph", body_ok, body_ok)
-        page.wait_for_timeout(300)
-        enabled_in_card = _split_enabled(page)
-        check("split button ENABLED after in-card selection",
-              enabled_in_card is True, enabled_in_card)
-        rc = _select_in_right_column(page)
-        if rc.get("ok"):
-            page.wait_for_timeout(300)
-            enabled_after = _split_enabled(page)
-            preview_after = _preview(page)
-            check("right-column selection DISABLES split (stale range cleared)",
-                  enabled_after is False, f"enabled={enabled_after} preview={preview_after}")
-            check("preview row gone after outside selection",
-                  preview_after is None, preview_after)
-        else:
-            check("right column selectable (note-body present at 1920)",
-                  False, "could not select in .note-column")
+        # tail child = src lines 6–18 → rel: h2=2, fence=4–7, katex=9–11,
+        # closing line=13
+        check("navigated to the tail card",
+              _goto_card_with(page, "echo line-one"), "fence card not found")
+        hs = _handles(page)
+        expect_tail = [[2, 2], [4, 7], [9, 11], [13, 13]]
+        check("tail card handles: heading + fence(1) + katex(1) + closing",
+              hs == expect_tail, hs)
+        # atomic whole-block pick
+        _click_handle(page, 4, 7)
+        c = _confirm(page)
+        check("fence handle picks the WHOLE block (4 lines)",
+              c is not None and _range_nums(c["range"]) == (4, 7, 4), c)
+        _cancel(page)
+        # cross-block pick tints every overlapped item
+        _click_handle(page, 2)
+        _click_handle(page, 13)
+        c = _confirm(page)
+        check("cross-block pick 2–13 tints all 4 items",
+              c is not None and _range_nums(c["range"]) == (2, 13, 12)
+              and c["n_sel"] == 4, c)
+        check("cross-block head=小节 tail=结尾",
+              c is not None and "小节" in c["previews"][0]
+              and "结尾正文一行" in c["previews"][1], c and c["previews"])
+        _cancel(page)
 
         check("no JS page errors", not js_errors, js_errors[:3])
         browser.close()

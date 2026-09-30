@@ -1615,29 +1615,111 @@ a:focus-visible,
   opacity: 0.85;
 }
 
-/* 切割预览 (2026-09-30): the actual cut range, shown the moment a selection
- * is tracked (block/line expansion can differ from what the user selected). */
-.split-preview {
+/* 分割行把手 + 确认条 (line-handle split picker, 2026-10-01). Every rendered
+ * source line gets a small dot in the left gutter (.line-handle inside
+ * span.line / div.line-anchor — injected by lib/split-selection.ts
+ * annotateLines). Click first line → click last line → lines tint
+ * (.line-sel) and the confirm bar shows the exact range with head AND tail
+ * previews. Replaces the old .split-preview (selection-driven, head-only). */
+.reading-chunk-body {
+  position: relative;
+  /* gutter room for atomic-block (pre/table/hr/katex) handles */
+  padding-left: 30px !important;
+}
+.reading-chunk-body .line,
+.reading-chunk-body .line-anchor {
+  position: relative;
+}
+/* Soft-line handles are INLINE dots before the sentence: several source
+ * lines often share one visual row (19-char median line in a ~580px card),
+ * so an absolutely-positioned gutter dot would float mid-text. Atomic-block
+ * handles (.line-anchor > .line-handle) stay absolute in the gutter — the
+ * block's left edge is stable. */
+.line-handle {
+  display: inline-block;
+  position: relative;
+  width: 10px;
+  height: 10px;
+  margin-right: 7px;
+  vertical-align: baseline;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--md-sys-color-outline-variant);
+  opacity: 0.45;
+  cursor: pointer;
+  transition: opacity 0.15s ease, transform 0.15s ease, background 0.15s ease;
+}
+/* enlarge the click target without growing the visual dot */
+.line-handle::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+}
+.line-handle:hover {
+  opacity: 1;
+  transform: scale(1.4);
+  background: var(--md-sys-color-primary);
+}
+.line-anchor > .line-handle {
+  position: absolute;
+  left: -22px;
+  top: 0.35em;
+  margin-right: 0;
+}
+.line-sel {
+  background: color-mix(in srgb, var(--md-sys-color-secondary-container) 55%, transparent);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+.line-anchor.line-sel {
+  background: color-mix(in srgb, var(--md-sys-color-secondary-container) 55%, transparent);
+}
+.line-sel > .line-handle,
+.line-anchor.line-sel > .line-handle {
+  opacity: 1;
+  background: var(--md-sys-color-primary);
+}
+
+.split-confirm {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  justify-content: space-between;
   gap: 10px;
   flex-wrap: wrap;
   margin: -4px 0 10px;
-  padding: 6px 10px;
+  padding: 8px 10px 8px 12px;
   border-radius: var(--md-sys-shape-corner-extra-small, 4px);
   background: var(--md-sys-color-secondary-container);
   color: var(--md-sys-color-on-secondary-container);
 }
-.split-preview__range {
+.split-confirm__info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+.split-confirm__range {
   font-weight: 500;
   white-space: nowrap;
 }
-.split-preview__text {
-  opacity: 0.8;
+.split-confirm__preview {
+  opacity: 0.85;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   min-width: 0;
+}
+.split-confirm__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.split-confirm__cancel {
+  --md-text-button-label-text-color: var(--md-sys-color-on-secondary-container);
 }
 
 .reading-chunk-body {
