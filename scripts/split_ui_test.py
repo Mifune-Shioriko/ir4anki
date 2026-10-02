@@ -24,6 +24,10 @@ Covers:
      handles; the tail child shows the fence and katex-block as single
      whole-block handles; a cross-block pick tints every overlapped item.
   6. the old selection-driven scissors button is GONE.
+  7. WHOLE-LINE click target (2026-10-03): clicking the line TEXT (not the
+     dot) picks it; hovering shows a pointer; a text-selection DRAG never
+     picks (it stays the 添加挖空 cloze seed); clicking inside an atomic
+     block picks the whole block.
 
 Run: backend/.venv/bin/python scripts/split_ui_test.py
 (needs playwright + chromium; both present in backend/.venv)
@@ -286,6 +290,62 @@ def run(notes: Path):
         check("confirm bar gone after 取消", c is None, c)
         check("no tint left after 取消",
               page.locator(".reading-chunk-body .line-sel").count() == 0)
+
+        print("== 3b. whole-line click target (2026-10-03) ==")
+        # click the TEXT of line 4 (not the dot) → picks 4–4
+        loc4 = page.locator(
+            '.reading-chunk-body span.line[data-line-start="4"]')
+        box = loc4.first.bounding_box()
+        assert box, "no box for span.line 4"
+        page.mouse.click(box["x"] + box["width"] * 0.6,
+                         box["y"] + box["height"] / 2)
+        page.wait_for_timeout(150)
+        c = _confirm(page)
+        check("clicking line TEXT (not the dot) picks the line → 4–4",
+              c is not None and _range_nums(c["range"]) == (4, 4, 1), c)
+        _cancel(page)
+
+        # hover a line → pointer cursor (whole-line affordance)
+        page.hover('.reading-chunk-body span.line[data-line-start="5"]')
+        page.wait_for_timeout(100)
+        cur = page.evaluate("""() => getComputedStyle(document.querySelector(
+            '.reading-chunk-body span.line[data-line-start="5"]')).cursor""")
+        check("hovering a line shows pointer cursor", cur == "pointer", cur)
+
+        # DRAG (text selection) must NOT pick — it is the 添加挖空 cloze seed
+        b3 = page.locator(
+            '.reading-chunk-body span.line[data-line-start="3"]'
+        ).first.bounding_box()
+        b5 = page.locator(
+            '.reading-chunk-body span.line[data-line-start="5"]'
+        ).first.bounding_box()
+        assert b3 and b5, "no boxes for drag"
+        page.mouse.move(b3["x"] + 30, b3["y"] + b3["height"] / 2)
+        page.mouse.down()
+        page.mouse.move(b5["x"] + b5["width"] - 10,
+                        b5["y"] + b5["height"] / 2, steps=8)
+        page.mouse.up()
+        page.wait_for_timeout(200)
+        c = _confirm(page)
+        check("drag-selecting text does NOT open the confirm bar",
+              c is None, c)
+        sel_len = page.evaluate(
+            "() => (window.getSelection()||'').toString().length")
+        check("drag leaves a real text selection for 添加挖空",
+              sel_len > 5, sel_len)
+        page.evaluate("() => window.getSelection().removeAllRanges()")
+
+        # click inside an ATOMIC block (fence) picks the whole block
+        pbox = page.locator(
+            '.reading-chunk-body .line-anchor pre').first.bounding_box()
+        assert pbox, "no box for fence"
+        page.mouse.click(pbox["x"] + pbox["width"] / 2,
+                         pbox["y"] + pbox["height"] / 2)
+        page.wait_for_timeout(150)
+        c = _confirm(page)
+        check("clicking inside the fence picks the WHOLE block 9–12",
+              c is not None and _range_nums(c["range"]) == (9, 12, 4), c)
+        _cancel(page)
 
         print("== 4. 确认分割 persists the exact whole-line child ==")
         _click_handle(page, 4)

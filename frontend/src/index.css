@@ -1615,12 +1615,15 @@ a:focus-visible,
   opacity: 0.85;
 }
 
-/* 分割行把手 + 确认条 (line-handle split picker, 2026-10-01). Every rendered
- * source line gets a small dot in the left gutter (.line-handle inside
- * span.line / div.line-anchor — injected by lib/split-selection.ts
- * annotateLines). Click first line → click last line → lines tint
- * (.line-sel) and the confirm bar shows the exact range with head AND tail
- * previews. Replaces the old .split-preview (selection-driven, head-only). */
+/* 分割行把手 + 确认条 (line-handle split picker, 2026-10-01; WHOLE-LINE
+ * click target 2026-10-03). Every rendered source line gets a small dot in
+ * the left gutter (.line-handle inside span.line / div.line-anchor —
+ * injected by lib/split-selection.ts annotateLines). The dot is the visual
+ * affordance, but the CLICK TARGET is the whole line: clicking anywhere on
+ * a rendered line picks it (drag/text-selection still feeds 添加挖空, never
+ * picks). Hovering a line lights its dot + tints the row. Click first line
+ * → click last line → lines tint (.line-sel) and the confirm bar shows the
+ * exact range with head AND tail previews. */
 .reading-chunk-body {
   position: relative;
   /* gutter room for atomic-block (pre/table/hr/katex) handles */
@@ -1629,6 +1632,22 @@ a:focus-visible,
 .reading-chunk-body .line,
 .reading-chunk-body .line-anchor {
   position: relative;
+}
+/* whole-line hover feedback (user spec 2026-10-03): the row tints faintly
+ * and shows a pointer; the gutter dot lights up as if hovered directly. */
+.reading-chunk-body .line:not(.line-sel):hover,
+.reading-chunk-body .line-anchor:not(.line-sel):hover {
+  background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  cursor: pointer;
+}
+.line:hover > .line-handle,
+.line-anchor:hover > .line-handle {
+  opacity: 1;
+  transform: scale(1.4);
+  background: var(--md-sys-color-primary);
 }
 /* Soft-line handles are INLINE dots before the sentence: several source
  * lines often share one visual row (19-char median line in a ~580px card),

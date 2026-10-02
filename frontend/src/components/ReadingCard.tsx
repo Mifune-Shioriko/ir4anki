@@ -26,19 +26,22 @@ import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 // cloze is created from them (backend _reading_record_card).
 //
 // 分割文段 (LINE-HANDLE model, 2026-10-01 — replaces the text-selection
-// flow): every rendered source line carries a small dot handle in the left
-// gutter (atomic blocks — code fences, tables, $$ formulas, <hr> — get ONE
-// handle for the whole block). Click the first line's handle, click the last
-// line's handle (further clicks re-adjust the far end), the lines highlight
-// and an inline confirm bar appears above the body with the exact cut range
-// + a HEAD and TAIL line preview (the old head-only snippet couldn't
-// confirm where the cut ended — user spec). 确认分割 → POST
-// /api/reading/split with the whole-line range. No DOM-selection guessing:
-// the handles ARE the backend's line model, so what you click is what gets
-// cut. Gap disposition still follows the 切割语义 chips: 书签模式 (bookmark,
-// DEFAULT) = the cut lines become a smaller todo reading card, the UNREAD
-// tail stays todo (queued), the read prefix sinks to background; 提炼模式
-// (extract) = only the cut lines survive, all gaps sink to background.
+// flow; WHOLE-LINE click target 2026-10-03): every rendered source line
+// carries a small dot handle in the left gutter (atomic blocks — code
+// fences, tables, $$ formulas, <hr> — get ONE handle for the whole block).
+// The dot is the affordance, but clicking ANYWHERE on the rendered line
+// picks it (a drag/text-selection is the cloze seed and never picks).
+// Click the first line, click the last line (further clicks re-adjust the
+// far end), the lines highlight and an inline confirm bar appears above
+// the body with the exact cut range + a HEAD and TAIL line preview (the
+// old head-only snippet couldn't confirm where the cut ended — user spec).
+// 确认分割 → POST /api/reading/split with the whole-line range. No
+// DOM-selection guessing: the lines ARE the backend's line model, so what
+// you click is what gets cut. Gap disposition still follows the 切割语义
+// chips: 书签模式 (bookmark, DEFAULT) = the cut lines become a smaller todo
+// reading card, the UNREAD tail stays todo (queued), the read prefix sinks
+// to background; 提炼模式 (extract) = only the cut lines survive, all gaps
+// sink to background.
 //
 // 添加挖空 still captures the CURRENT text selection inside the chunk body
 // (tracked via selectionchange — clicking a toolbar button clears the live
@@ -141,7 +144,18 @@ export const ReadingCard: Component<Props> = (props) => {
     }
   }
 
+  // Click target = the WHOLE rendered line (span.line / div.line-anchor),
+  // not just the gutter dot (user spec 2026-10-03: 点选对应行就选中切片).
+  // The dot stays as the visual affordance; hovering anywhere on the line
+  // lights it up (CSS). A DRAG (text selection) must NOT pick a line — it
+  // is the 添加挖空 cloze seed — so mousedown coords are recorded and a
+  // moved/non-collapsed click is ignored.
+  let downX = 0
+  let downY = 0
+
   const onBodyMouseDown = (e: MouseEvent) => {
+    downX = e.clientX
+    downY = e.clientY
     const h = (e.target as HTMLElement | null)?.closest?.('.line-handle')
     // preventDefault keeps the click from focusing the button (Space must
     // stay 制卡完成) and from starting a text selection (the cloze seed).
@@ -149,12 +163,30 @@ export const ReadingCard: Component<Props> = (props) => {
   }
 
   const onBodyClick = (e: MouseEvent) => {
-    const h = (e.target as HTMLElement | null)?.closest?.(
-      '.line-handle',
-    ) as HTMLElement | null
-    if (!h) return
-    const s = parseInt(h.dataset.lineStart || '0', 10)
-    const en = parseInt(h.dataset.lineEnd || h.dataset.lineStart || '0', 10)
+    const t = e.target as HTMLElement | null
+    if (!t?.closest) return
+    if (t.closest('a')) return // let links navigate, never pick
+    const isHandle = !!t.closest('.line-handle')
+    const item = t.closest('.line-handle, .line, .line-anchor') as
+      | HTMLElement
+      | null
+    if (!item) return
+    if (!isHandle) {
+      // Drag guard for line-BODY clicks: a real text selection (or a moved
+      // mouse between down and up) is a 添加挖空 cloze seed, not a line
+      // pick. Handle clicks skip this — their mousedown preventDefaults
+      // (selection stays as the cloze seed) and must ALWAYS pick.
+      if (
+        Math.abs(e.clientX - downX) > 4 ||
+        Math.abs(e.clientY - downY) > 4
+      ) {
+        return
+      }
+      const selNow = window.getSelection()
+      if (selNow && !selNow.isCollapsed) return
+    }
+    const s = parseInt(item.dataset.lineStart || '0', 10)
+    const en = parseInt(item.dataset.lineEnd || item.dataset.lineStart || '0', 10)
     if (s) pickHandle(s, Math.max(en, s))
   }
 
