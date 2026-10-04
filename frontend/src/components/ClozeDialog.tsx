@@ -1,6 +1,6 @@
 import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
-import { applyBottomSheetAnimation } from '../lib/bottom-sheet'
+import { applyDialogGuard } from '../lib/dialog-guard'
 import { clozeMdToHtml, clozeRanges, renderClozeMd } from '../lib/cloze'
 import { renderMarkdown } from '../lib/markdown'
 import { IconPassword } from './icons'
@@ -191,7 +191,7 @@ export const ClozeDialog: Component<Props> = (props) => {
       class="edit-dialog cloze-dialog"
       open
       onClose={() => props.onClose()}
-      ref={el => applyBottomSheetAnimation(el)}
+      ref={el => applyDialogGuard(el, () => props.onClose())}
     >
       <div slot="headline">添加挖空卡</div>
 

@@ -32,6 +32,10 @@ export interface StudyModeSizes {
   read?: number
   new: number
   review: number
+  /** daily card-MAKING goal for the reading stage (2026-10-05): reading
+   * keeps dealing batches until this many cards were made today, checked
+   * at segment boundaries only. Absent on old backends. */
+  make?: number
 }
 export type StudyModes = Record<string, StudyModeSizes>
 
@@ -291,6 +295,13 @@ export interface ReadingStartResponse {
   /** empty deal only: chunks held by the preview-pool gate (round 3) */
   gated?: number
   all_gated?: boolean
+  /** daily card-making goal (2026-10-05): today's made-card count + the
+   * goal. `goal_reached` on an empty deal = reading stood down because the
+   * goal is already met → chain straight to review. Absent when the goal is
+   * inactive (preview mode off / AnkiConnect down). */
+  made_today?: number | null
+  make_goal?: number | null
+  goal_reached?: boolean
 }
 
 export interface ReadingActResponse {
@@ -298,6 +309,11 @@ export interface ReadingActResponse {
   reason?: string
   status?: ReadingChunkStatus
   round_complete?: boolean
+  /** daily card-making goal (2026-10-05): true when this segment boundary
+   * crossed the goal and parked the rest of the round → chain to review */
+  goal_reached?: boolean
+  made_today?: number | null
+  make_goal?: number | null
   stats?: ReadingRoundStats
   done?: number
   total?: number
@@ -336,6 +352,9 @@ export interface ReadingExtras {
   reading_active?: number
   /** chunks held by the preview-pool gate (B·二段重推, round 3) */
   reading_gated?: number
+  /** daily card-making goal progress (2026-10-05); null when inactive */
+  made_today?: number | null
+  make_goal?: number | null
   /** active reading round only (resume after refresh) — the completed
    * tombstone is fetched via GET /api/reading/state */
   reading_round?: ReadingRound

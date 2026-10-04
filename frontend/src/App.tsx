@@ -230,6 +230,16 @@ export const App: Component = () => {
   const [rdTotal, setRdTotal] = createSignal(0)
   const [rdStats, setRdStats] = createSignal<ReadingRoundStats>({})
   const [rdBusy, setRdBusy] = createSignal(false)
+  // ---- daily card-making goal (user spec 2026-10-05) ----
+  // Reading keeps dealing segment batches until `makeGoal` cards were made
+  // today; the checkpoint is a SEGMENT BOUNDARY (the backend parks the
+  // round and returns goal_reached) so card-making is never cut short.
+  // makeGoal null/0 → goal tracking inactive (old backend / preview off /
+  // AnkiConnect down) and the UI falls back to the batch-shaped ring.
+  const [madeToday, setMadeToday] = createSignal<number | null>(null)
+  const [makeGoal, setMakeGoal] = createSignal<number | null>(null)
+  // accumulated stats base for multi-batch flows (see startReadingStage)
+  let rdStatsBase: ReadingRoundStats = {}
   // ---- round summary (hero moment, P2 2026-09-27 round 2) ----
   // When the daily chain lands back on the start screen, it shows what the
   // round just accomplished (阅读 N 段 · 复习 N 张) instead of a 4-second
@@ -558,6 +568,8 @@ export const App: Component = () => {
         setReadingAvailable(d.reading_available ?? 0)
         setReadingActive(d.reading_active ?? 0)
         setReadingGated(d.reading_gated ?? 0)
+        setMadeToday(d.made_today ?? null)
+        setMakeGoal(d.make_goal ?? null)
       }
       // 单一流水线 (2026-09-24; preview stage retired 2026-09-27): a page
       // load resumes an ACTIVE round where it left off; an active reading
@@ -593,8 +605,13 @@ export const App: Component = () => {
     try {
       const d = await api.readingStart(selectedMode())
       if (d.study_modes) setStudyModes(d.study_modes)
+      if (d.made_today != null) setMadeToday(d.made_today)
+      if (d.make_goal != null) setMakeGoal(d.make_goal)
       if (!d.chunks.length) {
-        if (d.all_gated) {
+        if (d.goal_reached) {
+          // 今日制卡目标已满 (2026-10-05)：阅读阶段直接让位给复习
+          showSnack(`今日制卡目标已达成（${d.made_today}/${d.make_goal}）——直接进入复习`)
+        } else if (d.all_gated) {
           showSnack('正在制卡的片段都在等卡片过预览池——明天它们会重新推送')
         }
         await startReviewStage()
@@ -603,7 +620,11 @@ export const App: Component = () => {
       setRdChunks(d.chunks)
       setRdDone(0)
       setRdTotal(d.chunks.length)
-      setRdStats({})
+      // Goal-based reading (2026-10-05) chains MULTIPLE batches into one
+      // flow, and each backend round starts its own stats at 0 — snapshot
+      // the accumulated total as this batch's base so rdAct can add onto it
+      // (the round-summary hero then counts every batch, not just the last).
+      rdStatsBase = { ...rdStats() }
       setPhase('reading')
     } catch (e) {
       setLoadText('加载失败：' + (e as Error).message)
@@ -648,9 +669,18 @@ export const App: Component = () => {
   // the single 开始 button: first stage with content wins
   const beginFlow = async () => {
     setRoundSummary(null) // fresh round — the summary strip belongs to the last one
-    if (readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
+    setRdStats({})
+    rdStatsBase = {}
+    // 今日制卡目标已满 (2026-10-05) → skip the reading stage entirely
+    const goal = makeGoal()
+    const made = madeToday()
+    const goalMet = goal != null && goal > 0 && made != null && made >= goal
+    if (!goalMet && readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
       await startReadingStage()
     } else {
+      if (goalMet && readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
+        showSnack(`今日制卡目标已达成（${made}/${goal}）——直接进入复习`)
+      }
       await startReviewStage()
     }
   }
@@ -811,6 +841,9 @@ export const App: Component = () => {
     if (previewMode()) {
       setPreviewPool(p => (p == null ? p : p + 1))
       setPendingRelease(p => (p == null ? p : p + 1))
+      // daily making-goal ring (2026-10-05): the backend is the authority
+      // (checked at segment boundaries) but the ring should move live
+      setMadeToday(p => (p == null ? p : p + 1))
     }
     // 渐进制卡: the backend recorded the note id on the source chunk AND
     // auto-marked a todo chunk as active — mirror both locally so 「已从本
@@ -930,9 +963,46 @@ export const App: Component = () => {
         prev.filter(c => !(c.chunk_key === chunk.chunk_key && c.path === chunk.path)),
       )
       setRdDone(d.done ?? rdDone() + 1)
-      if (d.stats) setRdStats(d.stats)
+      if (d.stats) {
+        // add this batch's stats onto the accumulated base (multi-batch
+        // goal flow, 2026-10-05)
+        setRdStats({
+          done: (rdStatsBase.done ?? 0) + (d.stats.done ?? 0),
+          skipped: (rdStatsBase.skipped ?? 0) + (d.stats.skipped ?? 0),
+          next: (rdStatsBase.next ?? 0) + (d.stats.next ?? 0),
+        })
+      }
+      if (d.made_today != null) setMadeToday(d.made_today)
+      if (d.make_goal != null) setMakeGoal(d.make_goal)
       if (d.round_complete || rdChunks().length === 0) {
         setRdTotal(d.total ?? rdTotal())
+        // Goal-based reading (user spec 2026-10-05): the making goal is
+        // checked ONLY here, at a segment boundary — never mid-card. The
+        // backend parks the round when the goal is met (goal_reached); if
+        // the batch drained with the goal UNMET, deal the next reading
+        // batch right away (startReadingStage itself falls through to
+        // review when the list is empty / all gated).
+        const goal = d.make_goal ?? makeGoal()
+        const made = d.made_today ?? madeToday()
+        if (d.goal_reached) {
+          showSnack(`今日制卡目标达成（${made}/${goal}）——进入复习`)
+          await chainAfterReading()
+          return
+        }
+        // Zero-progress guard: a batch ended ENTIRELY in 下一张 (稍后继续)
+        // means the user deferred everything — re-dealing would hand back
+        // the very same segments forever. Chain to review instead.
+        const batchStats = d.stats ?? {}
+        const progressed =
+          (batchStats.done ?? 0) + (batchStats.skipped ?? 0) > 0
+        if (
+          goal != null && goal > 0 &&
+          made != null && made < goal &&
+          progressed
+        ) {
+          await startReadingStage()
+          return
+        }
         // 单一流水线 (2026-09-24; preview stage retired 2026-09-27):
         // reading drained → review stage, no readingDone stats page
         await chainAfterReading()
@@ -1102,7 +1172,16 @@ export const App: Component = () => {
     // works regardless of the visible section: mid-round browsing of
     // 文件/阅读清单 still tracks the active round
     if (phase() === 'review' && currentCard()) return { done: totalDone(), total: roundTotal() }
-    if (phase() === 'reading' && rdCurrent()) return { done: rdDone(), total: rdTotal() }
+    if (phase() === 'reading' && rdCurrent()) {
+      // Goal-based reading (2026-10-05): when the daily making goal is
+      // live, the ring tracks 制卡进度 (X/15) instead of the batch position
+      // — the batch is just plumbing now, the goal is the real progress.
+      const goal = makeGoal()
+      if (goal != null && goal > 0) {
+        return { done: Math.min(madeToday() ?? 0, goal), total: goal }
+      }
+      return { done: rdDone(), total: rdTotal() }
+    }
     return null
   }
 
@@ -1214,6 +1293,8 @@ export const App: Component = () => {
             pendingRelease={previewMode() ? pendingRelease() : null}
             previewMode={previewMode()}
             readingAvailable={readingMode() ? readingAvailable() : 0}
+            madeToday={madeToday()}
+            makeGoal={makeGoal()}
             studyModes={studyModes()}
             mode={selectedMode()}
             roundSummary={roundSummary()}

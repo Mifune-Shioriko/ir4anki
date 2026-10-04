@@ -1,8 +1,10 @@
 import { Component, Show } from 'solid-js'
 
 // Delete confirmation (防呆, user spec 2026-09-04): MD3 basic dialog —
-// centered container (the default md-dialog anchoring, NOT the edit sheet's
-// bottom-sheet animation), headline + supporting text + two actions.
+// centered container (the default md-dialog anchoring; scrim-click still
+// cancels HERE on purpose — a confirmation has nothing to lose, unlike the
+// editor dialogs which are scrim-guarded since 2026-10-05), headline +
+// supporting text + two actions.
 // Destructive confirm button is styled error-colored via filled-button
 // container/label tokens.
 //

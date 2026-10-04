@@ -1,5 +1,6 @@
 import { Component, Show, createSignal, onCleanup, onMount } from 'solid-js'
 import { api } from '../api'
+import { applyDialogGuard } from '../lib/dialog-guard'
 import { renderMarkdown } from '../lib/markdown'
 import type { ReadingChunk } from '../types'
 import type { Cm6Handle } from '../lib/cm6-editor'
@@ -157,8 +158,10 @@ export const SegEditDialog: Component<Props> = (props) => {
       onClose={() => props.onClose()}
       ref={el => {
         // keep the default center-scaled dialog motion (NOT the bottom-sheet
-        // animation EditDialog uses — this is a wide workstation dialog)
-        void el
+        // animation EditDialog used before 2026-10-05 — this is a wide
+        // workstation dialog) + block scrim dismissal (user spec 2026-10-05:
+        // 所有编辑弹窗一致 — 只有 取消/保存/Esc 能关).
+        applyDialogGuard(el, () => props.onClose())
       }}
     >
       <div slot="headline">编辑片段</div>

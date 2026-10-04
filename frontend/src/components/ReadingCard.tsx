@@ -5,6 +5,7 @@ import {
   annotateLines,
   annotatedItems,
   previewHeadTail,
+  resolveLineAt,
   type SplitSelection,
 } from '../lib/split-selection'
 import type { ReadingChunk, ReadingChunkStatus } from '../types'
@@ -200,6 +201,32 @@ export const ReadingCard: Component<Props> = (props) => {
     }
   }
 
+  // ---- hover indicator (user spec 2026-10-05) ----
+  // CSS :hover alone flickers in the line-height gaps of a wrapped source
+  // line (gap belongs to no box → hover drops). mousemove + resolveLineAt
+  // treats each source line as ONE block: anywhere in the band lights the
+  // gutter dot (.line-hover), so sweeping the mouse never blinks. The row
+  // background 荧光 is gone — the dot is the only indicator.
+  let hoverEl: HTMLElement | null = null
+  const clearHover = () => {
+    if (hoverEl) {
+      hoverEl.classList.remove('line-hover')
+      hoverEl = null
+    }
+  }
+  const onBodyMove = (e: MouseEvent) => {
+    if (!bodyRef) return
+    const hit = resolveLineAt(bodyRef, e.clientX, e.clientY)
+    const el = hit?.el ?? null
+    if (el === hoverEl) return
+    clearHover()
+    if (el) {
+      el.classList.add('line-hover')
+      hoverEl = el
+    }
+  }
+  const onBodyLeave = () => clearHover()
+
   // annotate after every (re)render of the body; the token is the chunk
   // text itself — identical text re-annotating is a no-op, a chunk swap
   // re-runs the walk. queueMicrotask: Solid's innerHTML binding is itself an
@@ -210,6 +237,7 @@ export const ReadingCard: Component<Props> = (props) => {
       () => [props.chunk.text, props.chunk.chunk_key, props.chunk.path] as const,
       () => {
         clearPick()
+        clearHover()
         const text = props.chunk.text
         queueMicrotask(() => {
           if (!bodyRef) return
@@ -377,6 +405,8 @@ export const ReadingCard: Component<Props> = (props) => {
             innerHTML={renderMarkdown(props.chunk.text)}
             onMouseDown={onBodyMouseDown}
             onClick={onBodyClick}
+            onMouseMove={onBodyMove}
+            onMouseLeave={onBodyLeave}
           />
         </div>
       </md-elevated-card>

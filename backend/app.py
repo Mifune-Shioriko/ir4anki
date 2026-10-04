@@ -5,6 +5,15 @@ Session model (single daily flow, user spec 2026-09-24 + 2026-09-27):
     DYNAMIC review ceil(D/3) (D = the day's due snapshot, see below).
     Sizes env-overridable (ANKI_DAILY_READ / ANKI_DAILY_NEW /
     ANKI_REVIEW_DUE_DIVISOR).
+  - the reading stage is GOAL-BASED (user spec 2026-10-05): it keeps
+    dealing 4-segment batches until MAKE_DAILY_GOAL cards were made today
+    (ANKI_DAILY_MAKE, default = ANKI_DAILY_NEW — today's made cards are
+    tomorrow's new cards). The checkpoint is a SEGMENT BOUNDARY
+    (complete/skip/next), never mid-card: making cards on a segment is
+    never cut short. Goal met → the rest of the round parks (statuses
+    untouched, segments deal again next round) and the chain moves to
+    review. Counter = pool cards whose noteId is today (see
+    _made_today_count); AnkiConnect down → fail-open (reading continues).
   - the daily chain is 阅读 → 复习 — the manual PREVIEW STAGE is RETIRED
     (user spec 2026-09-27). New cards still land in the preview pool
     SUSPENDED when they are made, but nobody approves them by hand anymore:
@@ -111,6 +120,16 @@ STUDY_MODES: dict[str, dict[str, int]] = {
 }
 DEFAULT_MODE = "daily"
 REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 3))
+
+# Daily card-MAKING goal (user spec 2026-10-05): the reading stage keeps
+# dealing segment batches until this many cards were made TODAY, then the
+# chain moves on to review. The checkpoint is a SEGMENT BOUNDARY (the
+# complete/skip/next act) — never mid-card, so making cards on a segment is
+# never cut short. Defaults to the daily NEW size: today's made cards are
+# tomorrow's new cards, so "make 15" and "review 15 new" stay in lockstep.
+# Override with ANKI_DAILY_MAKE; <=0 disables the goal (old fixed-round
+# behaviour: one batch, then review).
+MAKE_DAILY_GOAL = _env_int("ANKI_DAILY_MAKE", STUDY_MODES[DEFAULT_MODE]["new"])
 
 # Daily due snapshot (user spec 2026-09-24): D is captured ONCE per Anki day
 # at the first review deal, so 早/中/晚 rounds each take ceil(D/3) and the
@@ -266,6 +285,11 @@ def _capped_study_modes(review_size: int | None = None) -> dict[str, dict[str, i
         row = dict(sizes)
         if review_size is not None:
             row["review"] = review_size
+        # reading stage runs until this many cards were made today (2026-10-05);
+        # 0 = goal tracking inactive (needs the preview pool as its counter)
+        row["make"] = (
+            MAKE_DAILY_GOAL if (MAKE_DAILY_GOAL > 0 and PREVIEW_MODE) else 0
+        )
         out[name] = row
     return out
 
@@ -1221,6 +1245,37 @@ async def _pending_release_today() -> int:
         if i.get("cardId") and i.get("type") == 0
     ]
     return sum(1 for i in infos if _note_created_anki_day(i.get("note") or 0) == today)
+
+
+async def _made_today_count() -> int | None:
+    """Cards made TODAY through ir4anki — the daily card-making goal's
+    counter (user spec 2026-10-05, drives MAKE_DAILY_GOAL).
+
+    Counting rule = the preview-pool timestamp (same as
+    _pending_release_today): suspended new pool cards whose NOTE was
+    created on the current Anki day — exactly the batch that auto-releases
+    as tomorrow's new cards, and it includes cards made during the review
+    stage too (「今天总制卡量」).
+
+    Returns None when the counter is unavailable (PREVIEW_MODE off → no
+    pool to count; AnkiConnect unreachable): callers treat None as "goal
+    tracking inactive / not reached" (fail-open) — a dead backend must
+    never end the reading stage spuriously, exactly like the segment gates.
+    """
+    if not PREVIEW_MODE:
+        return None
+    try:
+        return await _pending_release_today()
+    except Exception:
+        return None
+
+
+def _make_goal_wire(made_today: int | None) -> int | None:
+    """make_goal only ships when the counter is live (made_today not None) —
+    the frontend falls back to the legacy one-batch flow otherwise."""
+    if MAKE_DAILY_GOAL > 0 and made_today is not None:
+        return MAKE_DAILY_GOAL
+    return None
 
 
 @app.get("/api/note")
@@ -2721,6 +2776,13 @@ async def _reading_extras() -> dict:
             max(0, s.get("active", 0) - s.get("gated_active", 0)) for s in summaries
         )
         out["reading_gated"] = sum(s.get("gated", 0) for s in summaries)
+        # daily card-making goal progress (2026-10-05): the UI shows 制卡
+        # X/15 in the reading ring; make_goal only ships when the counter
+        # is live (preview mode on + AnkiConnect reachable).
+        if MAKE_DAILY_GOAL > 0:
+            made = await _made_today_count()
+            out["made_today"] = made
+            out["make_goal"] = _make_goal_wire(made)
         rp = _reading_round_payload(data)
         if rp is not None and rp.get("status") == "active":
             out["reading_round"] = rp
@@ -2957,13 +3019,30 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
         # BEFORE computing the gates, so a page left open across the 4 AM
         # rollover unlocks gated frontiers on 开始 without a reload
         await auto_release_pool()
+    # resolved pacing table (dynamic review size, 2026-09-24) — the frontend
+    # pipes this into its studyModes signal, so it must not carry review=0
+    modes = await _wire_study_modes()
+    # Daily card-MAKING goal (user spec 2026-10-05): once today's made-card
+    # count reaches the goal, the reading stage stands down — the deal
+    # answers empty + goal_reached and the frontend chains into review. The
+    # checkpoint lives at SEGMENT boundaries (see _reading_act_impl), so an
+    # in-progress segment is never cut short; this start-time check only
+    # catches rounds that would BEGIN with the goal already met.
+    made_today = await _made_today_count() if MAKE_DAILY_GOAL > 0 else None
+    if made_today is not None and made_today >= MAKE_DAILY_GOAL:
+        return {
+            "chunks": [],
+            "mode": mode,
+            "empty": True,
+            "goal_reached": True,
+            "made_today": made_today,
+            "make_goal": MAKE_DAILY_GOAL,
+            "study_modes": modes,
+        }
     data = _reading_read()
     per_round = STUDY_MODES[mode].get("read", 0)
     gated = await _reading_gates(data)
     payloads = _deal_reading(data, per_round, gated) if per_round > 0 else []
-    # resolved pacing table (dynamic review size, 2026-09-24) — the frontend
-    # pipes this into its studyModes signal, so it must not carry review=0
-    modes = await _wire_study_modes()
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
         return {
@@ -2971,6 +3050,8 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
             "mode": mode,
             "empty": True,
             "study_modes": modes,
+            "made_today": made_today,
+            "make_goal": _make_goal_wire(made_today),
             # why nothing was dealt: all_gated = every remaining chunk is
             # waiting on its cards to clear the preview pipeline (the UI can
             # then say 「等卡片过预览池」 instead of 「清单读完了」)
@@ -2994,6 +3075,8 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
         "mode": mode,
         "empty": False,
         "study_modes": modes,
+        "made_today": made_today,
+        "make_goal": _make_goal_wire(made_today),
     }
 
 
@@ -3001,10 +3084,20 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
 async def reading_act(path: str, chunk_key: str, action: str):
     async with _state_lock:
         _reading_guard()
-        return _reading_act_impl(path, chunk_key, action)
+        # The daily-making-goal checkpoint only matters for round-advancing
+        # actions on an ACTIVE round — skip the (AnkiConnect-backed) count
+        # otherwise, so mark_active/promote/demote stay cheap.
+        made_today = None
+        if action in ("complete", "skip", "next") and MAKE_DAILY_GOAL > 0:
+            rd0 = (_reading_read() or {}).get("round")
+            if isinstance(rd0, dict) and rd0.get("status") == "active":
+                made_today = await _made_today_count()
+        return _reading_act_impl(path, chunk_key, action, made_today=made_today)
 
 
-def _reading_act_impl(path: str, chunk_key: str, action: str):
+def _reading_act_impl(
+    path: str, chunk_key: str, action: str, made_today: int | None = None
+):
     """Per-chunk decision inside a reading round.
 
     mark_active: todo → active (正在制卡). Does NOT advance the round — the
@@ -3099,11 +3192,28 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
     seg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     round_complete = False
+    goal_reached = False
     if in_round and action in ("complete", "skip", "next"):
         stats_key = {"complete": "done", "skip": "skipped", "next": "next"}[action]
         stats = rd.setdefault("stats", {})
         stats[stats_key] = stats.get(stats_key, 0) + 1
         round_complete = _drop_and_maybe_complete()
+        # Daily card-making goal (user spec 2026-10-05): the checkpoint is a
+        # SEGMENT BOUNDARY — complete/skip/next just finished one segment,
+        # so the user is never cut off mid-card. Goal met → park the rest of
+        # the round (statuses untouched; those segments deal again next
+        # round, same semantics as finish) and hand over to the review
+        # stage (round_complete → the frontend chains on).
+        if (
+            not round_complete
+            and MAKE_DAILY_GOAL > 0
+            and made_today is not None
+            and made_today >= MAKE_DAILY_GOAL
+        ):
+            rd["status"] = "complete"
+            rd["pending"] = []
+            round_complete = True
+            goal_reached = True
     if demote_completed_round:
         round_complete = True
     _reading_write(data)
@@ -3111,6 +3221,11 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
         "ok": True,
         "status": seg.get("status", "todo"),
         "round_complete": round_complete,
+        "goal_reached": goal_reached,
+        "made_today": made_today,
+        # only ship the goal when the counter is live — same wire rule as
+        # reading/start (PREVIEW off / AnkiConnect down ⇒ no goal UI)
+        "make_goal": _make_goal_wire(made_today),
         "stats": (rd or {}).get("stats", {}),
         "done": (rd or {}).get("done", 0),
         "total": (rd or {}).get("total", 0),

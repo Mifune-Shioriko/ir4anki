@@ -231,6 +231,78 @@ export function annotatedItems(
   return out
 }
 
+/** Resolve the source line at a viewport point (user spec 2026-10-05).
+ *
+ * Why not CSS :hover: a soft-wrapped source line spans several visual rows,
+ * and the line-height gap between those rows belongs to NO inline box —
+ * :hover drops out there, so sweeping the mouse down a paragraph made the
+ * indicator blink on/off. This resolver treats 一行就是一个 block:
+ *   1. direct hit (elementFromPoint inside a .line / .line-anchor),
+ *   2. caret hit-test (caretRangeFromPoint / caretPositionFromPoint) —
+ *      resolves gap points to the surrounding text, then narrows to the
+ *      items inside that tagged block,
+ *   3. nearest item by geometric distance, capped at HOVER_REACH px so the
+ *      card's outer padding stays dark.
+ * Returns null when nothing is within reach. */
+const HOVER_REACH = 24
+
+export function resolveLineAt(
+  body: HTMLElement,
+  x: number,
+  y: number,
+): { el: HTMLElement; start: number; end: number } | null {
+  const items = annotatedItems(body)
+  if (!items.length) return null
+  // 1. direct hit
+  const under = document.elementFromPoint(x, y) as HTMLElement | null
+  if (under && body.contains(under)) {
+    const direct = under.closest<HTMLElement>('.line, .line-anchor')
+    if (direct) {
+      const found = items.find(i => i.el === direct)
+      if (found) return found
+    }
+  }
+  // 2. caret hit-test → the block owning the gap
+  let scope: Element | null = null
+  const caretRange = (document as Document & {
+    caretRangeFromPoint?: (x: number, y: number) => Range | null
+  }).caretRangeFromPoint
+  if (caretRange) {
+    const r = caretRange.call(document, x, y)
+    const n = r?.startContainer ?? null
+    scope = n ? (n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement) : null
+  } else {
+    const caretPos = (document as Document & {
+      caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node } | null
+    }).caretPositionFromPoint
+    const p = caretPos ? caretPos.call(document, x, y) : null
+    const n = p?.offsetNode ?? null
+    scope = n ? (n.nodeType === Node.ELEMENT_NODE ? (n as Element) : n.parentElement) : null
+  }
+  let pool = items
+  if (scope && body.contains(scope)) {
+    const block = scope.closest('[data-src-line]')
+    if (block) {
+      const inner = items.filter(i => block.contains(i.el))
+      if (inner.length) pool = inner
+    }
+  }
+  // 3. nearest by distance to the item's box (0 when inside it)
+  let best: (typeof items)[number] | null = null
+  let bestD = HOVER_REACH * HOVER_REACH
+  for (const it of pool) {
+    const r = it.el.getBoundingClientRect()
+    const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0
+    const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0
+    const d = dx * dx + dy * dy
+    if (d < bestD) {
+      bestD = d
+      best = it
+    }
+  }
+  return best
+}
+
 function ellipsizeMiddle(s: string, head = 26, tail = 18): string {
   if (s.length <= head + tail + 3) return s
   return `${s.slice(0, head)} … ${s.slice(-tail)}`

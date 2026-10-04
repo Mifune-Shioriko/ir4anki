@@ -1377,37 +1377,29 @@ a:focus-visible,
   }
 }
 
-/* ---- edit dialog as a bottom sheet (user spec: 从底部中间往上弹出) ----
- * md-dialog is display:contents + position:fixed; the inner <dialog> element
+/* ---- edit/add/cloze dialogs: WIDE CENTERED (user spec 2026-10-05) ----
+ * Was a bottom sheet (从底部中间往上弹出) — a stray click on the exposed
+ * backdrop instantly dismissed it and threw away edits. Now it is the same
+ * centered workstation dialog as .seg-edit-dialog (SAME width formula),
+ * scrim clicks are blocked by lib/dialog-guard.ts (取消/保存/Esc only),
+ * and the default center-scale open animation returns (bottom-sheet.ts is
+ * no longer referenced). Inner layout is unchanged (user: 分区还是按照
+ * 编辑卡片现在的设计).
+ * md-dialog is display:contents + position:fixed; the inner <dialog>
  * inherits margin/insets from the host, and UA styles give it inset:0 —
- * so `margin: auto auto 0 auto` (top:auto eats all free vertical space)
- * anchors it bottom-center. Shape: rounded top corners only, per the MD3
- * bottom-sheet spec. */
+ * so `margin: auto` centers it. NOTE: --md-dialog-container-min-width is
+ * NOT a real token — the host is width:fit-content and the inner <dialog>
+ * inherits width from the host, so an explicit host width sizes it. */
 .edit-dialog {
-  margin: auto auto 0 auto;
-  /* Same width as the study card: content column (680px) minus its 24px
-   * side paddings = 632px, so the sheet visually rises up behind the card.
-   * NOTE: --md-dialog-container-min-width is NOT a real token — the host is
-   * width:fit-content and the inner <dialog> inherits width from the host,
-   * so an explicit host width is what actually sizes the sheet. */
+  margin: auto;
+  /* identical to .seg-edit-dialog: two content columns + gap, viewport-guarded */
   width: min(
-    calc(var(--content-max-width) - 2 * var(--content-padding)),
+    calc(2 * var(--content-max-width) + 24px + 48px),
     calc(100vw - 48px)
   );
   /* lift the built-in max-width:min(560px,…) clamp, keep a viewport guard */
   max-width: calc(100vw - 48px);
-  --md-dialog-container-shape-start-start: 28px;
-  --md-dialog-container-shape-start-end: 28px;
-  --md-dialog-container-shape-end-start: 0px;
-  --md-dialog-container-shape-end-end: 0px;
-  /* Raised 720px→810px (audit item #6): at 720px the inner shadow scroller
-   * (clientH = max-height − 152px for the fixed headline+actions) was 568px
-   * vs ~648px of content (2 field rows + upload + tags), so the 添加标签
-   * input fell ~80px below the fold and users had to scroll inside the
-   * sheet to reach it. 810px gives a 658px scroller — the tag row is now
-   * visible without scrolling on a normal desktop viewport, and the
-   * calc(100vh - 24px) guard still clamps short/mobile screens. */
-  max-height: min(810px, calc(100vh - 24px));
+  max-height: calc(100vh - 48px);
 }
 
 .edit-dialog-content {
@@ -1632,19 +1624,21 @@ a:focus-visible,
 .reading-chunk-body .line,
 .reading-chunk-body .line-anchor {
   position: relative;
-}
-/* whole-line hover feedback (user spec 2026-10-03): the row tints faintly
- * and shows a pointer; the gutter dot lights up as if hovered directly. */
-.reading-chunk-body .line:not(.line-sel):hover,
-.reading-chunk-body .line-anchor:not(.line-sel):hover {
-  background: color-mix(in srgb, var(--md-sys-color-on-surface) 6%, transparent);
-  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
   cursor: pointer;
 }
+/* Row feedback = the gutter DOT only (user spec 2026-10-05): the row
+ * background 荧光 is gone for hover AND selection — a lit+enlarged dot is
+ * the single indicator. Hover is JS-driven (.line-hover, ReadingCard
+ * caretRangeFromPoint hit-test) because CSS :hover flickers when the
+ * pointer sits in the line-height gap of a wrapped source line (the gap
+ * belongs to no inline box): the JS path resolves ANY point in the
+ * paragraph to its nearest source-line block, so the dot stays lit across
+ * the whole visual band — 一行就是一个 block. Plain :hover rules stay as a
+ * no-JS fallback. */
 .line:hover > .line-handle,
-.line-anchor:hover > .line-handle {
+.line-anchor:hover > .line-handle,
+.line.line-hover > .line-handle,
+.line-anchor.line-hover > .line-handle {
   opacity: 1;
   transform: scale(1.4);
   background: var(--md-sys-color-primary);
@@ -1686,18 +1680,12 @@ a:focus-visible,
   top: 0.35em;
   margin-right: 0;
 }
-.line-sel {
-  background: color-mix(in srgb, var(--md-sys-color-secondary-container) 55%, transparent);
-  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
-}
-.line-anchor.line-sel {
-  background: color-mix(in srgb, var(--md-sys-color-secondary-container) 55%, transparent);
-}
+/* Selected range: NO background tint (user spec 2026-10-05 — 荧光去掉);
+ * the class stays (tests + applySelClasses) and lights its dots instead. */
 .line-sel > .line-handle,
 .line-anchor.line-sel > .line-handle {
   opacity: 1;
+  transform: scale(1.4);
   background: var(--md-sys-color-primary);
 }
 

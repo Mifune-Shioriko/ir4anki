@@ -20,6 +20,10 @@ interface Props {
   previewMode?: boolean
   /** reading segments available this round (渐进制卡) */
   readingAvailable?: number
+  /** daily card-making goal (2026-10-05): reading keeps dealing batches
+   * until this many cards were made today; null/0 = inactive (old backend) */
+  madeToday?: number | null
+  makeGoal?: number | null
   /** what the round that just ended accomplished (hero summary strip,
    * 2026-09-27 round 2); null until a round completes this session */
   roundSummary?: RoundSummary | null
@@ -39,6 +43,8 @@ export const StartScreen: Component<Props> = (props) => {
     const m = props.mode ?? 'daily'
     return t && t[m] ? t[m] : null
   }
+  // daily card-making goal live (2026-10-05)? reading is goal-based then
+  const goalActive = () => (props.makeGoal ?? 0) > 0
   // nothing anywhere to study TODAY: no due, no new pool, no preview pool
   // awaiting tomorrow's release, no reading segments
   const isEmpty = () =>
@@ -96,7 +102,9 @@ export const StartScreen: Component<Props> = (props) => {
           </Show>
           <h1 class="screen-title md-typescale-headline-medium">开始学习</h1>
           <p class="screen-detail md-typescale-body-medium">
-            一轮依次推进：阅读笔记 → 复习。中途不用选，做完自动进入下一段，全部完成回到这里。今天制的卡进预览池，明天自动放行为新卡。
+            {goalActive()
+              ? `一轮依次推进：阅读笔记 → 复习。阅读阶段以「今天制满 ${props.makeGoal} 张卡」为目标：每过完一段检查一次，绝不会打断你制卡；制满后自动进入复习。今天制的卡进预览池，明天自动放行为新卡。`
+              : '一轮依次推进：阅读笔记 → 复习。中途不用选，做完自动进入下一段，全部完成回到这里。今天制的卡进预览池，明天自动放行为新卡。'}
           </p>
 
           <Show when={isEmpty() && props.due != null}>
@@ -110,8 +118,12 @@ export const StartScreen: Component<Props> = (props) => {
               <div class="plan-head md-typescale-label-large">今日每轮计划</div>
               <Show when={(props.readingAvailable ?? 0) > 0}>
                 <div class="stat-row">
-                  <span>阅读</span>
-                  <span class="stat-value">{sizes()!.read ?? 0} 段</span>
+                  <span>{goalActive() ? '阅读（制满今日卡片为止）' : '阅读'}</span>
+                  <span class="stat-value">
+                    {goalActive()
+                      ? `已制 ${props.madeToday ?? 0} / ${props.makeGoal} 张`
+                      : `${sizes()!.read ?? 0} 段`}
+                  </span>
                 </div>
               </Show>
               <div class="stat-row">

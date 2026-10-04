@@ -1,14 +1,16 @@
 import { Component, For, Show, createEffect, createSignal, onMount } from 'solid-js'
 import katex from 'katex'
 import { api } from '../api'
-import { applyBottomSheetAnimation } from '../lib/bottom-sheet'
+import { applyDialogGuard } from '../lib/dialog-guard'
 import { fromEditorHtml, makeMathChip, makeMediaImg, mathifyField, toEditorHtml } from '../lib/rich'
 import {
   IconFormatBold, IconFormatItalic, IconFormatUnderlined, IconInkHighlighter,
   IconImage, IconFormatClear, IconFunctions,
 } from './icons'
 
-// Rich-text note editor (MD3 bottom sheet). contenteditable fields are
+// Rich-text note editor (MD3 wide centered dialog, user spec 2026-10-05 —
+// was a bottom sheet; scrim clicks no longer dismiss it, 取消/保存/Esc only).
+// contenteditable fields are
 // imperative by design: toolbar commands + paste-upload mutate the DOM
 // directly, Solid only mounts the initial HTML (fresh mount per card —
 // App.tsx unmounts the dialog on close).
@@ -326,7 +328,9 @@ export const EditDialog: Component<Props> = (props) => {
         dialogRef = el
         // Must be set before the dialog's open animation runs (the open
         // attribute triggers show() after a connected microtask).
-        applyBottomSheetAnimation(el)
+        // Scrim clicks are blocked (user spec 2026-10-05: 误触即关丢编辑) —
+        // only 取消/保存 and Esc close it. Default center-scale motion.
+        applyDialogGuard(el, () => props.onClose())
       }}
     >
       <div slot="headline">{isAdd() ? '添加卡片' : '编辑卡片'}</div>
