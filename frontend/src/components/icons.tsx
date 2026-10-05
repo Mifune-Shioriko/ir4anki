@@ -56,6 +56,11 @@ const P_ArrowBack = ['m274-450 248 248-42 42-320-320 320-320 42 42-248 248h526v6
 // 片段编辑器 (user spec 2026-09-23): grid_on = 插入表格 (GFM template).
 // Official Material Symbols outlined path (@material-symbols/svg-400).
 const P_Grid = ['M180-120q-24 0-42-18t-18-42v-600q0-24 18-42t42-18h600q24 0 42 18t18 42v600q0 24-18 42t-42 18H180Zm270-250H180v190h270v-190Zm60 0v190h270v-190H510Zm-60-60v-190H180v190h270Zm60 0h270v-190H510v190ZM180-680h600v-100H180v100Z']
+// file management (user spec 2026-10-06): drive_file_move = 移动到,
+// folder_open = the CURRENT DIRECTORY (upload target / open folder).
+// Official Material Symbols outlined paths (@material-symbols/svg-400).
+const P_DriveFileMove = ['M184-80q-24 0-42-18t-18-42v-720q0-24 18-42t42-18h167l59 60h288q24 0 42 18t18 42h60v142h-60v-82H455l-60-60H184v720h516v-480h60v540H184Zm435-360v-80H456v-60h163v-80l120 110-120 110ZM184-740v-60 60Z']
+const P_FolderOpen = ['M140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h189q12 0 22.5 4.5T370-774l59 59h272q17 0 31.5 9t18.5 24L637-492H240q-16 0-29.5 10T193-456L140-312v-428 520 60Zm100-60h439l96-260H236l-96 260Zm-96 60v-520 60-60 520Z']
 
 export interface IconProps { size?: number }
 
@@ -102,3 +107,5 @@ export const IconContentCut = (props: IconProps) => <Svg paths={P_ContentCut} {.
 export const IconFindInPage = (props: IconProps) => <Svg paths={P_FindInPage} {...props} />
 export const IconArrowBack = (props: IconProps) => <Svg paths={P_ArrowBack} {...props} />
 export const IconGrid = (props: IconProps) => <Svg paths={P_Grid} {...props} />
+export const IconDriveFileMove = (props: IconProps) => <Svg paths={P_DriveFileMove} {...props} />
+export const IconFolderOpen = (props: IconProps) => <Svg paths={P_FolderOpen} {...props} />

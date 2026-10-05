@@ -34,6 +34,29 @@ async function parse<T>(r: Response): Promise<T> {
   return data as T
 }
 
+/** /api/files/upload rejected with 409: .md name conflicts. The detail is
+ *  a JSON list of clashing relative paths — the UI offers 覆盖/改名/跳过
+ *  and retries with the chosen policy. */
+export class UploadConflictError extends Error {
+  conflicts: string[]
+  constructor(detail: string) {
+    super('文件名冲突')
+    this.name = 'UploadConflictError'
+    let c: string[] = []
+    try {
+      const d = JSON.parse(detail) as { conflicts?: string[] }
+      if (Array.isArray(d?.conflicts)) c = d.conflicts
+    } catch { /* detail wasn't JSON — keep [] */ }
+    this.conflicts = c
+  }
+}
+
+export interface FilesUploadResponse {
+  ok: boolean
+  saved: { path: string; action: string; original?: string }[]
+  images_renamed: Record<string, string>
+}
+
 function get<T>(url: string): Promise<T> {
   return fetch(url).then(r => parse<T>(r))
 }
@@ -89,9 +112,48 @@ export const api = {
     )
   },
   // ---- file browser (文件 section, user spec 2026-09-19 round 3) ----
-  filesList: () => get<{ files: { path: string; title: string }[] }>('/api/files/list'),
+  filesList: () => get<{ files: { path: string; title: string }[]; dirs?: string[] }>('/api/files/list'),
   filesRaw: (path: string) =>
     get<{ path: string; text: string }>(`/api/files/raw?path=${encodeURIComponent(path)}`),
+  // ---- file management (user spec 2026-10-06: 前端 = 语料唯一可信来源) ----
+  /** Upload .md notes + images. `entries` carry a File and its relative
+   *  path (webkitRelativePath for folder uploads, file.name for singles);
+   *  they land under `dir` keeping the subtree. A .md name conflict with
+   *  onConflict='error' (default) rejects with UploadConflictError listing
+   *  the clashing relative paths, so the UI can offer 覆盖/改名/跳过 and
+   *  retry. Image basename collisions auto-prefix (no error). */
+  filesUpload: (
+    entries: { file: File; rel: string }[],
+    dir: string,
+    onConflict: 'error' | 'overwrite' | 'rename' | 'skip' = 'error',
+  ): Promise<FilesUploadResponse> => {
+    const fd = new FormData()
+    for (const e of entries) {
+      fd.append('files', e.file)
+      fd.append('rel_paths', e.rel)
+    }
+    fd.append('dir', dir)
+    fd.append('on_conflict', onConflict)
+    return fetch('/api/files/upload', { method: 'POST', body: fd }).then(async r => {
+      if (r.status === 409) {
+        let detail = ''
+        try {
+          detail = String((JSON.parse(await r.text()) as { detail?: string }).detail ?? '')
+        } catch { /* non-JSON detail */ }
+        throw new UploadConflictError(detail)
+      }
+      return parse<FilesUploadResponse>(r)
+    })
+  },
+  filesRename: (path: string, newName: string) =>
+    post<{ ok: boolean; path: string; old_path?: string; unchanged?: boolean }>(
+      '/api/files/rename', { path, new_name: newName }),
+  filesMove: (path: string, newDir: string) =>
+    post<{ ok: boolean; path: string; old_path?: string; unchanged?: boolean }>(
+      '/api/files/move', { path, new_dir: newDir }),
+  filesDelete: (path: string, confirm: string) =>
+    post<{ ok: boolean; deleted: string; was_dir: boolean }>(
+      '/api/files/delete', { path, confirm }),
   // ---- reading mode (渐进制卡, 2026-09-19) ----
   readingStatus: () => get<ReadingStatusResponse>('/api/reading/status'),
   readingState: () => get<ReadingStateResponse>('/api/reading/state'),

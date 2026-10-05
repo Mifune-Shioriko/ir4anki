@@ -2335,6 +2335,183 @@ a:focus-visible,
   text-align: center;
 }
 
+/* ---- file management (user spec 2026-10-06) ---- */
+.files-tree-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+.files-upload-btn {
+  --md-text-button-label-text-size: 0.78rem;
+}
+/* current-directory strip = the upload target */
+.files-current-dir {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 12px 5px 20px;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface-variant);
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  min-width: 0;
+}
+.files-current-dir__path {
+  font-weight: 600;
+  color: var(--md-sys-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl; /* keep the DEEPEST segment visible when truncated */
+  text-align: left;
+}
+.files-current-dir__root {
+  margin-left: auto;
+  --md-text-button-label-text-size: 0.72rem;
+  flex-shrink: 0;
+}
+.files-tree-dir__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.files-tree-dir--root {
+  margin-bottom: 2px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-small, 8px)
+    var(--md-sys-shape-corner-small, 8px) 0 0;
+}
+.files-tree-dir--current {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+.files-tree-dir--current:hover {
+  background: var(--md-sys-color-primary-container);
+}
+/* hover row actions (rename/move/delete) — hidden until the row hovers */
+.files-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-left: auto;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.files-tree-dir:hover .files-row-actions,
+.files-tree-file:hover .files-row-actions,
+.files-tree-file--selected .files-row-actions {
+  opacity: 1;
+}
+.files-row-action {
+  --md-icon-button-state-layer-size: 30px;
+  width: 30px;
+  height: 30px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+.files-row-action--danger {
+  color: var(--md-sys-color-error);
+}
+/* move dialog folder picker */
+.files-move-list {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  padding: 4px;
+  margin-top: 8px;
+}
+.files-move-dir {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  cursor: pointer;
+  user-select: none;
+}
+.files-move-dir:hover {
+  background: var(--md-sys-color-surface-container-low);
+}
+.files-move-dir--pick {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+.files-move-dir--disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.files-move-hint {
+  margin-top: 12px;
+  color: var(--md-sys-color-on-surface-variant);
+}
+/* generic management dialogs (rename/move/delete/conflict) */
+.files-dialog {
+  width: min(520px, calc(100vw - 48px));
+  max-width: calc(100vw - 48px);
+}
+.files-dialog-content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 300px;
+}
+.files-dialog-path {
+  color: var(--md-sys-color-on-surface-variant);
+  word-break: break-all;
+}
+.files-dialog-note {
+  color: var(--md-sys-color-on-surface-variant);
+  background: var(--md-sys-color-surface-container-low);
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  padding: 8px 12px;
+}
+.files-rename-input,
+.files-delete-input {
+  width: 100%;
+}
+.files-delete-warn {
+  color: var(--md-sys-color-error);
+}
+.files-delete-warn--listed {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  padding: 8px 12px;
+}
+.files-conflict-list {
+  max-height: 200px;
+  overflow-y: auto;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  padding: 6px 10px;
+  margin-top: 4px;
+}
+.files-conflict-item {
+  padding: 2px 0;
+  word-break: break-all;
+  color: var(--md-sys-color-on-surface-variant);
+}
+.danger-text-button {
+  --md-text-button-label-text-color: var(--md-sys-color-error);
+}
+/* viewer crumb action row */
+.files-viewer-crumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.files-viewer-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 2px;
+  flex-shrink: 0;
+}
+.files-viewer-actions md-text-button {
+  --md-text-button-label-text-size: 0.78rem;
+}
+
 @media (max-width: 900px) {
   /* narrow: stack tree above viewer, both scroll with the page */
   .files-page {

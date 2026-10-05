@@ -271,8 +271,11 @@ async def main():
               _seg(A_PATH, k2)["status"] == "active")
         r = await c.post("/api/reading/start?mode=daily")
         dealt = _deal_keys(r)
-        check("round dealt exactly {s1, s3} — gated s2 skipped, s3 AFTER it dealt",
-              dealt == {k1, k3}, str(dealt))
+        # list-driven dealing (2026-10-06): ONE segment per file. s2 (the
+        # only active) is gated → the slot falls back to the frontier s1;
+        # s3 does NOT ride along (每文件严格一段).
+        check("round dealt exactly {s1} — gated active skipped, frontier takes the slot",
+              dealt == {k1}, str(dealt))
         await c.post("/api/reading/finish")
 
         print("== 2. summary + funnel wire shape ==")
@@ -316,12 +319,16 @@ async def main():
         fake.add_pool_card(nid2b)
         _set_seg(A_PATH, k2, cards_created=[nid2b])
         r = await c.post("/api/reading/start?mode=daily")
-        check("round dealt {s1, s3}", _deal_keys(r) == {k1, k3}, str(_deal_keys(r)))
-        for k in (k1, k3):
-            r = await c.post("/api/reading/act",
-                             params={"path": A_PATH, "chunk_key": k,
-                                     "action": "complete"})
-            check(f"complete {k} ok", r.json().get("ok") is True, r.text[:150])
+        check("round dealt {s1} (one per file; gated s2 → frontier slot)",
+              _deal_keys(r) == {k1}, str(_deal_keys(r)))
+        # s3 never rides along (每文件严格一段) — clear it test-side and
+        # complete s1 through the round, leaving gated s2 as the only
+        # live segment
+        _set_seg(A_PATH, k3, status="done")
+        r = await c.post("/api/reading/act",
+                         params={"path": A_PATH, "chunk_key": k1,
+                                 "action": "complete"})
+        check("complete s1 ok", r.json().get("ok") is True, r.text[:150])
         r = await c.get("/api/reading/status")
         a_sum = _summary(r, A_PATH)
         check("no frontier left (only the gated segment)",

@@ -1,19 +1,15 @@
 """Anki review web app — backend (v2).
 
-Session model (single daily flow, user spec 2026-09-24 + 2026-09-27):
-  - ONE pacing tier "daily" = read 4 segments + {new} 15 new cards +
+Session model (single daily flow, user spec 2026-09-24 + 2026-10-06):
+  - ONE pacing tier "daily" = one reading round + {new} 15 new cards +
     DYNAMIC review ceil(D/3) (D = the day's due snapshot, see below).
-    Sizes env-overridable (ANKI_DAILY_READ / ANKI_DAILY_NEW /
-    ANKI_REVIEW_DUE_DIVISOR).
-  - the reading stage is GOAL-BASED (user spec 2026-10-05): it keeps
-    dealing 4-segment batches until MAKE_DAILY_GOAL cards were made today
-    (ANKI_DAILY_MAKE, default = ANKI_DAILY_NEW — today's made cards are
-    tomorrow's new cards). The checkpoint is a SEGMENT BOUNDARY
-    (complete/skip/next), never mid-card: making cards on a segment is
-    never cut short. Goal met → the rest of the round parks (statuses
-    untouched, segments deal again next round) and the chain moves to
-    review. Counter = pool cards whose noteId is today (see
-    _made_today_count); AnkiConnect down → fail-open (reading continues).
+    Sizes env-overridable (ANKI_DAILY_NEW / ANKI_REVIEW_DUE_DIVISOR).
+  - the reading round is LIST-DRIVEN (user spec 2026-10-06, replacing both
+    the chunk budget and the 2026-10-05 daily card-making goal — ALL
+    card-making quotas are retired): every file in the 阅读清单 contributes
+    EXACTLY ONE segment per round (its first non-gated `active` segment,
+    else its frontier), so a 6-file list deals 6 segments — 每篇文章都推一遍.
+    No floor and no cap: a single-file list deals a single segment.
   - the daily chain is 阅读 → 复习 — the manual PREVIEW STAGE is RETIRED
     (user spec 2026-09-27). New cards still land in the preview pool
     SUSPENDED when they are made, but nobody approves them by hand anymore:
@@ -34,14 +30,16 @@ Session model (single daily flow, user spec 2026-09-24 + 2026-09-27):
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
-    a reading round of {read} note segments runs BEFORE the review stage.
+    a LIST-DRIVEN reading round runs BEFORE the review stage — one segment
+    per 阅读清单 file (user spec 2026-10-06).
     The user reads their own markdown notes (~/anki-notes, whole-file
     seeding + recursive bookmark splits) and writes cards by hand. Per
     segment: todo → active(正在制卡) → done(制卡完成), or skipped(无需制卡).
-    Within a file only the frontier segment is dealt, so later segments
-    stay locked until the frontier is finished; an `active` segment
-    resurfaces first every round. Files are opt-in via the 阅读清单
-    (manual priority). State: state/reading.db (SQLite).
+    Each file contributes exactly ONE segment per round (its first non-gated
+    `active`, else its frontier), so later segments stay locked until the
+    frontier is finished and an `active` segment resurfaces every round.
+    Files are opt-in via the 阅读清单 (manual priority).
+    State: state/reading.db (SQLite).
 
     Reading gate (user spec 2026-09-19 round 3; SEGMENT-LEVEL since the
     2026-09-29 option-B ruling): a segment whose created cards have NOT all
@@ -62,6 +60,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import sqlite3
 import sys
 import time
@@ -71,7 +70,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -95,8 +94,9 @@ ROUND_FILE = STATE_DIR / "round.json"
 
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
-# ---- single daily pacing (user spec 2026-09-24) ----
-# One round shape, run 早/中/晚: 4 reading segments + a review batch of
+# ---- single daily pacing (user spec 2026-09-24, list-driven 2026-10-06) ----
+# One round shape, run 早/中/晚: ONE reading round (every listed file
+# contributes exactly one segment — no fixed size) + a review batch of
 # 15 new + ceil(D/3) reviews, where D = the due-card count SNAPSHOTTED at
 # the day's first review deal (daily.json, Anki-day keyed — three rounds
 # then clear the day's due pile). The manual preview stage was retired
@@ -113,23 +113,12 @@ def _env_int(name: str, default: int) -> int:
 
 STUDY_MODES: dict[str, dict[str, int]] = {
     "daily": {
-        "read": _env_int("ANKI_DAILY_READ", 4),
         "new": _env_int("ANKI_DAILY_NEW", 15),
         "review": 0,  # dynamic: ceil(due snapshot / divisor), see below
     },
 }
 DEFAULT_MODE = "daily"
 REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 3))
-
-# Daily card-MAKING goal (user spec 2026-10-05): the reading stage keeps
-# dealing segment batches until this many cards were made TODAY, then the
-# chain moves on to review. The checkpoint is a SEGMENT BOUNDARY (the
-# complete/skip/next act) — never mid-card, so making cards on a segment is
-# never cut short. Defaults to the daily NEW size: today's made cards are
-# tomorrow's new cards, so "make 15" and "review 15 new" stay in lockstep.
-# Override with ANKI_DAILY_MAKE; <=0 disables the goal (old fixed-round
-# behaviour: one batch, then review).
-MAKE_DAILY_GOAL = _env_int("ANKI_DAILY_MAKE", STUDY_MODES[DEFAULT_MODE]["new"])
 
 # Daily due snapshot (user spec 2026-09-24): D is captured ONCE per Anki day
 # at the first review deal, so 早/中/晚 rounds each take ceil(D/3) and the
@@ -233,17 +222,17 @@ PREVIEW_FILE = STATE_DIR / "preview.json"  # legacy round state; no longer writt
 # machine (todo → active → done, plus skipped), NO SuperMemo-style fragment
 # rescheduling in v1.
 #
-# Ordering rule (user spec, updated 2026-09-19 round 2): a round deals up
-# to STUDY_MODES[mode]["read"] CHUNKS — active chunks first (resurface until
-# done/skipped), then one frontier chunk per file (breadth, 阅读清单
-# priority), then — while the budget isn't filled — the same files' NEXT
-# dealable chunks in file order (depth). A single-file list therefore still
-# gets a full round instead of exactly one chunk. Within a file, chunks
-# before the frontier are done/skipped by definition; done/skipped chunks
-# are never dealt. An `active` chunk IS dealable, so it automatically
-# resurfaces every round until the user marks it done/skipped. A GATED
-# chunk (preview-pool hold) is skipped by every phase but does NOT lock the
-# rest of its file (segment-level gate, option B 2026-09-29).
+# Ordering rule (user spec 2026-10-06, LIST-DRIVEN): a round deals EXACTLY
+# ONE segment per 阅读清单 file — its first non-gated `active` segment, else
+# its frontier (first non-gated todo). All card-making quotas are retired
+# (the old per-round chunk budget AND the 2026-10-05 daily goal), so an
+# N-file list deals up to N segments (每篇文章都推一遍) with no floor and no
+# cap; a single-file list deals a single segment. An `active` segment
+# occupies its file's one slot (resurfaces every round until done/skipped).
+# done/skipped/background segments are never dealt. A GATED segment
+# (preview-pool hold) is skipped but does NOT lock the rest of its file
+# (segment-level gate, option B 2026-09-29) — if a file's only candidates
+# are gated, that file simply contributes nothing this round.
 #
 # 开始制卡 is GONE from the UI (2026-09-19 round 2): chunks auto-mark
 # `active` when a card or cloze is created from them (_reading_record_card).
@@ -251,8 +240,7 @@ PREVIEW_FILE = STATE_DIR / "preview.json"  # legacy round state; no longer writt
 #
 # Files are opt-in (阅读清单): the corpus mixes study notes with misc logs,
 # so nothing is auto-queued; the user adds files and orders them by hand
-# (decision #2). Round size rides the pacing modes: STUDY_MODES[*]["read"]
-# (decision #4). Chunks come from the vendored backend/chunker.py over the
+# (decision #2). Chunks come from the vendored backend/chunker.py over the
 # notes corpus (ANKI_NOTES_DIR).
 #
 # Gated on ANKI_READING_MODE like preview: off ⇒ endpoints 404, the wire
@@ -285,11 +273,6 @@ def _capped_study_modes(review_size: int | None = None) -> dict[str, dict[str, i
         row = dict(sizes)
         if review_size is not None:
             row["review"] = review_size
-        # reading stage runs until this many cards were made today (2026-10-05);
-        # 0 = goal tracking inactive (needs the preview pool as its counter)
-        row["make"] = (
-            MAKE_DAILY_GOAL if (MAKE_DAILY_GOAL > 0 and PREVIEW_MODE) else 0
-        )
         out[name] = row
     return out
 
@@ -1245,37 +1228,6 @@ async def _pending_release_today() -> int:
         if i.get("cardId") and i.get("type") == 0
     ]
     return sum(1 for i in infos if _note_created_anki_day(i.get("note") or 0) == today)
-
-
-async def _made_today_count() -> int | None:
-    """Cards made TODAY through ir4anki — the daily card-making goal's
-    counter (user spec 2026-10-05, drives MAKE_DAILY_GOAL).
-
-    Counting rule = the preview-pool timestamp (same as
-    _pending_release_today): suspended new pool cards whose NOTE was
-    created on the current Anki day — exactly the batch that auto-releases
-    as tomorrow's new cards, and it includes cards made during the review
-    stage too (「今天总制卡量」).
-
-    Returns None when the counter is unavailable (PREVIEW_MODE off → no
-    pool to count; AnkiConnect unreachable): callers treat None as "goal
-    tracking inactive / not reached" (fail-open) — a dead backend must
-    never end the reading stage spuriously, exactly like the segment gates.
-    """
-    if not PREVIEW_MODE:
-        return None
-    try:
-        return await _pending_release_today()
-    except Exception:
-        return None
-
-
-def _make_goal_wire(made_today: int | None) -> int | None:
-    """make_goal only ships when the counter is live (made_today not None) —
-    the frontend falls back to the legacy one-batch flow otherwise."""
-    if MAKE_DAILY_GOAL > 0 and made_today is not None:
-        return MAKE_DAILY_GOAL
-    return None
 
 
 @app.get("/api/note")
@@ -2557,75 +2509,56 @@ async def _reading_gates(data: dict) -> set[tuple[str, str]]:
     return gated
 
 
-def _deal_reading(data: dict, per_round: int, gated: set | None = None) -> list[dict]:
-    """Deal up to `per_round` CHUNKS (not files) — user decision 2026-09-19.
+def _deal_reading(data: dict, gated: set | None = None) -> list[dict]:
+    """Deal EXACTLY ONE segment per listed file — user decision 2026-10-06.
 
-    Three phases, files always in 阅读清单 priority order:
-      0. every `active` chunk resurfaces first (design rule: 正在制卡
-         chunks come back every round until done/skipped — with multi-chunk
-         rounds a deep active chunk could otherwise fall outside the window);
-      1. breadth: each file's frontier (first not-done/skipped) chunk;
-      2. depth: while the budget isn't filled (fewer files than per_round),
-         the same files contribute their NEXT dealable chunks in file order,
-         so a single-file reading list still gets a full round (quick=2 /
-         focus=5) instead of exactly one chunk.
-    Done/skipped chunks are never dealt. GATED chunks (cards still inside
-    the preview pipeline — B·二段重推, 2026-09-19 round 3) are never dealt
-    either, but they are SEGMENT-LEVEL holds (option B, 2026-09-29): a
-    gated chunk is skipped, it does NOT lock the rest of its file — the
-    frontier and the depth pass continue past it.
+    List-driven dealing replaces both the old chunk budget (per_round) and
+    the 2026-10-05 daily card-making goal: ALL card-making quotas are gone.
+    Files are visited in 阅读清单 priority order; each contributes at most
+    one segment, chosen as:
+      1. its FIRST non-gated `active` segment (行序) — 正在制卡 work always
+         resurfaces and occupies that file's single slot (user ruling:
+         active 占该文件名额, 每文件严格只推一段);
+      2. else its frontier — the first non-gated dealable (todo) segment;
+      3. else (every candidate gated / nothing dealable) the file contributes
+         NOTHING this round — it is not padded from other files.
+    So an N-file list deals up to N segments (每篇文章都推一遍); a single-file
+    list deals a single segment. No floor, no cap. done/skipped/background
+    segments are never dealt; GATED segments (cards still in the preview
+    pipeline) are skipped but never lock their file (segment-level hold,
+    option B 2026-09-29).
     """
     gated = gated or set()
     payloads: list[dict] = []
-    dealt: set[tuple[str, str]] = set()
-    # views = [path, ordered, summary, segs_by_id] per dealable file —
-    # segs_by_id resolves parent_seg_id chains for ancestor_cards
-    views: list[list] = []
     for entry in data.get("list", []):
+        path = entry.get("path", "")
         ordered, summary = _file_view(entry, gated)  # may migrate (caller saves)
-        if not ordered or not summary.get("frontier"):
+        if not ordered:
             continue
-        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
-        views.append([entry.get("path", ""), ordered, summary, segs_by_id])
-
-    def _dealable(path: str, key: str, st: dict) -> bool:
-        return st.get("status", "todo") not in (
-            "done", "skipped", "background", "container"
-        ) and (path, key) not in gated
-
-    def _take(path: str, ch: dict, key: str, st: dict, summary: dict,
-              segs_by_id: dict) -> None:
-        payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
-        dealt.add((path, key))
-
-    for path, ordered, summary, by_id in views:  # phase 0: active first
+        pick = None
+        # 1. first non-gated `active` segment (行序) — occupies the file's slot
         for ch, key, st in ordered:
-            if len(payloads) >= per_round:
-                break
             if (
                 st.get("status", "todo") == "active"
-                and (path, key) not in dealt
                 and (path, key) not in gated
             ):
-                _take(path, ch, key, st, summary, by_id)
-    for path, ordered, summary, by_id in views:  # phase 1: frontier per file
-        if len(payloads) >= per_round:
-            break
-        for ch, key, st in ordered:
-            if not _dealable(path, key, st):
-                continue
-            # the frontier is dealt exactly once — if phase 0 already took
-            # it (active), this file contributes nothing to the breadth pass
-            if (path, key) not in dealt:
-                _take(path, ch, key, st, summary, by_id)
-            break
-    for path, ordered, summary, by_id in views:  # phase 2: deepen, priority order
-        for ch, key, st in ordered:
-            if len(payloads) >= per_round:
-                return payloads
-            if (path, key) in dealt or not _dealable(path, key, st):
-                continue
-            _take(path, ch, key, st, summary, by_id)
+                pick = (ch, key, st)
+                break
+        # 2. else the frontier: first non-gated dealable segment
+        if pick is None:
+            for ch, key, st in ordered:
+                s = st.get("status", "todo")
+                if s in ("done", "skipped", "background", "container"):
+                    continue
+                if (path, key) in gated:
+                    continue
+                pick = (ch, key, st)
+                break
+        if pick is None:
+            continue  # every candidate gated / nothing dealable — no padding
+        ch, key, st = pick
+        segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
+        payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
     return payloads
 
 
@@ -2776,13 +2709,6 @@ async def _reading_extras() -> dict:
             max(0, s.get("active", 0) - s.get("gated_active", 0)) for s in summaries
         )
         out["reading_gated"] = sum(s.get("gated", 0) for s in summaries)
-        # daily card-making goal progress (2026-10-05): the UI shows 制卡
-        # X/15 in the reading ring; make_goal only ships when the counter
-        # is live (preview mode on + AnkiConnect reachable).
-        if MAKE_DAILY_GOAL > 0:
-            made = await _made_today_count()
-            out["made_today"] = made
-            out["make_goal"] = _make_goal_wire(made)
         rp = _reading_round_payload(data)
         if rp is not None and rp.get("status") == "active":
             out["reading_round"] = rp
@@ -2849,8 +2775,27 @@ async def reading_corpus():
 
 @app.get("/api/files/list")
 async def files_list():
+    # dirs = every directory under the corpus (excluding protected ones).
+    # The tree view builds from files alone, but the MOVE dialog needs the
+    # directory list so empty dirs (a fresh 2027/ with no notes yet) are
+    # still valid move destinations.
+    dirs: list[str] = []
+    if NOTES_DIR.is_dir():
+        root = NOTES_DIR.resolve()
+        for p in sorted(NOTES_DIR.rglob("*")):
+            try:
+                if not p.is_dir():
+                    continue
+            except OSError:
+                continue
+            rel = p.relative_to(root)
+            if any(part in NOTES_SKIP_DIRS for part in rel.parts):
+                continue
+            dirs.append(str(rel))
     return {
-        "files": [{"path": p, "title": Path(p).stem} for p in _corpus_files()]
+        "files": [{
+            "path": p, "title": Path(p).stem} for p in _corpus_files()],
+        "dirs": dirs,
     }
 
 
@@ -2860,6 +2805,416 @@ async def files_raw(path: str):
     if text is None:
         raise HTTPException(status_code=404, detail="note file not found")
     return {"path": path, "text": text}
+
+
+# ---- file management (user spec 2026-10-06: 前端 = 语料唯一可信来源) --------
+# Upload / rename / move / delete over the ~/anki-notes corpus. The reading
+# store keys EVERYTHING by relative path (rfiles/segments/rcards/rorphans/
+# round pending/archive), so rename & move migrate those rows in the same
+# critical section — content is untouched (file_sha stays valid), so segment
+# line numbers/fingerprints keep working and reading progress survives a
+# rename verbatim (the user's core requirement: 改文件名不能丢阅读进度).
+# Delete is HARD (user ruling): disk + all reading progress go; Anki cards
+# already made from the file are NOT touched (only the app-side provenance).
+# External (file-manager/Obsidian) changes are NOT reconciled automatically —
+# the existing missing/orphan/file_sha drift fuses remain the safety net.
+
+def _files_root() -> Path:
+    return NOTES_DIR.resolve()
+
+
+def _files_resolve(rel: str) -> Path:
+    """Absolute path for a corpus-relative file/dir path; 400 on traversal,
+    the corpus root itself, or a protected dir (.obsidian/_assets/…)."""
+    rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+    if not rel:
+        raise HTTPException(status_code=400, detail="path 不能为空")
+    root = _files_root()
+    p = (NOTES_DIR / rel).resolve()
+    if not p.is_relative_to(root) or p == root:
+        raise HTTPException(status_code=400, detail="非法路径")
+    if any(part in NOTES_SKIP_DIRS for part in p.relative_to(root).parts):
+        raise HTTPException(status_code=400, detail="该目录受保护，不能在 app 内操作")
+    return p
+
+
+def _files_rel(p: Path) -> str:
+    return str(p.relative_to(_files_root()))
+
+
+def _files_check_name(name: str) -> str:
+    """Validate a bare file/dir name (rename target, new dir component)."""
+    name = (name or "").strip()
+    if not name or "/" in name or "\\" in name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="非法名称")
+    if name.startswith(".") or name in NOTES_SKIP_DIRS:
+        raise HTTPException(
+            status_code=400, detail="名称不能以 . 开头，也不能是保留目录名")
+    return name
+
+
+def _like_escape(s: str) -> str:
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool) -> None:
+    """Migrate every reading-store reference from old_rel to new_rel.
+
+    Single file: exact-path UPDATEs. Directory: every stored path under
+    `old_rel/` is re-prefixed (rows are matched via LIKE with escaping, but
+    UPDATED by their exact old value, so no escape subtleties on the write
+    side). Also rewrites the active round's pending entries and drops stale
+    _chunk_cache keys. Runs in ONE SQLite transaction.
+    """
+    old_p = old_rel.rstrip("/") + "/"
+    new_p = new_rel.rstrip("/") + "/"
+    mapping: dict[str, str] = {}
+    conn = _reading_conn()
+    try:
+        with conn:
+            for t in ("rfiles", "segments", "rcards", "rorphans"):
+                if is_dir:
+                    rows = conn.execute(
+                        f"SELECT DISTINCT path FROM {t} "
+                        "WHERE path LIKE ? ESCAPE '\\'",
+                        (_like_escape(old_p) + "%",),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        f"SELECT DISTINCT path FROM {t} WHERE path = ?",
+                        (old_rel,),
+                    ).fetchall()
+                for (p,) in rows:
+                    np = (new_p + p[len(old_p):]) if is_dir else new_rel
+                    mapping[p] = np
+                    conn.execute(
+                        f"UPDATE {t} SET path = ? WHERE path = ?", (np, p))
+            row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
+            if row and row[0] and mapping:
+                try:
+                    rd = json.loads(row[0])
+                except Exception:
+                    rd = None
+                if isinstance(rd, dict):
+                    touched = False
+                    for item in rd.get("pending") or []:
+                        p = item.get("path")
+                        if p in mapping:
+                            item["path"] = mapping[p]
+                            touched = True
+                    if touched:
+                        conn.execute(
+                            "UPDATE rround SET data = ? WHERE id = 1",
+                            (json.dumps(rd, ensure_ascii=False),),
+                        )
+    finally:
+        conn.close()
+    for old in mapping:
+        _chunk_cache.pop(old, None)
+
+
+def _reading_purge(rel: str, is_dir: bool) -> None:
+    """Delete ALL reading-store rows for a path (or a directory prefix) and
+    drop it from the active round (counted done, same accounting as
+    list/remove). Anki cards made from the file are NOT touched (user
+    ruling 2026-10-06: 删除=硬删+进度清掉, 已制卡保留)."""
+    prefix = rel.rstrip("/") + "/"
+    conn = _reading_conn()
+    try:
+        with conn:
+            for t in ("rfiles", "segments", "rcards", "rorphans"):
+                if is_dir:
+                    conn.execute(
+                        f"DELETE FROM {t} WHERE path LIKE ? ESCAPE '\\'",
+                        (_like_escape(prefix) + "%",),
+                    )
+                else:
+                    conn.execute(f"DELETE FROM {t} WHERE path = ?", (rel,))
+            row = conn.execute("SELECT data FROM rround WHERE id = 1").fetchone()
+            if row and row[0]:
+                try:
+                    rd = json.loads(row[0])
+                except Exception:
+                    rd = None
+                if isinstance(rd, dict):
+                    pend = rd.get("pending") or []
+                    keep = [
+                        p for p in pend
+                        if not (
+                            p.get("path") == rel
+                            or (is_dir and str(p.get("path", "")).startswith(prefix))
+                        )
+                    ]
+                    dropped = len(pend) - len(keep)
+                    if dropped:
+                        rd["pending"] = keep
+                        rd["done"] = rd.get("done", 0) + dropped
+                        if not keep:
+                            rd["status"] = "complete"
+                        conn.execute(
+                            "UPDATE rround SET data = ? WHERE id = 1",
+                            (json.dumps(rd, ensure_ascii=False),),
+                        )
+    finally:
+        conn.close()
+    _chunk_cache.pop(rel, None)
+
+
+class FilesRenameBody(BaseModel):
+    path: str
+    new_name: str
+
+
+class FilesMoveBody(BaseModel):
+    path: str
+    new_dir: str  # corpus-relative; "" = corpus root
+
+
+class FilesDeleteBody(BaseModel):
+    path: str
+    confirm: str  # must equal the basename (防呆, user ruling)
+
+
+@app.post("/api/files/rename")
+async def files_rename(body: FilesRenameBody):
+    async with _state_lock:
+        src = _files_resolve(body.path)
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+        name = _files_check_name(body.new_name)
+        is_dir = src.is_dir()
+        is_md = src.is_file() and src.suffix.lower() == ".md"
+        if src.is_file() and not is_md:
+            # v1 limitation (user-approved): note images are referenced by
+            # BARE BASENAME from .md files — renaming one silently breaks
+            # every reference. Images travel with folder moves instead.
+            raise HTTPException(
+                status_code=400,
+                detail="暂不支持重命名图片（会断开 .md 里的引用）；图片可随文件夹整体移动",
+            )
+        if is_md and Path(name).suffix.lower() != ".md":
+            name += ".md"  # friendly: inline rename without the extension
+        dst = src.parent / name
+        old_rel = _files_rel(src)
+        if dst == src:
+            return {"ok": True, "path": old_rel, "unchanged": True}
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="目标名称已存在")
+        os.rename(src, dst)
+        _reading_relocate(old_rel, _files_rel(dst), is_dir)
+        return {"ok": True, "path": _files_rel(dst), "old_path": old_rel}
+
+
+@app.post("/api/files/move")
+async def files_move(body: FilesMoveBody):
+    async with _state_lock:
+        src = _files_resolve(body.path)
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+        new_dir_rel = (body.new_dir or "").strip().replace("\\", "/").strip("/")
+        dst_dir = _files_root() if not new_dir_rel else _files_resolve(new_dir_rel)
+        if dst_dir.exists() and not dst_dir.is_dir():
+            raise HTTPException(status_code=400, detail="目标不是文件夹")
+        is_dir = src.is_dir()
+        if is_dir and (dst_dir == src or src in dst_dir.parents):
+            raise HTTPException(status_code=400, detail="不能把文件夹移动到它自己里面")
+        dst = dst_dir / src.name
+        old_rel = _files_rel(src)
+        if dst == src:
+            return {"ok": True, "path": old_rel, "unchanged": True}
+        if dst.exists():
+            raise HTTPException(status_code=409, detail="目标位置已有同名文件/文件夹")
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        _reading_relocate(old_rel, _files_rel(dst), is_dir)
+        return {"ok": True, "path": _files_rel(dst), "old_path": old_rel}
+
+
+@app.post("/api/files/delete")
+async def files_delete(body: FilesDeleteBody):
+    async with _state_lock:
+        src = _files_resolve(body.path)
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="文件不存在")
+        # 防呆 (user ruling): the request must carry the exact basename
+        if (body.confirm or "") != src.name:
+            raise HTTPException(
+                status_code=400,
+                detail=f"确认文本不匹配（需要输入 {src.name}）",
+            )
+        rel = _files_rel(src)
+        is_dir = src.is_dir()
+        if is_dir:
+            shutil.rmtree(src)
+        else:
+            src.unlink()
+        _reading_purge(rel, is_dir)
+        return {"ok": True, "deleted": rel, "was_dir": is_dir}
+
+
+def _rewrite_image_refs(text: str, mapping: dict[str, str]) -> str:
+    """Point .md image references at renamed uploads (basename-collision
+    auto-prefixing). Covers markdown `](…name)` and html `src/href="…name"`
+    where the reference's LAST path segment is the old basename."""
+    for old, new in mapping.items():
+        esc = re.escape(old)
+        text = re.sub(
+            r"(\]\((?:[^()\s]*/)?)"+esc+r"(\))",
+            lambda m, n=new: m.group(1) + n + m.group(2), text)
+        text = re.sub(
+            r"((?:src|href)\s*=\s*[\"'](?:[^\"']*/)?)"+esc+r"([\"'])",
+            lambda m, n=new: m.group(1) + n + m.group(2), text)
+    return text
+
+
+@app.post("/api/files/upload")
+async def files_upload(
+    files: list[UploadFile] = File(...),
+    rel_paths: list[str] = Form(...),
+    target_dir: str = Form("", alias="dir"),
+    on_conflict: str = Form("error"),  # error | overwrite | rename | skip
+):
+    """Upload .md notes + images into the corpus (user spec 2026-10-06).
+
+    Folder uploads ride webkitRelativePath: the frontend sends every file
+    with its relative path and they land under `dir` keeping the subtree.
+    .md name conflict → policy (error=409 so the UI can ask; overwrite /
+    rename=auto `name (1).md` / skip). IMAGES keep their relative position,
+    but a basename collision with ANY existing corpus image auto-prefixes
+    the folder name (media is served by basename — the textbook-import
+    lesson) and the same batch's .md references are rewritten to match.
+    Uploaded files do NOT auto-join the reading list (stays opt-in).
+    """
+    async with _state_lock:
+        if len(files) != len(rel_paths):
+            raise HTTPException(status_code=400, detail="files 与 rel_paths 数量不一致")
+        if not files:
+            raise HTTPException(status_code=400, detail="没有上传任何文件")
+        if on_conflict not in ("error", "overwrite", "rename", "skip"):
+            raise HTTPException(status_code=400, detail="on_conflict 非法")
+        tdir_rel = (target_dir or "").strip().replace("\\", "/").strip("/")
+        tdir = _files_root() if not tdir_rel else _files_resolve(tdir_rel)
+        if tdir.exists() and not tdir.is_dir():
+            raise HTTPException(status_code=400, detail="目标不是文件夹")
+
+        # read + validate everything up front (all-or-nothing before writes)
+        items: list[dict] = []
+        for up, rel in zip(files, rel_paths):
+            rel = (rel or "").strip().replace("\\", "/").lstrip("/")
+            if not rel:
+                raise HTTPException(status_code=400, detail="缺少相对路径")
+            dest = _files_resolve(
+                (tdir_rel + "/" if tdir_rel else "") + rel)
+            suffix = dest.suffix.lower()
+            if suffix == ".md":
+                kind = "md"
+            elif suffix in NOTE_IMAGE_EXTS:
+                kind = "img"
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"仅支持 .md 笔记和图片：{rel}",
+                )
+            data = await up.read()
+            if not data:
+                raise HTTPException(status_code=400, detail=f"空文件：{rel}")
+            if len(data) > UPLOAD_MAX_BYTES:
+                raise HTTPException(
+                    status_code=413, detail=f"文件过大（最多 25 MB）：{rel}")
+            items.append({"rel": rel, "dest": dest, "kind": kind, "data": data})
+
+        # existing image basenames (media is served corpus-wide by basename)
+        img_names: set[str] = set()
+        for p in NOTES_DIR.rglob("*"):
+            try:
+                if p.is_file() and p.suffix.lower() in NOTE_IMAGE_EXTS:
+                    img_names.add(p.name)
+            except OSError:
+                continue
+
+        def _free_name(dirpath: Path, name: str) -> str:
+            """First free `name`, else `stem (1).ext`, `stem (2).ext`, …"""
+            if not (dirpath / name).exists():
+                return name
+            stem, ext = Path(name).stem, Path(name).suffix
+            i = 1
+            while (dirpath / f"{stem} ({i}){ext}").exists():
+                i += 1
+            return f"{stem} ({i}){ext}"
+
+        conflicts: list[str] = []
+        rename_map: dict[str, str] = {}   # old basename → final basename
+        for it in items:
+            dest: Path = it["dest"]
+            if it["kind"] == "md":
+                if dest.exists():
+                    if on_conflict == "error":
+                        conflicts.append(it["rel"])
+                    elif on_conflict == "overwrite":
+                        it["action"] = "overwritten"
+                    elif on_conflict == "rename":
+                        dest = dest.parent / _free_name(dest.parent, dest.name)
+                        it["dest"] = dest
+                        it["action"] = "renamed"
+                    else:  # skip
+                        it["action"] = "skipped"
+                else:
+                    it["action"] = "written"
+            else:
+                if dest.name in img_names:
+                    # basename collision → prefix with the upload's first
+                    # folder component (textbook-import lesson), else (N)
+                    parts = Path(it["rel"]).parts
+                    prefix = parts[0] if len(parts) > 1 else (
+                        tdir_rel.split("/")[-1] if tdir_rel else "img")
+                    prefix = re.sub(r"[^\w\u4e00-\u9fff.-]+", "-", prefix).strip("-")
+                    cand = f"{prefix}-{dest.name}"
+                    i = 1
+                    stem, ext = Path(cand).stem, Path(cand).suffix
+                    while cand in img_names:
+                        cand = f"{stem} ({i}){ext}"
+                        i += 1
+                    rename_map[dest.name] = cand
+                    it["dest"] = dest.parent / cand
+                    it["action"] = "renamed"
+                else:
+                    it["action"] = "written"
+                img_names.add(it["dest"].name)  # claim within the batch
+
+        if conflicts:
+            raise HTTPException(
+                status_code=409,
+                detail=json.dumps(
+                    {"conflicts": conflicts}, ensure_ascii=False),
+            )
+
+        # write .md files (with image refs rewritten), then images
+        saved: list[dict] = []
+        for it in items:
+            if it["action"] == "skipped":
+                saved.append({"path": it["rel"], "action": "skipped"})
+                continue
+            dest: Path = it["dest"]
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if it["kind"] == "md":
+                try:
+                    text = it["data"].decode("utf-8")
+                except UnicodeDecodeError:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"不是有效的 UTF-8 文本：{it['rel']}",
+                    )
+                text = _rewrite_image_refs(text, rename_map)
+                dest.write_text(text, encoding="utf-8")
+            else:
+                dest.write_bytes(it["data"])
+            saved.append({"path": _files_rel(dest), "action": it["action"],
+                          "original": it["rel"]})
+        return {
+            "ok": True,
+            "saved": saved,
+            "images_renamed": rename_map,
+        }
 
 
 class ReadingPathBody(BaseModel):
@@ -3007,7 +3362,7 @@ async def reading_state():
 
 @app.post("/api/reading/start")
 async def reading_start(mode: str | None = None):
-    """Deal one reading segment: STUDY_MODES[mode]["read"] frontier chunks."""
+    """Deal one reading round: exactly one segment per 阅读清单 file."""
     async with _state_lock:
         _reading_guard()
         return await _reading_start_impl(study_mode(mode))
@@ -3022,27 +3377,13 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
     # resolved pacing table (dynamic review size, 2026-09-24) — the frontend
     # pipes this into its studyModes signal, so it must not carry review=0
     modes = await _wire_study_modes()
-    # Daily card-MAKING goal (user spec 2026-10-05): once today's made-card
-    # count reaches the goal, the reading stage stands down — the deal
-    # answers empty + goal_reached and the frontend chains into review. The
-    # checkpoint lives at SEGMENT boundaries (see _reading_act_impl), so an
-    # in-progress segment is never cut short; this start-time check only
-    # catches rounds that would BEGIN with the goal already met.
-    made_today = await _made_today_count() if MAKE_DAILY_GOAL > 0 else None
-    if made_today is not None and made_today >= MAKE_DAILY_GOAL:
-        return {
-            "chunks": [],
-            "mode": mode,
-            "empty": True,
-            "goal_reached": True,
-            "made_today": made_today,
-            "make_goal": MAKE_DAILY_GOAL,
-            "study_modes": modes,
-        }
+    # List-driven dealing (user spec 2026-10-06): every listed file
+    # contributes exactly one segment; there is NO card-making quota anymore
+    # (the 2026-10-05 daily goal and its start-time stand-down are retired),
+    # so a round is only empty when nothing is dealable.
     data = _reading_read()
-    per_round = STUDY_MODES[mode].get("read", 0)
     gated = await _reading_gates(data)
-    payloads = _deal_reading(data, per_round, gated) if per_round > 0 else []
+    payloads = _deal_reading(data, gated)
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
         return {
@@ -3050,8 +3391,6 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
             "mode": mode,
             "empty": True,
             "study_modes": modes,
-            "made_today": made_today,
-            "make_goal": _make_goal_wire(made_today),
             # why nothing was dealt: all_gated = every remaining chunk is
             # waiting on its cards to clear the preview pipeline (the UI can
             # then say 「等卡片过预览池」 instead of 「清单读完了」)
@@ -3075,8 +3414,6 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
         "mode": mode,
         "empty": False,
         "study_modes": modes,
-        "made_today": made_today,
-        "make_goal": _make_goal_wire(made_today),
     }
 
 
@@ -3084,20 +3421,10 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
 async def reading_act(path: str, chunk_key: str, action: str):
     async with _state_lock:
         _reading_guard()
-        # The daily-making-goal checkpoint only matters for round-advancing
-        # actions on an ACTIVE round — skip the (AnkiConnect-backed) count
-        # otherwise, so mark_active/promote/demote stay cheap.
-        made_today = None
-        if action in ("complete", "skip", "next") and MAKE_DAILY_GOAL > 0:
-            rd0 = (_reading_read() or {}).get("round")
-            if isinstance(rd0, dict) and rd0.get("status") == "active":
-                made_today = await _made_today_count()
-        return _reading_act_impl(path, chunk_key, action, made_today=made_today)
+        return _reading_act_impl(path, chunk_key, action)
 
 
-def _reading_act_impl(
-    path: str, chunk_key: str, action: str, made_today: int | None = None
-):
+def _reading_act_impl(path: str, chunk_key: str, action: str):
     """Per-chunk decision inside a reading round.
 
     mark_active: todo → active (正在制卡). Does NOT advance the round — the
@@ -3192,28 +3519,11 @@ def _reading_act_impl(
     seg["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
     round_complete = False
-    goal_reached = False
     if in_round and action in ("complete", "skip", "next"):
         stats_key = {"complete": "done", "skip": "skipped", "next": "next"}[action]
         stats = rd.setdefault("stats", {})
         stats[stats_key] = stats.get(stats_key, 0) + 1
         round_complete = _drop_and_maybe_complete()
-        # Daily card-making goal (user spec 2026-10-05): the checkpoint is a
-        # SEGMENT BOUNDARY — complete/skip/next just finished one segment,
-        # so the user is never cut off mid-card. Goal met → park the rest of
-        # the round (statuses untouched; those segments deal again next
-        # round, same semantics as finish) and hand over to the review
-        # stage (round_complete → the frontend chains on).
-        if (
-            not round_complete
-            and MAKE_DAILY_GOAL > 0
-            and made_today is not None
-            and made_today >= MAKE_DAILY_GOAL
-        ):
-            rd["status"] = "complete"
-            rd["pending"] = []
-            round_complete = True
-            goal_reached = True
     if demote_completed_round:
         round_complete = True
     _reading_write(data)
@@ -3221,11 +3531,6 @@ def _reading_act_impl(
         "ok": True,
         "status": seg.get("status", "todo"),
         "round_complete": round_complete,
-        "goal_reached": goal_reached,
-        "made_today": made_today,
-        # only ship the goal when the counter is live — same wire rule as
-        # reading/start (PREVIEW off / AnkiConnect down ⇒ no goal UI)
-        "make_goal": _make_goal_wire(made_today),
         "stats": (rd or {}).get("stats", {}),
         "done": (rd or {}).get("done", 0),
         "total": (rd or {}).get("total", 0),

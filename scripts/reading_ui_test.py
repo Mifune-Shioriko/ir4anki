@@ -289,7 +289,10 @@ def run(state):
         check("渐进制卡 start screen is gone",
               page.locator(".screen-title", has_text="渐进制卡").count() == 0)
         plan = page.locator(".screen-stats").first.inner_text()
-        check("plan shows 阅读 4 段 (wire)", "阅读" in plan and "4 段" in plan, plan)
+        # list-driven (2026-10-06): 阅读 row = one segment per listed file —
+        # 2 files in the list → 2 段 (the old fixed "4 段" budget is gone)
+        check("plan shows 阅读 2 段 (one per listed file)",
+              "阅读" in plan and "2 段" in plan, plan)
         check("single 开始 button",
               page.locator("md-filled-button", has_text="开始").count() == 1)
         page.screenshot(path="/tmp/reading-ui-start.png")

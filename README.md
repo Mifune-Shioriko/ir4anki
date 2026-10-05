@@ -32,13 +32,11 @@ Anki). Segment state (todo → active → done/skipped), the segment tree, and
 sqlite DB — the .md files stay pure text with zero markers. While reviewing any
 card later, the app can show the original source segment with full-file context.
 
-The reading stage is **goal-based**: instead of a fixed number of segments per
-round, it keeps dealing batches until you've made your daily card goal
-(`ANKI_DAILY_MAKE`, default = `ANKI_DAILY_NEW`). The goal is only ever checked
-at a **segment boundary** (制卡完成 / 跳过 / 下一张) — never mid-card — so it
-can't cut you off while you're writing cards on a segment. Once the goal is
-met, the rest of the batch parks (statuses untouched, those segments deal
-again next round) and the flow hands over to review.
+The reading round is **list-driven**: every file in the 阅读清单 contributes
+exactly ONE segment per round — its in-progress (正在制卡) segment if it has
+one, otherwise its frontier — so a 6-file list deals 6 segments (每篇文章都推
+一遍). There is no card-making quota anywhere: finish the round, the flow
+hands over to review, and 开始 again deals the next segment of every file.
 
 - **Segment editor** — edit a segment's text in-app (CodeMirror 6 source +
   live markdown preview). Saves atomically rewrite the .md and re-anchor every
@@ -47,9 +45,16 @@ again next round) and the flow hands over to review.
 - **Images in notes** — upload images from the editor; they're stored under
   `NOTES_DIR/_assets` and referenced by bare filename, so the .md stays clean
   and your notes folder stays relocatable (git-friendly).
-- **文件 browser** — a read-only folder-tree view of the whole corpus with
-  rendered markdown/KaTeX, separate from the 阅读清单 (which controls what
-  gets dealt and in what priority).
+- **文件 browser = corpus file manager** — the app is the single source of
+  truth for the notes folder: a folder-tree view with rendered markdown/KaTeX,
+  plus **upload** (files or whole folders, .md + images), **rename**, **move**
+  and **delete**, all from the 文件 page. Rename/move migrate the file's
+  reading progress transactionally (path-keyed rows follow the file, content
+  untouched — so a rename never loses progress); delete is hard (disk +
+  reading progress, Anki cards kept) behind a type-the-filename confirmation.
+  Uploaded images keep their relative position; a basename clash auto-prefixes
+  and rewrites the note's reference. Separate from the 阅读清单, which still
+  controls what gets dealt and in what priority.
 
 ### Preview pool (先看后考 — read before you're tested)
 New cards don't hit the scheduler immediately. They land **suspended** in a
@@ -187,7 +192,6 @@ Defaults that most people will want to change:
 | `ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` | `问答题` / `填空题` | note types used by the add-card dialogs — must exist in your collection |
 | `ANKI_ROLLOVER_HOUR` | `4` | must match Anki's own "next day starts at" |
 | `ANKI_RELEASE_DAILY_GOAL` | `45` | max auto-released cards per day |
-| `ANKI_DAILY_MAKE` | `15` (= `ANKI_DAILY_NEW`) | daily card-making goal for the goal-based reading stage; `0` disables it |
 
 ## Multiple machines
 
@@ -216,16 +220,17 @@ backend/.venv/bin/python scripts/reading_test.py
 backend/.venv/bin/python scripts/auto_release_test.py
 backend/.venv/bin/python scripts/reading_edit_test.py
 backend/.venv/bin/python scripts/gate_segment_level_test.py
-backend/.venv/bin/python scripts/make_goal_test.py
+backend/.venv/bin/python scripts/list_dealing_test.py
+backend/.venv/bin/python scripts/file_mgmt_test.py
 backend/.venv/bin/python scripts/modes_e2e.py
 backend/.venv/bin/python scripts/sync_throttle_test.py
 # UI tests additionally need: pip install playwright && playwright install chromium
 backend/.venv/bin/python scripts/modes_ui_test.py
 backend/.venv/bin/python scripts/reading_ui_test.py
-backend/.venv/bin/python scripts/goal_ui_test.py
+backend/.venv/bin/python scripts/file_mgmt_ui_test.py
 ```
 
-Tests spawn throwaway backends on ports 8902/8903 with isolated state dirs and
+Tests spawn throwaway backends on ports 8902–8907 with isolated state dirs and
 fake or dead AnkiConnect endpoints — they never answer cards against the live
 collection.
 

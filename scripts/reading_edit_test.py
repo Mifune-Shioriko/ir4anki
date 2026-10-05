@@ -173,8 +173,11 @@ async def main():
         s1, s2, s3 = segs
         r = await c.post("/api/reading/start?mode=focus")
         dealt = r.json()["chunks"]
-        check("focus dealt 3", len(dealt) == 3, len(dealt))
-        by_key = {ch["chunk_key"]: ch for ch in dealt}
+        # list-driven dealing (2026-10-06): one segment per FILE — a
+        # single-file list deals exactly its frontier, no depth pass
+        check("list-driven dealt 1 (single file = one segment)",
+              len(dealt) == 1 and dealt[0]["chunk_key"] == str(s1["seg_id"]),
+              [(ch["chunk_key"], ch["path"]) for ch in dealt])
 
         print("== 2. basic edit: replace s1 with +2 lines ==")
         new_text = ("## 一、浅层结构（改）\n\n皮肤薄，移动性大。\n\n浅筋膜内有颈阔肌，由面神经支配。\n\n"

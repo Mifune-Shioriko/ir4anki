@@ -262,8 +262,11 @@ def run():
     modes = st.get("study_modes") or {}
     check("wire: single daily tier", list(modes.keys()) == ["daily"], list(modes.keys()))
     d = modes.get("daily", {})
-    check("wire sizes read=4 new=15, NO preview key",
-          (d.get("read"), d.get("new")) == (4, 15) and "preview" not in d, d)
+    # list-driven reading (2026-10-06): no read/make sizes on the wire —
+    # the round size = number of listed files (computed per deal)
+    check("wire sizes new=15, NO read/preview/make keys",
+          d.get("new") == 15 and "read" not in d and "preview" not in d
+          and "make" not in d, d)
     check("wire review = ceil(3/3) = 1", d.get("review") == 1, d.get("review"))
 
     # /api/status does NOT run auto_release (read-only endpoint) — the first
@@ -310,11 +313,12 @@ def run():
               page.locator(".modes-label").count() == 0)
         stats = page.locator(".screen-stats").all_inner_texts()
         joined = " ".join(stats)
-        # Goal-based reading (2026-10-05): with PREVIEW_MODE on the counter
-        # is live, so the 阅读 plan row shows the daily making goal instead
-        # of a fixed segment count. today's pool card = 1 → 已制 1 / 15 张.
-        check("plan: 阅读 row is goal-based (制满今日卡片)",
-              "阅读" in joined and "已制 1 / 15 张" in joined, joined[:200])
+        # List-driven reading (2026-10-06): the 阅读 plan row shows the
+        # round size = one segment per listed file (1 file in this fixture).
+        # The 2026-10-05 goal copy (已制 X / 15 张) is retired with the
+        # whole card-making quota mechanism.
+        check("plan: 阅读 row is list-driven (每篇文章一段 → 1 段)",
+              "阅读" in joined and "1 段" in joined, joined[:200])
         check("plan: NO 预览新卡 row (stage retired)", "预览新卡" not in joined, joined[:200])
         check("plan: 复习 15 新 + 1 到期", "15 新 + 1 到期" in joined, joined[:300])
         check("pool row: 预览池（明日自动放行）+ 今日新制",

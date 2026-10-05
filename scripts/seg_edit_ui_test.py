@@ -131,9 +131,14 @@ def run(notes: Path):
     png = png.resolve()
     png.write_bytes(base64.b64decode(PNG_B64))
 
-    # seed: whole-file segment split into the 3 sections + deal a focus round
+    # seed: whole-file segment split into the 3 sections + deal a round.
+    # List-driven dealing (2026-10-06): ONE segment per file per round —
+    # the frontier (section 一, line_start 3) is dealt, not all 3.
     d = _seed_sections()
-    check("seed: 3 segments dealt", len(d.get("chunks", [])) == 3, d)
+    chunks = d.get("chunks", [])
+    check("seed: 1 segment dealt (list-driven frontier = section 一)",
+          len(chunks) == 1 and chunks[0].get("line_start") == 3,
+          [(ch.get("seg_id"), ch.get("line_start")) for ch in chunks])
 
     with sync_playwright() as p:
         browser = p.chromium.launch()

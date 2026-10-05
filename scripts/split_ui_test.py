@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -376,8 +377,12 @@ def run(notes: Path):
                          ("background", "todo", "active", "done")})
 
         print("== 5. post-split rounds: children re-render handles ==")
+        # List-driven dealing (2026-10-06): ONE segment per file per round.
+        # After the bookmark split the file is prefix(bg) + cut(4–5,todo) +
+        # tail(6–18,todo), so the frontier = the cut child. Deal it first…
         api("/api/reading/finish", "POST")
-        api("/api/reading/start?mode=focus", "POST")
+        d = api("/api/reading/start?mode=focus", "POST")
+        cut_key = d["chunks"][0]["chunk_key"]
         page.reload(wait_until="networkidle")
         page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
         # first dealt child = lines 4–5 (the cut): one <p> with 2 soft lines
@@ -393,10 +398,21 @@ def run(notes: Path):
               and "子丑寅卯辰" in c["previews"][1], c)
         _cancel(page)
 
+        # …then complete the cut child so the frontier advances to the tail,
+        # and deal a fresh round (the tail is now the file's one segment).
+        _r = api("/api/reading/act?path=" + urllib.parse.quote(A_REL)
+                 + "&chunk_key=" + urllib.parse.quote(cut_key)
+                 + "&action=complete", "POST")
+        check("completed the cut child", _r.get("ok") is True, _r)
+        api("/api/reading/finish", "POST")
+        api("/api/reading/start?mode=focus", "POST")
+        page.reload(wait_until="networkidle")
+        page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
         # tail child = src lines 6–18 → rel: h2=2, fence=4–7, katex=9–11,
-        # closing line=13
-        check("navigated to the tail card",
-              _goto_card_with(page, "echo line-one"), "fence card not found")
+        # closing line=13. It is now the frontier (the only dealt segment).
+        check("tail child is now the dealt card (frontier advanced)",
+              "echo line-one" in page.locator(".reading-chunk-body").first.inner_text(),
+              page.locator(".reading-chunk-body").first.inner_text()[:80])
         hs = _handles(page)
         expect_tail = [[2, 2], [4, 7], [9, 11], [13, 13]]
         check("tail card handles: heading + fence(1) + katex(1) + closing",
