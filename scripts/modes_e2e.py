@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""E2E for the single daily pacing tier (user spec 2026-09-24, preview
-stage retired 2026-09-27).
+"""E2E for the single daily pacing tier (user spec 2026-09-24 → 2026-10-09).
 
-One round shape — 4 reading + 15 new + ceil(D/3) reviews, where D is the
-day's due count snapshotted at the first review deal (state/daily.json).
-The manual preview stage is GONE: session/start triggers auto_release_pool
-(pool cards made on an earlier Anki day become new cards, capped per day).
+One round shape — up to 2 reading segments per file + ALL new + ALL due
+reviews (D / divisor, divisor default 1), where D is the day's due count
+snapshotted at the first review deal (state/daily.json). New-card VOLUME is
+paced on the inflow side by RELEASE_DAILY_GOAL (36/day). The manual preview
+stage is GONE: session/start triggers auto_release_pool (pool cards made on
+an earlier Anki day become new cards, capped per day).
 
 In-process ASGITransport against the REAL AnkiConnect but an ISOLATED
 ANKI_STATE_DIR, so the user's live round.json/daily.json/auto_release.json
@@ -58,19 +59,24 @@ async def main():
         modes = st.get("study_modes") or {}
         check("only 'daily' tier", list(modes.keys()) == ["daily"], list(modes.keys()))
         d = modes.get("daily", {})
-        check("read=4 (wire)", d.get("read") == 4, d)
+        check("no 'read'/'make' size in the wire table (quotas retired)",
+              "read" not in d and "make" not in d, d)
         check("no 'preview' size in the wire table (stage retired)",
               "preview" not in d, d)
-        check("new=15 (wire)", d.get("new") == 15, d)
+        check("new resolved to the live pool (>=0, not the static 0 when pool>0)",
+              isinstance(d.get("new"), int) and d["new"] >= 0, d.get("new"))
         check("review resolved (>=0, not the static placeholder when due>0)",
               isinstance(d.get("review"), int) and d["review"] >= 0, d.get("review"))
         check("default_mode = daily", st.get("default_mode") == "daily")
-        check("release_daily_goal = 45", st.get("release_daily_goal") == 45,
+        check("release_daily_goal = 36", st.get("release_daily_goal") == 36,
               st.get("release_daily_goal"))
         check("status still has preview_mode", st.get("preview_mode") is True)
 
         due_pool = st.get("due_review") or 0
-        expect_review = math.ceil(due_pool / 3) if due_pool else 0
+        new_pool = st.get("new_total") or 0
+        # divisor defaults to 1 (2026-10-09 one-round pacing) → whole due pile
+        expect_review = due_pool
+        expect_new = new_pool
 
         print("== session/state (idle) exposes the daily table ==")
         s = (await c.get("/api/session/state")).json()
@@ -81,14 +87,17 @@ async def main():
         check("state has NO preview_per_round field",
               "preview_per_round" not in s, list(s.keys()))
 
-        print("== start deals the daily batch: 15 new + ceil(D/3) reviews ==")
+        print("== start deals the daily batch: ALL new + ALL due (one round a day) ==")
         r = (await c.post("/api/session/start")).json()
         n_new = sum(1 for x in r["cards"] if x["isNew"])
         n_rev = len(r["cards"]) - n_new
         check("response mode=daily", r.get("mode") == "daily", r.get("mode"))
-        check("new_per_round=15 on wire", r.get("new_per_round") == 15, r.get("new_per_round"))
-        check("new <= 15", n_new <= 15, n_new)
-        check(f"reviews == ceil({due_pool}/3) = {expect_review}",
+        check("new_per_round resolved to the live pool on wire",
+              r.get("new_per_round") == expect_new or r.get("new_per_round") == 0,
+              (r.get("new_per_round"), expect_new))
+        check("all dealable new cards drawn", n_new == expect_new,
+              f"n_new={n_new} pool={expect_new}")
+        check(f"reviews == the whole due snapshot ({due_pool})",
               n_rev == expect_review or due_pool == 0, f"n_rev={n_rev} due={due_pool}")
         rd = json.loads((Path(STATE) / "round.json").read_text())
         check("round.json stores mode=daily", rd.get("mode") == "daily", rd.get("mode"))
@@ -119,8 +128,9 @@ async def main():
         await c.post("/api/session/start")
         r3 = (await c.post("/api/session/more")).json()
         check("more mode=daily", r3.get("mode") == "daily", r3.get("mode"))
-        check("more draws up to 15 new",
-              sum(1 for x in r3["cards"] if x["isNew"]) <= 15, r3["cards"][:3])
+        check("more draws the whole new pool too",
+              sum(1 for x in r3["cards"] if x["isNew"]) <= max(expect_new, 0),
+              r3["cards"][:3])
         await c.post("/api/session/finish")
 
         print("== preview endpoints are GONE (stage retired 2026-09-27) ==")

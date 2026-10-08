@@ -1,15 +1,20 @@
 """Anki review web app — backend (v2).
 
-Session model (single daily flow, user spec 2026-09-24 + 2026-10-06):
-  - ONE pacing tier "daily" = one reading round + {new} 15 new cards +
-    DYNAMIC review ceil(D/3) (D = the day's due snapshot, see below).
-    Sizes env-overridable (ANKI_DAILY_NEW / ANKI_REVIEW_DUE_DIVISOR).
-  - the reading round is LIST-DRIVEN (user spec 2026-10-06, replacing both
-    the chunk budget and the 2026-10-05 daily card-making goal — ALL
-    card-making quotas are retired): every file in the 阅读清单 contributes
-    EXACTLY ONE segment per round (its first non-gated `active` segment,
-    else its frontier), so a 6-file list deals 6 segments — 每篇文章都推一遍.
-    No floor and no cap: a single-file list deals a single segment.
+Session model (single daily flow, user spec 2026-09-24 → 2026-10-09):
+  - ONE pacing tier "daily" = one reading round + a review batch of the
+    ENTIRE dealable new pool + ALL due cards (D / divisor, divisor default
+    1, D = the day's due snapshot). The day is meant to be done in ONE
+    round (一天只做一轮, user spec 2026-10-09); new-card VOLUME is paced on
+    the inflow side by RELEASE_DAILY_GOAL (36/day, lowered from 45). Sizes
+    env-overridable (ANKI_DAILY_NEW>0 re-caps the draw /
+    ANKI_REVIEW_DUE_DIVISOR>1 splits the due pile across rounds).
+  - the reading round is LIST-DRIVEN (user spec 2026-10-06; raised to TWO
+    segments per file on 2026-10-09): every file in the 阅读清单 contributes
+    UP TO TWO segments per round (slot 1 = its first non-gated `active`,
+    else its frontier; slot 2 = the next non-gated dealable segment), so a
+    6-file list deals up to 12 segments — 每篇文章推两次. A freshly seeded
+    whole-file entry has only one dealable segment and deals 1; files with
+    bookmark-split children deal 2. No padding from other files.
   - the daily chain is 阅读 → 复习 — the manual PREVIEW STAGE is RETIRED
     (user spec 2026-09-27). New cards still land in the preview pool
     SUSPENDED when they are made, but nobody approves them by hand anymore:
@@ -30,14 +35,16 @@ Session model (single daily flow, user spec 2026-09-24 + 2026-10-06):
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
-    a LIST-DRIVEN reading round runs BEFORE the review stage — one segment
-    per 阅读清单 file (user spec 2026-10-06).
+    a LIST-DRIVEN reading round runs BEFORE the review stage — up to TWO
+    segments per 阅读清单 file (user spec 2026-10-06, raised 1→2 on
+    2026-10-09: 每篇文章推两次，一天只做一轮).
     The user reads their own markdown notes (~/anki-notes, whole-file
     seeding + recursive bookmark splits) and writes cards by hand. Per
     segment: todo → active(正在制卡) → done(制卡完成), or skipped(无需制卡).
-    Each file contributes exactly ONE segment per round (its first non-gated
-    `active`, else its frontier), so later segments stay locked until the
-    frontier is finished and an `active` segment resurfaces every round.
+    Each file contributes AT MOST TWO segments per round (slot 1 = its first
+    non-gated `active`, else its frontier; slot 2 = the next non-gated
+    dealable segment in line order), so a freshly seeded whole-file entry
+    deals 1 and a file with split children deals 2.
     Files are opt-in via the 阅读清单 (manual priority).
     State: state/reading.db (SQLite).
 
@@ -94,17 +101,20 @@ ROUND_FILE = STATE_DIR / "round.json"
 
 ROUND_EXPIRE_HOURS = 24  # a half-finished round older than this is discarded
 
-# ---- single daily pacing (user spec 2026-09-24, list-driven 2026-10-06) ----
-# One round shape, run 早/中/晚: ONE reading round (every listed file
-# contributes exactly one segment — no fixed size) + a review batch of
-# 15 new + ceil(D/3) reviews, where D = the due-card count SNAPSHOTTED at
-# the day's first review deal (daily.json, Anki-day keyed — three rounds
-# then clear the day's due pile). The manual preview stage was retired
-# 2026-09-27: new cards auto-release from the pool overnight (see
-# auto_release_pool). The old quick/focus tiers are retired; `mode`
+# ---- single daily pacing (user spec 2026-09-24 → 2026-10-09) ----
+# One round shape, run ONCE a day (一天只做一轮): ONE reading round (every
+# listed file contributes up to TWO segments — no fixed size) + a review
+# batch of ALL new + ALL due, where the due size is D / REVIEW_DUE_DIVISOR
+# and D = the due-card count SNAPSHOTTED at the day's first review deal
+# (daily.json, Anki-day keyed). Divisor defaults to 1 (whole pile) and
+# new defaults to 0 (whole dealable pool — the 36/day inflow cap
+# RELEASE_DAILY_GOAL is the real volume control). The manual preview stage
+# was retired 2026-09-27: new cards auto-release from the pool overnight
+# (see auto_release_pool). The old quick/focus tiers are retired; `mode`
 # survives on the wire as an opaque compat field and every unknown value
-# normalizes to "daily". review=0 in the static table means "dynamic" —
-# the wire copy carries the computed size. Sizes env-overridable.
+# normalizes to "daily". review=0 in the static table means "dynamic" and
+# new=0 means "unlimited" — the wire copy carries the computed sizes.
+# Sizes env-overridable.
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
@@ -113,12 +123,22 @@ def _env_int(name: str, default: int) -> int:
 
 STUDY_MODES: dict[str, dict[str, int]] = {
     "daily": {
-        "new": _env_int("ANKI_DAILY_NEW", 15),
-        "review": 0,  # dynamic: ceil(due snapshot / divisor), see below
+        # 0 = UNLIMITED (user spec 2026-10-09): the round deals the ENTIRE
+        # dealable new pool — 当天放行的新卡一次做完，不积压. The daily
+        # new-card volume is paced on the INFLOW side by RELEASE_DAILY_GOAL
+        # (36/day, lowered from 45 — the old target was rarely finished).
+        # Steady state: draw == releases == ≤36. Set ANKI_DAILY_NEW>0 to
+        # re-cap the per-round draw.
+        "new": _env_int("ANKI_DAILY_NEW", 0),
+        "review": 0,  # dynamic: due snapshot / divisor (divisor default 1 = ALL due)
     },
 }
 DEFAULT_MODE = "daily"
-REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 3))
+# One round a day (user spec 2026-10-09): the day's ENTIRE due pile is dealt
+# in that single round — 今天的账今天清，不积压. The old default 3 (ceil(D/3)
+# per round × 早中晚三轮) is retired; set ANKI_REVIEW_DUE_DIVISOR=3 to get the
+# legacy three-round pacing back.
+REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 1))
 
 # Daily due snapshot (user spec 2026-09-24): D is captured ONCE per Anki day
 # at the first review deal, so 早/中/晚 rounds each take ceil(D/3) and the
@@ -173,14 +193,15 @@ async def _daily_review_size(snapshot: bool = False) -> int:
         return 0
     return -(-due // REVIEW_DUE_DIVISOR)  # ceil division
 
-# Daily cap for new-card releases (user spec 2026-09-16 as a preview-approve
-# goal; 2026-09-27 as an AUTO-RELEASE cap): auto_release_pool() never
-# unsuspends more than this many pool cards per Anki day, so a heavy
-# card-making day can't flood the new-card queue and blow up the review
-# burden (放行太多 → 复习负担太大). Oldest cards release first; overflow
-# waits for the next day. <=0 disables the cap. Env-overridable. Default
-# 45 = 3 rounds × 15 new per round (the user's self-designed daily budget).
-RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 45)
+# Daily cap for new-card releases: auto_release_pool() never unsuspends more
+# than this many pool cards per Anki day, so a heavy card-making day can't
+# flood the new-card queue and blow up the review burden (放行太多 → 复习负担
+# 太大). Oldest cards release first; overflow waits for the next day. <=0
+# disables the cap. Env-overridable. Default 36 = the user's daily new-card
+# budget (lowered from 45 on 2026-10-09 — the 45 target was rarely finished;
+# with ONE round a day the round deals the ENTIRE released batch, so the cap
+# alone paces the new-card flow).
+RELEASE_DAILY_GOAL = _env_int("ANKI_RELEASE_DAILY_GOAL", 36)
 # ledger for the daily cap: {"day": YYYYMMDD, "released": N} — Anki-day
 # keyed like the due snapshot, survives restarts, resets on a new day.
 AUTO_RELEASE_FILE = STATE_DIR / "auto_release.json"
@@ -256,13 +277,17 @@ NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "_assets"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
 
 
-def _capped_study_modes(review_size: int | None = None) -> dict[str, dict[str, int]]:
+def _capped_study_modes(review_size: int | None = None,
+                        new_size: int | None = None) -> dict[str, dict[str, int]]:
     """Wire copy of STUDY_MODES, adapted to live numbers:
 
     - `review` is DYNAMIC (single daily pacing 2026-09-24): ceil(D/3) from
       the daily due snapshot. review_size=None leaves the static 0
       placeholder (AnkiConnect unavailable — the frontend then hides the
       number instead of showing a bogus 0).
+    - `new` may be UNLIMITED (static 0, user spec 2026-10-09 — the round
+      takes the whole dealable pool): new_size resolves it to the live pool
+      count for display. new_size=None likewise keeps the 0 placeholder.
 
     The frontend renders sizes from this table only, so the rules live in
     exactly one place. (The old budget-capped `preview` size died with the
@@ -273,18 +298,28 @@ def _capped_study_modes(review_size: int | None = None) -> dict[str, dict[str, i
         row = dict(sizes)
         if review_size is not None:
             row["review"] = review_size
+        if row.get("new", 0) <= 0 and new_size is not None:
+            row["new"] = new_size
         out[name] = row
     return out
 
 
 async def _wire_study_modes() -> dict[str, dict[str, int]]:
     """_capped_study_modes with the dynamic review size resolved (display
-    mode — never persists a snapshot)."""
+    mode — never persists a snapshot). new=0 (unlimited) resolves to the
+    live dealable new pool so the start-screen plan shows a real number."""
     try:
         review_size = await _daily_review_size(snapshot=False)
     except Exception:
         review_size = None
-    return _capped_study_modes(review_size)
+    new_size = None
+    if STUDY_MODES[DEFAULT_MODE].get("new", 0) <= 0:
+        try:
+            ids = await anki("findCards", {"query": new_card_query()})
+            new_size = len(ids or [])
+        except Exception:
+            new_size = None
+    return _capped_study_modes(review_size, new_size)
 
 # Anki's day rollover is 4 AM (collection default, container TZ fixed to
 # Asia/Shanghai). Release comparisons use the ANKI day, not the calendar
@@ -619,9 +654,12 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
     # new cards: random sample within the per-round cap, spread evenly
     if allow_new:
         new_ids = await anki("findCards", {"query": new_card_query()}) or []
-        take = min(new_count, len(new_ids))
+        # new_count <= 0 = UNLIMITED (user spec 2026-10-09): take the whole
+        # dealable pool — the day's released batch is finished in one round.
+        take = len(new_ids) if new_count <= 0 else min(new_count, len(new_ids))
         if take > 0:
-            new_cards = await fetch_cards(random.sample(new_ids, take))
+            drawn = new_ids if take == len(new_ids) else random.sample(new_ids, take)
+            new_cards = await fetch_cards(drawn)
             n_reviews = len(cards)
             if n_reviews:
                 for i, c in enumerate(new_cards):
@@ -2510,23 +2548,27 @@ async def _reading_gates(data: dict) -> set[tuple[str, str]]:
 
 
 def _deal_reading(data: dict, gated: set | None = None) -> list[dict]:
-    """Deal EXACTLY ONE segment per listed file — user decision 2026-10-06.
+    """Deal UP TO TWO segments per listed file — user decision 2026-10-09.
 
-    List-driven dealing replaces both the old chunk budget (per_round) and
-    the 2026-10-05 daily card-making goal: ALL card-making quotas are gone.
-    Files are visited in 阅读清单 priority order; each contributes at most
-    one segment, chosen as:
-      1. its FIRST non-gated `active` segment (行序) — 正在制卡 work always
-         resurfaces and occupies that file's single slot (user ruling:
-         active 占该文件名额, 每文件严格只推一段);
-      2. else its frontier — the first non-gated dealable (todo) segment;
-      3. else (every candidate gated / nothing dealable) the file contributes
-         NOTHING this round — it is not padded from other files.
-    So an N-file list deals up to N segments (每篇文章都推一遍); a single-file
-    list deals a single segment. No floor, no cap. done/skipped/background
-    segments are never dealt; GATED segments (cards still in the preview
-    pipeline) are skipped but never lock their file (segment-level hold,
-    option B 2026-09-29).
+    List-driven dealing (2026-10-06) with the per-file slot raised 1 → 2
+    (每篇文章推两次，一天只做一轮). Files are visited in 阅读清单 priority
+    order; each contributes AT MOST two segments:
+      slot 1: the file's FIRST non-gated `active` segment (正在制卡 work
+              always resurfaces) — else its frontier (first non-gated
+              dealable todo segment);
+      slot 2: the SECOND non-gated `active` if the file has two in-progress
+              segments (actives beat line order — the old phase-0 resurface
+              guarantee) — else the next non-gated dealable segment in line
+              order (frontier when slot 1 was an active; the segment AFTER
+              the frontier otherwise).
+    A file with only ONE dealable segment contributes just one (the natural
+    state for whole-file seeding before the first bookmark split). Every
+    candidate gated / nothing dealable → the file contributes NOTHING this
+    round — never padded from other files. So an N-file list deals up to 2N
+    segments; no floor, no cap beyond that.
+    done/skipped/background/container segments are never dealt; GATED
+    segments (cards still in the preview pipeline) are skipped but never
+    lock their file (segment-level hold, option B 2026-09-29).
     """
     gated = gated or set()
     payloads: list[dict] = []
@@ -2535,30 +2577,31 @@ def _deal_reading(data: dict, gated: set | None = None) -> list[dict]:
         ordered, summary = _file_view(entry, gated)  # may migrate (caller saves)
         if not ordered:
             continue
-        pick = None
-        # 1. first non-gated `active` segment (行序) — occupies the file's slot
-        for ch, key, st in ordered:
-            if (
-                st.get("status", "todo") == "active"
-                and (path, key) not in gated
-            ):
-                pick = (ch, key, st)
-                break
-        # 2. else the frontier: first non-gated dealable segment
-        if pick is None:
-            for ch, key, st in ordered:
-                s = st.get("status", "todo")
-                if s in ("done", "skipped", "background", "container"):
-                    continue
-                if (path, key) in gated:
-                    continue
-                pick = (ch, key, st)
-                break
-        if pick is None:
-            continue  # every candidate gated / nothing dealable — no padding
-        ch, key, st = pick
         segs_by_id = {s.get("seg_id"): s for s in entry.get("segments") or []}
-        payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
+        dealable = [
+            (ch, key, st) for ch, key, st in ordered
+            if st.get("status", "todo") in ("todo", "active")
+            and (path, key) not in gated
+        ]
+        if not dealable:
+            continue  # every candidate gated / nothing dealable — no padding
+        actives = [x for x in dealable if x[2].get("status") == "active"]
+        # slot 1: first active, else the frontier (= dealable[0], line order)
+        first = actives[0] if actives else dealable[0]
+        picked = [first]
+        # slot 2: second active, else next dealable in line order
+        second = None
+        if len(actives) > 1:
+            second = actives[1]
+        else:
+            second = next(
+                (x for x in dealable if x[1] != first[1]),
+                None,
+            )
+        if second is not None:
+            picked.append(second)
+        for ch, key, st in picked:
+            payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
     return payloads
 
 
@@ -2694,11 +2737,24 @@ async def _reading_extras() -> dict:
         data = _reading_read()
         gated = await _reading_gates(data)
         summaries = []
+        dealable_segs = 0
         for entry in data.get("list", []):
-            _, summary = _file_view(entry, gated)
+            ordered, summary = _file_view(entry, gated)
             summaries.append(summary)
+            # exact round-size preview (2026-10-09, two-slot dealing):
+            # count each file's non-gated dealable (todo|active) segments,
+            # capped at the per-file slot count — same predicate as
+            # _deal_reading, so the start-screen plan matches the deal.
+            n = sum(
+                1
+                for _ch, key, st in (ordered or [])
+                if st.get("status", "todo") in ("todo", "active")
+                and (entry.get("path", ""), key) not in gated
+            )
+            dealable_segs += min(2, n)
         out["reading_list_size"] = len(data.get("list", []))
         out["reading_available"] = sum(1 for s in summaries if s.get("frontier"))
+        out["reading_dealable"] = dealable_segs
         # funnel signal: only NOT-held 正在制卡 chunks resurface next round
         # (a gated active chunk waits for its cards to clear the preview
         # pipeline — counting it here would pull the user into a reading
@@ -3362,7 +3418,7 @@ async def reading_state():
 
 @app.post("/api/reading/start")
 async def reading_start(mode: str | None = None):
-    """Deal one reading round: exactly one segment per 阅读清单 file."""
+    """Deal one reading round: up to two segments per 阅读清单 file."""
     async with _state_lock:
         _reading_guard()
         return await _reading_start_impl(study_mode(mode))

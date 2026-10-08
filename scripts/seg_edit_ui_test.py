@@ -132,12 +132,12 @@ def run(notes: Path):
     png.write_bytes(base64.b64decode(PNG_B64))
 
     # seed: whole-file segment split into the 3 sections + deal a round.
-    # List-driven dealing (2026-10-06): ONE segment per file per round —
-    # the frontier (section 一, line_start 3) is dealt, not all 3.
+    # Two-slot dealing (2026-10-09): UP TO TWO segments per file per round —
+    # the frontier (section 一, line_start 3) + the next section (二).
     d = _seed_sections()
     chunks = d.get("chunks", [])
-    check("seed: 1 segment dealt (list-driven frontier = section 一)",
-          len(chunks) == 1 and chunks[0].get("line_start") == 3,
+    check("seed: 2 segments dealt (two-slot: sections 一 + 二)",
+          len(chunks) == 2 and chunks[0].get("line_start") == 3,
           [(ch.get("seg_id"), ch.get("line_start")) for ch in chunks])
 
     with sync_playwright() as p:

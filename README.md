@@ -12,15 +12,18 @@ between your devices via Anki's own sync.
 
 ## What it adds
 
-### One daily flow (早/中/晚, one button)
+### One daily flow (one button, one round a day)
 A single **开始** button runs the whole day: it deals reading segments first,
 then a review batch, then returns to the start screen — no intermediate
-pick/stats pages. The review count is **dynamic**: ⌈D/3⌉ where D is the day's
-due-card count, snapshotted at the first review deal of the Anki day (4 AM
-rollover), so three rounds (morning/noon/evening) clear the day's due pile
-evenly. New cards reach the review batch through the overnight release below.
-Stages with nothing to do are skipped automatically. Every number is
-env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
+pick/stats pages. The design is **one round a day** (2026-10-09): the review
+batch clears the day's ENTIRE due pile plus the whole dealable new pool, so
+nothing carries over. The review size is dynamic: ⌈D / divisor⌉ where D is the
+day's due-card count, snapshotted at the first review deal of the Anki day
+(4 AM rollover); the divisor defaults to **1** (whole pile). New cards reach the
+review batch through the overnight release below (capped at 36/day). Stages
+with nothing to do are skipped automatically. Nothing is *hard*-locked to one
+round — you can run another if you want; the pacing simply assumes one. Every
+number is env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
 
 ### Reading mode (渐进制卡 — incremental reading)
 Point it at a folder of markdown notes (`ANKI_NOTES_DIR`). Each listed file is
@@ -32,11 +35,14 @@ Anki). Segment state (todo → active → done/skipped), the segment tree, and
 sqlite DB — the .md files stay pure text with zero markers. While reviewing any
 card later, the app can show the original source segment with full-file context.
 
-The reading round is **list-driven**: every file in the 阅读清单 contributes
-exactly ONE segment per round — its in-progress (正在制卡) segment if it has
-one, otherwise its frontier — so a 6-file list deals 6 segments (每篇文章都推
-一遍). There is no card-making quota anywhere: finish the round, the flow
-hands over to review, and 开始 again deals the next segment of every file.
+The reading round is **list-driven**: every file in the 阅读清单 contributes UP
+TO TWO segments per round (2026-10-09, raised from one — 每篇文章推两次) — slot
+1 is its in-progress (正在制卡) segment if it has one, otherwise its frontier;
+slot 2 is the next dealable segment in line order. So a 6-file list deals up to
+12 segments. A freshly seeded whole-file entry has only one dealable segment
+and deals 1 until you bookmark-split it. There is no card-making quota
+anywhere: finish the round, the flow hands over to review, and 开始 again deals
+the next segments of every file.
 
 - **Segment editor** — edit a segment's text in-app (CodeMirror 6 source +
   live markdown preview). Saves atomically rewrite the .md and re-anchor every
@@ -63,9 +69,10 @@ preview deck the moment you make them. The next day the backend
 into your main deck unsuspended — so the first graded review happens after a
 night's sleep, letting FSRS seed from real recall instead of a recognition
 illusion. There is no manual approve/defer step: the overnight gap does the
-work. A daily release cap (`ANKI_RELEASE_DAILY_GOAL`, default 45) limits how
+work. A daily release cap (`ANKI_RELEASE_DAILY_GOAL`, default 36) limits how
 many cards enter the queue per day — oldest first, overflow waits for the next
-day — so a heavy card-making day can't blow up your review burden.
+day — so a heavy card-making day can't blow up your review burden. With one
+round a day, this cap IS your daily new-card budget.
 
 ### Segment-level gate (per-segment cooldown, 2026-09-29)
 A segment whose cards are still sitting in the preview pool is held overnight:
@@ -191,7 +198,9 @@ Defaults that most people will want to change:
 | `ANKI_PREVIEW_RELEASE_DECK` | `2026` | where released cards land |
 | `ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` | `问答题` / `填空题` | note types used by the add-card dialogs — must exist in your collection |
 | `ANKI_ROLLOVER_HOUR` | `4` | must match Anki's own "next day starts at" |
-| `ANKI_RELEASE_DAILY_GOAL` | `45` | max auto-released cards per day |
+| `ANKI_RELEASE_DAILY_GOAL` | `36` | max auto-released cards per day = your daily new-card budget |
+| `ANKI_DAILY_NEW` | `0` | new cards per round; 0 = unlimited (whole dealable pool) |
+| `ANKI_REVIEW_DUE_DIVISOR` | `1` | due pile is split by this; 1 = clear it all in one round |
 
 ## Multiple machines
 

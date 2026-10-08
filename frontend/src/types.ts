@@ -333,6 +333,9 @@ export interface ReadingExtras {
   reading_mode?: boolean
   reading_list_size?: number
   reading_available?: number
+  /** exact next-round size under two-slot dealing (2026-10-09): sum over
+   * files of min(2, non-gated dealable segments) — what the plan row shows */
+  reading_dealable?: number
   reading_active?: number
   /** chunks held by the preview-pool gate (B·二段重推, round 3) */
   reading_gated?: number

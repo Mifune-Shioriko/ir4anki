@@ -18,9 +18,10 @@ interface Props {
   pendingRelease?: number | null
   /** preview feature flag — the pool row is hidden when off */
   previewMode?: boolean
-  /** reading segments available this round (渐进制卡) — list-driven since
-   * 2026-10-06: every 阅读清单 file contributes exactly one segment, so this
-   * count IS the round size (all card-making quotas retired) */
+  /** reading segments the next round will deal (渐进制卡) — two-slot
+   * dealing since 2026-10-09: every 阅读清单 file contributes up to two
+   * segments (reading_dealable on the wire), so this count IS the round
+   * size (all card-making quotas retired) */
   readingAvailable?: number
   /** what the round that just ended accomplished (hero summary strip,
    * 2026-09-27 round 2); null until a round completes this session */
@@ -98,7 +99,7 @@ export const StartScreen: Component<Props> = (props) => {
           </Show>
           <h1 class="screen-title md-typescale-headline-medium">开始学习</h1>
           <p class="screen-detail md-typescale-body-medium">
-            一轮依次推进：阅读笔记 → 复习。阅读阶段每篇文章推进一段，全部过完自动进入复习。今天制的卡进预览池，明天自动放行为新卡。
+            一轮依次推进：阅读笔记 → 复习。阅读阶段每篇文章最多推进两段，全部过完自动进入复习；复习清掉全部到期卡和当日放行的新卡。今天制的卡进预览池，明天自动放行为新卡。
           </p>
 
           <Show when={isEmpty() && props.due != null}>
@@ -112,14 +113,14 @@ export const StartScreen: Component<Props> = (props) => {
               <div class="plan-head md-typescale-label-large">今日每轮计划</div>
               <Show when={(props.readingAvailable ?? 0) > 0}>
                 <div class="stat-row">
-                  <span>阅读（每篇文章一段）</span>
+                  <span>阅读（每篇最多两段）</span>
                   <span class="stat-value">{props.readingAvailable} 段</span>
                 </div>
               </Show>
               <div class="stat-row">
                 <span>复习（新卡 + 到期）</span>
                 <span class="stat-value">
-                  {sizes()!.new} 新 + {sizes()!.review > 0 ? sizes()!.review : '—'} 到期
+                  {sizes()!.new > 0 ? sizes()!.new : '全部'} 新 + {sizes()!.review > 0 ? sizes()!.review : '—'} 到期
                 </span>
               </div>
             </div>

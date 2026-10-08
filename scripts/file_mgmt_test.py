@@ -196,7 +196,7 @@ async def main():
         dealt = r.json().get("chunks", [])
         check("round dealt", len(dealt) >= 1, dealt)
         b_dealt = next((ch for ch in dealt if ch["path"] == B_NEW), None)
-        check("B is in the round (its file's one slot)", b_dealt is not None,
+        check("B is in the round (its file deals up to two slots)", b_dealt is not None,
               [ch["path"] for ch in dealt])
         if b_dealt:
             r2 = await c.post("/api/files/rename",

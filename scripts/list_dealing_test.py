@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Regression tests for LIST-DRIVEN dealing (user spec 2026-10-06).
+"""Regression tests for LIST-DRIVEN TWO-SLOT dealing (user spec 2026-10-06,
+raised to TWO segments per file on 2026-10-09).
 
-Every 阅读清单 file contributes EXACTLY ONE segment per round — its first
-non-gated `active` segment, else its frontier — so an N-file list deals up
-to N segments (每篇文章都推一遍), with NO floor and NO cap. All card-making
-quotas are retired (the old per-round chunk budget AND the 2026-10-05 daily
-goal). This suite pins the pure dealing semantics; the gate interaction
+Every 阅读清单 file contributes UP TO TWO segments per round — slot 1 = its
+first non-gated `active` (else its frontier); slot 2 = the second active, else
+the next dealable segment in line order — so an N-file list deals up to 2N
+segments (每篇文章推两次), with NO floor and NO cap. All card-making quotas are
+retired. This suite pins the pure dealing semantics; the gate interaction
 (gated active → frontier takes the slot; all-gated file contributes nothing)
 is covered by gate_segment_level_test.py.
 
@@ -158,67 +159,82 @@ async def main():
         check("B split into 2 dealable sections", len(_dealable_segs(B_PATH)) == 2,
               len(_dealable_segs(B_PATH)))
 
-        print("== 1. N files → N segments, one per file, list order ==")
+        print("== 1. N files → up to 2N segments, two per file, list order ==")
         r = await c.post("/api/reading/start?mode=daily")
         dealt = r.json().get("chunks", [])
-        check("dealt exactly 3 (one per listed file)", len(dealt) == 3, len(dealt))
-        check("order = 阅读清单 priority A,B,C", _deal_paths(r) == [A_PATH, B_PATH, C_PATH],
+        check("dealt exactly 6 (two per listed file)", len(dealt) == 6, len(dealt))
+        check("order = 阅读清单 priority A,A,B,B,C,C",
+              _deal_paths(r) == [A_PATH, A_PATH, B_PATH, B_PATH, C_PATH, C_PATH],
               _deal_paths(r))
-        check("each file contributes exactly ONE segment",
-              all(len(_deal_for(r, p)) == 1 for p in (A_PATH, B_PATH, C_PATH)),
+        check("each file contributes exactly TWO segments",
+              all(len(_deal_for(r, p)) == 2 for p in (A_PATH, B_PATH, C_PATH)),
               [(p, len(_deal_for(r, p))) for p in (A_PATH, B_PATH, C_PATH)])
-        a_seg = _deal_for(r, A_PATH)[0]
-        check("A's slot = its frontier (first dealable section)",
-              a_seg["chunk_key"] == str(a_segs[0]["seg_id"]),
-              (a_seg["chunk_key"], str(a_segs[0]["seg_id"])))
+        a_dealt = _deal_for(r, A_PATH)
+        check("A slot 1 = its frontier (first dealable section)",
+              a_dealt[0]["chunk_key"] == str(a_segs[0]["seg_id"]),
+              (a_dealt[0]["chunk_key"], str(a_segs[0]["seg_id"])))
+        check("A slot 2 = the NEXT section in line order",
+              a_dealt[1]["chunk_key"] == str(a_segs[1]["seg_id"]),
+              (a_dealt[1]["chunk_key"], str(a_segs[1]["seg_id"])))
         await c.post("/api/reading/finish")
 
         print("== 2. reorder → dealing follows the new priority ==")
         r = await c.post("/api/reading/list/reorder", json={"path": B_PATH, "top": True})
         check("reorder B to top ok", r.json()["order"][0] == B_PATH, r.json()["order"])
         r = await c.post("/api/reading/start?mode=daily")
-        check("dealing order now B,A,C", _deal_paths(r) == [B_PATH, A_PATH, C_PATH],
+        check("dealing order now B,B,A,A,C,C",
+              _deal_paths(r) == [B_PATH, B_PATH, A_PATH, A_PATH, C_PATH, C_PATH],
               _deal_paths(r))
         await c.post("/api/reading/finish")
         # restore A,B,C
         await c.post("/api/reading/list/reorder",
                      json={"order": [A_PATH, B_PATH, C_PATH]})
 
-        print("== 3. active segment occupies its file's slot (not the frontier) ==")
-        # A's 2nd section → active; frontier (summary) is still s1, but
-        # dealing must hand back the ACTIVE s2 (active 占名额).
+        print("== 3. active segment occupies slot 1; frontier rides slot 2 ==")
+        # A's 2nd section → active; slot 1 must hand back the ACTIVE s2 and
+        # slot 2 the next dealable segment in line order (the frontier s1).
         _set_seg(A_PATH, a_segs[1]["seg_id"], status="active")
         r = await c.post("/api/reading/start?mode=daily")
         a_dealt = _deal_for(r, A_PATH)
-        check("A contributes exactly one segment", len(a_dealt) == 1, len(a_dealt))
-        check("A's slot = the ACTIVE s2, not frontier s1",
+        check("A contributes exactly two segments", len(a_dealt) == 2, len(a_dealt))
+        check("A slot 1 = the ACTIVE s2",
               a_dealt and a_dealt[0]["chunk_key"] == str(a_segs[1]["seg_id"]),
               a_dealt and a_dealt[0]["chunk_key"])
-        check("A's dealt segment status = active",
+        check("A slot 1 status = active",
               a_dealt and a_dealt[0]["status"] == "active",
               a_dealt and a_dealt[0]["status"])
+        check("A slot 2 = frontier s1 (next dealable in line order)",
+              len(a_dealt) > 1 and a_dealt[1]["chunk_key"] == str(a_segs[0]["seg_id"]),
+              len(a_dealt) > 1 and a_dealt[1]["chunk_key"])
         await c.post("/api/reading/finish")
 
-        print("== 4. multiple actives → the FIRST in line order wins ==")
+        print("== 4. multiple actives → BOTH occupy the two slots (line order) ==")
         _set_seg(A_PATH, a_segs[2]["seg_id"], status="active")  # s2 AND s3 active
         r = await c.post("/api/reading/start?mode=daily")
         a_dealt = _deal_for(r, A_PATH)
-        check("still exactly one A segment", len(a_dealt) == 1, len(a_dealt))
-        check("first active in line order (s2) wins over s3",
+        check("still exactly two A segments", len(a_dealt) == 2, len(a_dealt))
+        check("first active in line order (s2) takes slot 1",
               a_dealt and a_dealt[0]["chunk_key"] == str(a_segs[1]["seg_id"]),
               a_dealt and a_dealt[0]["chunk_key"])
+        check("second active (s3) takes slot 2 — actives beat the todo s1",
+              len(a_dealt) > 1 and a_dealt[1]["chunk_key"] == str(a_segs[2]["seg_id"]),
+              len(a_dealt) > 1 and a_dealt[1]["chunk_key"])
         await c.post("/api/reading/finish")
         _set_seg(A_PATH, a_segs[2]["seg_id"], status="todo")   # reset s3
         _set_seg(A_PATH, a_segs[1]["seg_id"], status="todo")   # reset s2
 
-        print("== 5. single-file list → exactly one segment (no floor) ==")
+        print("== 5. single-file list → its two slots, no padding (no floor) ==")
         await c.post("/api/reading/list/remove", json={"path": B_PATH})
         await c.post("/api/reading/list/remove", json={"path": C_PATH})
         r = await c.post("/api/reading/start?mode=daily")
         dealt = r.json().get("chunks", [])
-        check("single file deals exactly 1 segment", len(dealt) == 1, len(dealt))
-        check("and it is from A", dealt and dealt[0]["path"] == A_PATH,
-              [ch["path"] for ch in dealt])
+        check("single file deals exactly 2 segments (of its 3 sections)",
+              len(dealt) == 2, len(dealt))
+        check("both from A, slots = s1 then s2 (line order)",
+              [ch["path"] for ch in dealt] == [A_PATH, A_PATH]
+              and [ch["chunk_key"] for ch in dealt]
+              == [str(a_segs[0]["seg_id"]), str(a_segs[1]["seg_id"])],
+              [(ch["path"], ch["chunk_key"]) for ch in dealt])
         await c.post("/api/reading/finish")
         # restore B, C
         await c.post("/api/reading/list/add", json={"path": B_PATH})
@@ -230,9 +246,10 @@ async def main():
         r = await c.post("/api/reading/start?mode=daily")
         check("A (all done) contributes nothing", len(_deal_for(r, A_PATH)) == 0,
               _deal_for(r, A_PATH))
-        check("round = B + C only (2 segments)", len(r.json().get("chunks", [])) == 2,
-              _deal_paths(r))
-        check("B and C still dealt", set(_deal_paths(r)) == {B_PATH, C_PATH},
+        check("round = B + C only (2×2 = 4 segments)",
+              len(r.json().get("chunks", [])) == 4, _deal_paths(r))
+        check("B and C still dealt (two each)",
+              _deal_paths(r) == [B_PATH, B_PATH, C_PATH, C_PATH],
               _deal_paths(r))
         await c.post("/api/reading/finish")
 

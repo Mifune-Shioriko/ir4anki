@@ -223,6 +223,7 @@ export const App: Component = () => {
   const [readingMode, setReadingMode] = createSignal(false)
   const [readingListSize, setReadingListSize] = createSignal(0)
   const [readingAvailable, setReadingAvailable] = createSignal(0)
+  const [readingDealable, setReadingDealable] = createSignal(0)
   const [readingActive, setReadingActive] = createSignal(0)
   const [, setReadingGated] = createSignal(0)
   const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
@@ -556,6 +557,7 @@ export const App: Component = () => {
       if (d.reading_mode) {
         setReadingListSize(d.reading_list_size ?? 0)
         setReadingAvailable(d.reading_available ?? 0)
+        setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
         setReadingActive(d.reading_active ?? 0)
         setReadingGated(d.reading_gated ?? 0)
       }
@@ -583,7 +585,7 @@ export const App: Component = () => {
 
   // ---- 单一流水线 (user spec 2026-09-24; preview stage retired 2026-09-27;
   //      list-driven reading 2026-10-06) ----
-  // 开始 → 阅读(每文件一段) → 复习(15新+ceil(D/3)到期) → 回开始页。
+  // 开始 → 阅读(每文件最多两段) → 复习(全部新卡+全部到期) → 回开始页。
   // 每段完成自动进入下一段；清单读完/全被门禁 → 直接进复习。
   // 预览环节已删除：今天制的卡进预览池，后端次日自动放行成新卡。
   const startReadingStage = async () => {
@@ -899,6 +901,7 @@ export const App: Component = () => {
       if (d.reading_mode) {
         setReadingListSize(d.reading_list_size ?? 0)
         setReadingAvailable(d.reading_available ?? 0)
+        setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
         setReadingActive(d.reading_active ?? 0)
         setReadingGated(d.reading_gated ?? 0)
       }
@@ -1220,7 +1223,7 @@ export const App: Component = () => {
             previewPool={previewMode() ? previewPool() : null}
             pendingRelease={previewMode() ? pendingRelease() : null}
             previewMode={previewMode()}
-            readingAvailable={readingMode() ? readingAvailable() : 0}
+            readingAvailable={readingMode() ? readingDealable() : 0}
             studyModes={studyModes()}
             mode={selectedMode()}
             roundSummary={roundSummary()}

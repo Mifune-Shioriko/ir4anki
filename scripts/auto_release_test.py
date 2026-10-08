@@ -62,8 +62,14 @@ def nid_for(days_ago: float = 0.0, hour=None) -> int:
 
     hour: force a specific local hour of that day — used to test the 4 AM
     rollover (a card made at 02:00 'today' belongs to YESTERDAY's Anki day).
+
+    ANKI-DAY-aware (fixture bug fix 2026-10-09, same as modes_ui_test):
+    Anki's day rolls over at 4 AM, so between 00:00 and 04:00 wall-clock,
+    "yesterday 15:00" is STILL the current Anki day and the release gate's
+    scenario asserts would fire. Anchor to the current ANKI DAY (now − 4h)
+    instead of wall-clock now.
     """
-    dt = datetime.now() - timedelta(days=days_ago)
+    dt = datetime.now() - timedelta(hours=4) - timedelta(days=days_ago)
     if hour is not None:
         dt = dt.replace(hour=hour, minute=0, second=0, microsecond=0)
     return int(dt.timestamp() * 1000)
@@ -94,11 +100,15 @@ class FakeAnki:
             return False
         if 'deck:"2026"' in q and c["deckName"] != "2026":
             return False
-        if "is:new" in q and c["type"] != 0:
+        if "is:new" in q and "-is:new" not in q and c["type"] != 0:
             return False
-        if "is:suspended" in q and c["queue"] != -1:
-            return False
+        # "-is:suspended" CONTAINS "is:suspended" as a substring — check the
+        # negated form first (fake bug fix 2026-10-09; modes_ui_test already
+        # guards this way). Without it the wire's new-pool probe
+        # (is:new -is:suspended) wrongly drops released cards.
         if "-is:suspended" in q and c["queue"] == -1:
+            return False
+        if "is:suspended" in q and "-is:suspended" not in q and c["queue"] != -1:
             return False
         if "tag:released-*" in q and not any(
                 t.startswith("released-") for t in self.notes[c["note"]]["tags"]):
@@ -191,7 +201,11 @@ async def scenario_timestamp_gate():
 async def scenario_legacy_sweep():
     print("== 3. legacy released-* stamped cards (old manual flow) drain ==")
     fake = reset()
-    yday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    # ANKI-DAY-aware stamp date (fixture bug fix 2026-10-09): between 00:00
+    # and 04:00 wall-clock, "yesterday" by calendar is STILL the current
+    # Anki day — the legacy card would then carry a TODAY stamp and wait
+    # instead of releasing. Anchor to the Anki day like nid_for does.
+    yday = (datetime.now() - timedelta(hours=4) - timedelta(days=1)).strftime("%Y%m%d")
     cid, nid = 7101, nid_for(days_ago=5)
     # old flow: approved → moved to 2026 but left SUSPENDED with a stamp
     fake.add_card(cid, deck="2026", note=nid, suspended=True,
@@ -308,7 +322,12 @@ async def scenario_wire():
         check("state has NO preview_round field", "preview_round" not in s)
         modes = (s.get("study_modes") or {}).get("daily") or {}
         check("wire study_modes: no 'preview' key", "preview" not in modes, modes)
-        check("wire study_modes: read/new present", modes.get("read") == 4 and modes.get("new") == 15, modes)
+        # 2026-10-06 retired read/make; 2026-10-09: new is UNLIMITED
+        # (static 0) resolved on the wire to the live pool count — after
+        # the auto-release above, exactly 1 card (7402) is dealable new.
+        check("wire study_modes: new resolved to the live pool (1), no read/make keys",
+              modes.get("new") == 1 and "read" not in modes and "make" not in modes,
+              modes)
         # retired endpoints are really gone: no POST route matches; the SPA
         # catch-all is GET-only, so FastAPI answers 405 (or 404) — either
         # way NOT a JSON preview payload

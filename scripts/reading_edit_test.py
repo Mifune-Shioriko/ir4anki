@@ -173,10 +173,12 @@ async def main():
         s1, s2, s3 = segs
         r = await c.post("/api/reading/start?mode=focus")
         dealt = r.json()["chunks"]
-        # list-driven dealing (2026-10-06): one segment per FILE — a
-        # single-file list deals exactly its frontier, no depth pass
-        check("list-driven dealt 1 (single file = one segment)",
-              len(dealt) == 1 and dealt[0]["chunk_key"] == str(s1["seg_id"]),
+        # two-slot dealing (2026-10-09): UP TO TWO segments per FILE — a
+        # single-file list deals its frontier s1 + the next section s2
+        check("two-slot dealt 2 (single file = frontier + next section)",
+              len(dealt) == 2
+              and dealt[0]["chunk_key"] == str(s1["seg_id"])
+              and dealt[1]["chunk_key"] == str(s2["seg_id"]),
               [(ch["chunk_key"], ch["path"]) for ch in dealt])
 
         print("== 2. basic edit: replace s1 with +2 lines ==")

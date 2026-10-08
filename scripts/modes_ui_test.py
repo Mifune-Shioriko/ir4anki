@@ -262,12 +262,14 @@ def run():
     modes = st.get("study_modes") or {}
     check("wire: single daily tier", list(modes.keys()) == ["daily"], list(modes.keys()))
     d = modes.get("daily", {})
-    # list-driven reading (2026-10-06): no read/make sizes on the wire —
-    # the round size = number of listed files (computed per deal)
-    check("wire sizes new=15, NO read/preview/make keys",
-          d.get("new") == 15 and "read" not in d and "preview" not in d
+    # 2026-10-09 pacing: new is UNLIMITED (static 0) resolved on the wire to
+    # the LIVE dealable pool — at /api/status time nothing has auto-released
+    # yet, so 0; review = D/divisor with divisor 1 → the whole due pile (3).
+    check("wire sizes new resolved (0 before auto-release), NO read/preview/make keys",
+          d.get("new") == 0 and "read" not in d and "preview" not in d
           and "make" not in d, d)
-    check("wire review = ceil(3/3) = 1", d.get("review") == 1, d.get("review"))
+    check("wire review = 3/1 = 3 (whole due pile, one round a day)",
+          d.get("review") == 3, d.get("review"))
 
     # /api/status does NOT run auto_release (read-only endpoint) — the first
     # session/state call does. After it: yesterday's pool card (9101) has
@@ -317,10 +319,11 @@ def run():
         # round size = one segment per listed file (1 file in this fixture).
         # The 2026-10-05 goal copy (已制 X / 15 张) is retired with the
         # whole card-making quota mechanism.
-        check("plan: 阅读 row is list-driven (每篇文章一段 → 1 段)",
+        check("plan: 阅读 row is list-driven (每篇最多两段 → 1 段, whole-file seed)",
               "阅读" in joined and "1 段" in joined, joined[:200])
         check("plan: NO 预览新卡 row (stage retired)", "预览新卡" not in joined, joined[:200])
-        check("plan: 复习 15 新 + 1 到期", "15 新 + 1 到期" in joined, joined[:300])
+        check("plan: 复习 1 新 + 3 到期 (whole due pile)",
+              "1 新 + 3 到期" in joined, joined[:300])
         check("pool row: 预览池（明日自动放行）+ 今日新制",
               "明日自动放行" in joined and "今日新制 1" in joined, joined[:300])
         check("single 开始 button",
@@ -345,9 +348,10 @@ def run():
               page.locator(".screen-title", has_text="本轮预览完成").count() == 0)
         page.screenshot(path="/tmp/daily-ui-review.png")
 
-        print("== 3. review stage: 1 due review + 1 auto-released new → drain ==")
-        # batch = 1 review card (9001) + the released new card (9101) = 2
-        for i in range(2):
+        print("== 3. review stage: 3 due reviews + 1 auto-released new → drain ==")
+        # batch (2026-10-09 one-round pacing) = ALL 3 due review cards + the
+        # whole dealable new pool (the released 9101) = 4
+        for i in range(4):
             page.wait_for_selector(
                 "md-filled-tonal-button:has-text('显示答案')", timeout=20000)
             page.locator("md-filled-tonal-button", has_text="显示答案").click()
@@ -362,14 +366,14 @@ def run():
         check("no DoneScreen rendered",
               page.locator(".screen-title", has_text="本轮完成").count() == 0)
         # hero summary strip (P2, 2026-09-27 round 2): this round skipped 1
-        # reading segment and reviewed 2 cards (1 new) — the start card must
+        # reading segment and reviewed 4 cards (1 new) — the start card must
         # show the completion summary, and the old shortcut-hint row must
         # stay gone (user request: 开始页不要 1234/Ctrl+Z 那行字)
         check("round-summary hero shown", page.locator(".round-summary").count() == 1)
         summ = page.locator(".round-summary").inner_text().replace("\n", " ")
         check("summary: 1 reading segment processed (skipped)",
               "阅读段处理" in summ and "跳过 1 段" in summ, summ)
-        check("summary: 2 cards reviewed incl 1 new",
+        check("summary: 4 cards reviewed incl 1 new",
               "卡片复习" in summ and "含新卡 1 张" in summ, summ)
         check("no screen-keys hint row (user asked to remove it)",
               page.locator(".screen-keys").count() == 0)
