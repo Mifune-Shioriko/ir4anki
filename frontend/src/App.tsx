@@ -41,29 +41,6 @@ import { WIDE_QUERY } from './lib/breakpoints'
 // choice, no persisted selection. (The old MODE_STORAGE_KEY localStorage
 // entry is simply ignored; a stale value can't affect anything.)
 
-// 切割语义 persistence (gap_policy, 2026-09-22): bookmark = 进度声明
-// (DEFAULT — the cut is a bookmark; the unread tail keeps queueing),
-// extract = 提炼宣言 (gaps sink to background). Same localStorage pattern
-// as the pacing mode.
-const GAP_POLICY_STORAGE_KEY = 'anki-reading-gap-policy'
-export type GapPolicy = 'bookmark' | 'extract'
-const readStoredGapPolicy = (): GapPolicy => {
-  try {
-    return localStorage.getItem(GAP_POLICY_STORAGE_KEY) === 'extract'
-      ? 'extract'
-      : 'bookmark'
-  } catch {
-    return 'bookmark'
-  }
-}
-const writeStoredGapPolicy = (p: GapPolicy) => {
-  try {
-    localStorage.setItem(GAP_POLICY_STORAGE_KEY, p)
-  } catch {
-    /* not critical */
-  }
-}
-
 type Phase =
   | 'loading'
   | 'start'
@@ -157,16 +134,6 @@ export const App: Component = () => {
   // table (dynamic review size) rendered as 今日每轮计划 on the start screen.
   const [studyModes, setStudyModes] = createSignal<StudyModes | null>(null)
   const selectedMode = () => 'daily'
-
-  // ---- 切割语义 (gap_policy, 2026-09-22) ----
-  // bookmark (default) = 进度声明: the cut is a bookmark, the unread tail
-  // stays queued; extract = 提炼宣言: gaps sink to background. Shared by the
-  // round and trace ReadingCard variants; persisted across reloads.
-  const [gapPolicy, setGapPolicy] = createSignal<GapPolicy>(readStoredGapPolicy())
-  const chooseGapPolicy = (p: GapPolicy) => {
-    setGapPolicy(p)
-    writeStoredGapPolicy(p)
-  }
 
   // ---- review/new split for the current batch (front-end only) ----
   // Batch composition is snapshotted at load time; the setters below are
@@ -361,11 +328,10 @@ export const App: Component = () => {
     const base = chunk.line_start - 1
     const selections = [{ start_line: base + sel.start_line, end_line: base + sel.end_line }]
     const wasTrace = traceOpen()
-    const policy = gapPolicy()
     setRdBusy(true)
     try {
       const res = await api.readingSplit(
-        chunk.path, chunk.seg_id, selections, policy,
+        chunk.path, chunk.seg_id, selections,
         // stale-coordinate guard (2026-09-30): echo what the card rendered
         // against; the backend refuses (409 stale) if the segment moved —
         // the selection's line numbers would slice the wrong text.
@@ -404,7 +370,7 @@ export const App: Component = () => {
       }
       setRelatedToken(t => t + 1)
       const hasTail = (res.children || []).some(c => c.tail && c.status === 'todo')
-      if (policy === 'bookmark' && hasTail) {
+      if (hasTail) {
         showSnack(
           `已分割出 ${kids.length} 个片段；未读的尾巴留在队列，之后照常推进`,
         )
@@ -1186,8 +1152,6 @@ export const App: Component = () => {
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(rdCurrent()!, sel)}
             onEdit={() => openSegEdit(rdCurrent()!)}
-            gapPolicy={gapPolicy()}
-            onGapPolicyChange={chooseGapPolicy}
             onExit={rdFinish}
           />
         </Show>
@@ -1207,8 +1171,6 @@ export const App: Component = () => {
             onCloze={openReadingCloze}
             onSplit={(sel) => doSplit(traceChunk()!, sel)}
             onEdit={() => openSegEdit(traceChunk()!)}
-            gapPolicy={gapPolicy()}
-            onGapPolicyChange={chooseGapPolicy}
             onExit={closeTrace}
             onBack={closeTrace}
           />

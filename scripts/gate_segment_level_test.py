@@ -223,8 +223,8 @@ async def _split_into_sections(c, path, whole_id, text):
         cur = tail["seg_id"]
 
 
-async def _add_and_split_extract(c, path):
-    """list/add + one extract cut around the LAST '## ' heading → returns
+async def _add_and_split_prefix(c, path):
+    """list/add + one bookmark cut around the LAST '## ' heading → returns
     (bg_seg_id, selected_todo_seg_id). The gap (header + first section)
     sinks to background."""
     r = await c.post("/api/reading/list/add", json={"path": path})
@@ -235,7 +235,7 @@ async def _add_and_split_extract(c, path):
     r = await c.post("/api/reading/split", json={
         "path": path, "seg_id": whole["seg_id"],
         "selections": [{"start_line": h, "end_line": len(lines)}],
-        "gap_policy": "extract"})
+        "gap_policy": "bookmark"})
     assert r.status_code == 200, r.text[:300]
     bgs = [s for s in _segs(path) if s.get("status") == "background"]
     sel = [s for s in _segs(path) if s.get("status") == "todo"]
@@ -343,7 +343,7 @@ async def main():
               d.get("empty") is True and d.get("all_gated") is True, str(d))
 
         print("== 5. promote works MID-ROUND (was silently stale before) ==")
-        bg_b, sel_b = await _add_and_split_extract(c, B_PATH)
+        bg_b, sel_b = await _add_and_split_prefix(c, B_PATH)
         r = await c.post("/api/reading/start?mode=daily")
         check("round active (腹's selected section dealt)",
               not r.json().get("empty"), r.text[:150])
@@ -390,7 +390,7 @@ async def main():
         # the background gap gets a TODAY pool card and is promoted → gated
         # TODO. Old formula (active - gated) would report 0 for this file;
         # the new gated_active-based one reports 1.
-        bg_c, sel_c = await _add_and_split_extract(c, C_PATH)
+        bg_c, sel_c = await _add_and_split_prefix(c, C_PATH)
         backend._reading_record_card(
             {"path": C_PATH, "chunk_key": str(sel_c)}, nid2y)  # released card
         nid_c = nid_for(0)

@@ -8,9 +8,14 @@ blocks (fence/table/hr/$$ formula) get ONE handle for the whole block
 (.line-anchor). Click first line → click last line → inline confirm bar with
 range + HEAD and TAIL previews → 确认分割 → POST /api/reading/split.
 
-SELF-CONTAINED: throwaway uvicorn on :8904 with isolated ANKI_STATE_DIR, a
-temporary corpus (ANKI_NOTES_DIR) and a DEAD AnkiConnect — the live app
-(:8901), the real collection and ~/anki-notes are untouched.
+SELF-CONTAINED: disposable uvicorn on an ephemeral loopback port, fixture-owned
+state/corpus/media, and an in-process AnkiConnect fake. No native collection,
+Anki service, sync, credentials or live data. REGRESSION_DIST must name an
+isolated built dist; the test never serves the project's frontend/dist.
+
+Bookmark acceptance also covers round and trace mode UI removal, old extract
+storage, outgoing coordinate guards without policy, and deferred worthwhile
+tails. The fixture-only setup endpoints exist solely in this test process.
 
 Covers:
   1. handle rendering — one handle per non-blank source line; a 3-line
@@ -29,10 +34,12 @@ Covers:
      picks (it stays the 添加挖空 cloze seed); clicking inside an atomic
      block picks the whole block.
 
-Run: backend/.venv/bin/python scripts/split_ui_test.py
-(needs playwright + chromium; both present in backend/.venv)
+Run: REGRESSION_DIST=/scratch/dist python scripts/split_ui_test.py
+(needs FastAPI/httpx/uvicorn and Playwright + Chromium, no native Anki deps)
 """
 import json
+import socket
+import uuid
 import os
 import re
 import signal
@@ -47,7 +54,7 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8904"
+BASE = ""  # Assigned an ephemeral loopback address by main().
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PASS = 0
 FAIL = 0
@@ -219,9 +226,11 @@ def run(notes: Path):
         page = browser.new_page(viewport={"width": 1920, "height": 1200})
         js_errors = []
         page.on("pageerror", lambda e: js_errors.append(str(e)))
+        page.add_init_script("localStorage.setItem('anki-reading-gap-policy', 'extract')")
         page.goto(BASE + "/", wait_until="networkidle")
         page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
         check("reading card rendered WITH line handles", True)
+        assert_no_mode_ui(page, "ordinary")
         check("dealt chunk is the whole file (line_start 1)",
               chunk["line_start"] == 1, chunk.get("line_start"))
 
@@ -351,7 +360,13 @@ def run(notes: Path):
         print("== 4. 确认分割 persists the exact whole-line child ==")
         _click_handle(page, 4)
         _click_handle(page, 5)
-        _confirm_ok(page)
+        with page.expect_response(lambda r: r.url == BASE + '/api/reading/split') as response:
+            _confirm_ok(page)
+        split_response = response.value
+        assert split_response.status == 200, split_response.text()
+        split = split_response.json()
+        assert_split_protocol(split_response.request.post_data_json, chunk, "ordinary")
+        assert_deferred_tail(split, A_REL)
         st = api("/api/reading/state")
         round_segs = st.get("round", {}).get("chunks", [])
         todo = [c2 for c2 in round_segs
@@ -435,45 +450,181 @@ def run(notes: Path):
               and "结尾正文一行" in c["previews"][1], c and c["previews"])
         _cancel(page)
 
+        run_trace_acceptance(page)
         check("no JS page errors", not js_errors, js_errors[:3])
         browser.close()
 
 
+def assert_no_mode_ui(page, variant):
+    assert page.locator('md-filter-chip[label="书签模式"], md-filter-chip[label="提炼模式"], .gap-policy-row, .gap-policy-hint').count() == 0, variant
+    assert page.evaluate("localStorage.getItem('anki-reading-gap-policy')") == 'extract'
+    print(f'  ok  {variant}: mode buttons/hint absent; stale extract preference retained')
+
+
+def assert_split_protocol(body, source, variant):
+    assert 'gap_policy' not in body, body
+    assert body['path'] == source['path'] and body['seg_id'] == source['seg_id'], body
+    assert body['fingerprint'] == source['fingerprint'] and body['fingerprint'], body
+    assert body['line_start'] == source['line_start'], body
+    print(f'  ok  {variant}: policy-free request preserves valid coordinate guards')
+
+
+def assert_deferred_tail(split, path):
+    assert 'gap_policy' not in split, split
+    tail = next(ch for ch in split['children'] if ch['tail'])
+    assert tail['status'] == 'todo', tail
+    assert str(tail['seg_id']) not in [ch['chunk_key'] for ch in split['child_chunks']], split
+    chunks = api('/api/reading/state')['round']['chunks']
+    assert not any(ch['path'] == path and ch['chunk_key'] == str(tail['seg_id']) for ch in chunks), chunks
+    print('  ok  worthwhile tail deferred beyond current chunks/pending')
+    return tail
+
+
+def run_trace_acceptance(page):
+    setup = api('/api/__bookmark_fixture/trace', 'POST')
+    assert setup.get('ok') is True, setup
+    page.reload(wait_until='networkidle')
+    button = page.locator('md-icon-button[data-aria-label="溯源：回到制卡时的原文片段"]')
+    button.wait_for()
+    page.wait_for_function("() => !document.querySelector('md-icon-button[data-aria-label=\"溯源：回到制卡时的原文片段\"]').disabled")
+    button.click()
+    page.wait_for_selector('.reading-chunk-body .line-handle')
+    assert_no_mode_ui(page, 'trace')
+    source = api('/api/reading/source?note_id=900001')
+    _click_handle(page, 3)
+    with page.expect_response(lambda r: r.url == BASE + '/api/reading/split') as response:
+        _confirm_ok(page)
+    split_response = response.value
+    assert split_response.status == 200, split_response.text()
+    split = split_response.json()
+    assert_split_protocol(split_response.request.post_data_json, source, 'trace')
+    tail = assert_deferred_tail(split, source['path'])
+    for ch in split['child_chunks']:
+        result = api('/api/reading/act?' + urllib.parse.urlencode({
+            'path': ch['path'], 'chunk_key': ch['chunk_key'], 'action': 'complete'}), 'POST')
+        assert result['ok'], result
+    api('/api/reading/finish', 'POST')
+    next_round = api('/api/reading/start', 'POST')
+    assert any(ch['path'] == source['path'] and ch['chunk_key'] == str(tail['seg_id'])
+               for ch in next_round['chunks']), next_round
+    # Cards remain anchored to the historical parent even after trace splitting.
+    historical = api('/api/reading/source?note_id=900001')
+    assert historical['seg_id'] == source['seg_id'] and historical['status'] == 'container'
+    print('  ok  trace tail returns in a future round; parent provenance preserved')
+    page.keyboard.press('Escape')
+    page.wait_for_selector('.flashcard-wrapper')
+
+
+def fixture_app():
+    """Real product app, Anki replaced only inside this disposable test server."""
+    sys.path.insert(0, str(REPO_ROOT / 'backend'))
+    import app as backend
+    active = False
+    card = dict(cardId=9000010, note=900001, type=0, queue=0, due=0,
+                question='<p>Fixture review question</p>', answer='<p>Fixture review answer</p>',
+                deckName='2026', modelName='问答题', css='')
+
+    async def fake_anki(action, params=None, timeout=30):
+        params = params or {}
+        if action == 'findCards':
+            q = params.get('query', '')
+            if '-is:new' in q:
+                return []
+            return [card['cardId']] if active and ('is:new' in q or q in ('prop:due<=0', 'nid:900001')) else []
+        if action == 'cardsInfo':
+            return [card.copy() for cid in params.get('cards', []) if active and cid == card['cardId']]
+        if action == 'notesInfo':
+            return [dict(noteId=900001, modelName='问答题', tags=[], cards=[card['cardId']],
+                         fields={'正面': 'Fixture review question', '背面': 'Fixture review answer'})
+                    for nid in params.get('notes', []) if active and nid == 900001]
+        if action == 'deckNames':
+            return ['2026']
+        raise AssertionError(f'unexpected Anki action in read-only fixture: {action}')
+
+    async def no_sync():
+        return False
+    backend.anki = fake_anki
+    backend.do_sync = no_sync
+    backend.fire_and_forget_sync = lambda: None
+
+    @backend.app.get('/api/__bookmark_fixture/identity')
+    async def identity():
+        return {'fixture': os.environ['BOOKMARK_FIXTURE_ID'], 'fake_anki': True}
+    # Product SPA catch-all is registered last during import; fixture routes
+    # must precede it. These routes never exist in the production app module.
+    backend.app.router.routes.insert(0, backend.app.router.routes.pop())
+
+    @backend.app.post('/api/__bookmark_fixture/trace')
+    async def trace():
+        nonlocal active
+        await backend.reading_finish()
+        name = 'trace.md'
+        (backend.NOTES_DIR / name).write_text(
+            '# Trace fixture\n\nSelected trace body with enough content.\nUnread trace tail with enough content for the next round.\n')
+        await backend.reading_list_add(backend.ReadingPathBody(path=name))
+        parent = next(e for e in backend._reading_read()['list'] if e['path'] == name)['segments'][0]
+        backend._reading_record_card({'path': name, 'chunk_key': str(parent['seg_id'])}, 900001)
+        await backend.reading_start()
+        active = True
+        result = await backend.start_session()
+        assert result['cards'] and result['cards'][0]['noteId'] == 900001, result
+        return {'ok': True}
+    backend.app.router.routes.insert(0, backend.app.router.routes.pop())
+    return backend.app
+
+
 def main():
-    state = tempfile.mkdtemp(prefix="split-ui-state-")
-    notes = Path(tempfile.mkdtemp(prefix="split-ui-notes-"))
-    (notes / "2026" / "解剖").mkdir(parents=True)
-    (notes / A_REL).write_text(NOTE, encoding="utf-8")
+    global BASE
+    dist_arg = os.environ.get('REGRESSION_DIST')
+    assert dist_arg, 'REGRESSION_DIST must name an isolated built dist'
+    dist = Path(dist_arg).resolve()
+    assert dist != (REPO_ROOT / 'frontend' / 'dist').resolve(), 'project dist is forbidden'
+    assert (dist / 'index.html').is_file() and (dist / 'assets').is_dir(), dist
+    with tempfile.TemporaryDirectory(prefix='bookmark-browser-') as fixture:
+        root = Path(fixture)
+        notes = root / 'corpus'
+        (notes / '2026' / '解剖').mkdir(parents=True)
+        (notes / A_REL).write_text(NOTE, encoding='utf-8')
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        BASE = f'http://127.0.0.1:{port}'
+        token = uuid.uuid4().hex
+        env = {k: v for k, v in os.environ.items() if not k.startswith('ANKI_') and k != 'ANKICONNECT_URL'}
+        env.update(ANKI_STATE_DIR=str(root/'state'), ANKI_NOTES_DIR=str(notes),
+                   ANKI_MEDIA_DIR=str(root/'media'), ANKI_READING_MODE='1',
+                   ANKI_PREVIEW_MODE='0', ANKI_DAILY_READ='50',
+                   ANKICONNECT_URL='http://127.0.0.1:1', REVIEW_DIST_DIR=str(dist),
+                   BOOKMARK_FIXTURE_ID=token, BOOKMARK_FIXTURE_PORT=str(port))
+        # Use the caller's external test interpreter; no repo venv or native deps.
+        log_path = Path(os.environ.get('BOOKMARK_BROWSER_LOG', str(root/'server.log')))
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open('w') as server_log:
+            proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--serve-fixture'],
+                                    env=env, stdout=server_log, stderr=server_log)
+            try:
+                wait_ready()
+                identity = api('/api/__bookmark_fixture/identity')
+                assert identity == {'fixture': token, 'fake_anki': True}, identity
+                assert proc.poll() is None, proc.returncode
+                print(f'fixture identity verified: {BASE}, fake Anki, isolated {root}', flush=True)
+                run(notes)
+                assert (notes / A_REL).read_text() == NOTE, 'source Markdown was rewritten'
+            finally:
+                if proc.poll() is None:
+                    proc.send_signal(signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=10)
+        print(f'\n{PASS} passed, {FAIL} failed')
+        return 1 if FAIL else 0
 
-    env = dict(os.environ)
-    env.update({
-        "ANKI_STATE_DIR": state,
-        "ANKI_NOTES_DIR": str(notes),
-        "ANKI_READING_MODE": "1",
-        "ANKI_PREVIEW_MODE": "0",
-        "ANKI_DAILY_READ": "50",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
-        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
-    })
-    py = REPO_ROOT / "backend" / ".venv" / "bin" / "python"
-    proc = subprocess.Popen(
-        [str(py), "-m", "uvicorn",
-         "--app-dir", str(REPO_ROOT / "backend"),
-         "app:app", "--host", "127.0.0.1", "--port", "8904"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        st = wait_ready()
-        check("backend up on :8904", st.get("anki") in ("ok", "error"), st)
-        run(notes)
-    finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-    print(f"\n{PASS} passed, {FAIL} failed")
-    return 1 if FAIL else 0
 
-
-sys.exit(main())
+if __name__ == '__main__':
+    if '--serve-fixture' in sys.argv:
+        import uvicorn
+        uvicorn.run(fixture_app(), host='127.0.0.1', port=int(os.environ['BOOKMARK_FIXTURE_PORT']))
+    else:
+        sys.exit(main())

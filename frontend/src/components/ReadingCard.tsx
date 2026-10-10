@@ -38,11 +38,9 @@ import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 // old head-only snippet couldn't confirm where the cut ended — user spec).
 // 确认分割 → POST /api/reading/split with the whole-line range. No
 // DOM-selection guessing: the lines ARE the backend's line model, so what
-// you click is what gets cut. Gap disposition still follows the 切割语义
-// chips: 书签模式 (bookmark, DEFAULT) = the cut lines become a smaller todo
-// reading card, the UNREAD tail stays todo (queued), the read prefix sinks
-// to background; 提炼模式 (extract) = only the cut lines survive, all gaps
-// sink to background.
+// you click is what gets cut. Selected lines become todo children; the
+// unread tail remains todo for future rounds; prefix and middle gaps become
+// background.
 //
 // 添加挖空 still captures the CURRENT text selection inside the chunk body
 // (tracked via selectionchange — clicking a toolbar button clears the live
@@ -91,10 +89,6 @@ interface Props {
   onSplit: (sel: SplitSelection) => void
   /** 编辑片段 (user spec 2026-09-23): open the SegEditDialog for this chunk */
   onEdit?: () => void
-  /** 切割语义 (gap_policy, 2026-09-22): bookmark = 进度声明（未读尾巴留在
-   *  队列, 默认）, extract = 提炼宣言（未选中部分全部沉背景） */
-  gapPolicy: 'bookmark' | 'extract'
-  onGapPolicyChange: (p: 'bookmark' | 'extract') => void
   /** mid-round exit: untouched chunks stay todo/active (round only) */
   onExit: () => void
   /** 回到复习 (trace only) */
@@ -327,32 +321,6 @@ export const ReadingCard: Component<Props> = (props) => {
           </div>
 
           <div class="reading-crumb md-typescale-label-small">{crumb()}</div>
-
-          {/* 切割语义开关 (gap_policy, 2026-09-22): bookmark = 未读尾巴留在
-              队列（默认，user spec「切到哪里=书签」); extract = 未选中部分
-              全部沉背景。状态由 App 持有并持久化（localStorage），round 和
-              trace 两个变体共用。 */}
-          <div class="gap-policy-row">
-            <md-chip-set class="gap-policy-chips" aria-label="切割语义">
-              <md-filter-chip
-                label="书签模式"
-                selected={props.gapPolicy === 'bookmark'}
-                title="切到哪里=书签：选中部分独立成卡，后面未读的部分留在队列照常推进（已制卡的片段自己当天不重推，次日卡片放行后恢复）"
-                onClick={() => props.onGapPolicyChange('bookmark')}
-              />
-              <md-filter-chip
-                label="提炼模式"
-                selected={props.gapPolicy === 'extract'}
-                title="提炼宣言：只有选中的部分保留，未选中部分全部沉入背景（可在阅读清单提升）"
-                onClick={() => props.onGapPolicyChange('extract')}
-              />
-            </md-chip-set>
-            <span class="gap-policy-hint md-typescale-label-small">
-              {props.gapPolicy === 'bookmark'
-                ? '未读的尾巴留在队列'
-                : '未选中部分沉入背景'}
-            </span>
-          </div>
 
           {/* 分割确认条 (line-handle picker, 2026-10-01): appears once a
               line handle is clicked; shows the EXACT whole-line cut range

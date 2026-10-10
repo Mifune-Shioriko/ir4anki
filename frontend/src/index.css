@@ -1589,24 +1589,6 @@ a:focus-visible,
   word-break: break-all;
 }
 
-/* 切割语义开关 (gap_policy, 2026-09-22): two mutually-exclusive filter chips
- * (书签/提炼) + a one-line hint. Sits between the breadcrumb and the chunk
- * body so the user picks the cut semantic before selecting text. */
-.gap-policy-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  flex-wrap: wrap;
-  margin: 0 0 10px;
-}
-.gap-policy-chips {
-  flex: 0 0 auto;
-}
-.gap-policy-hint {
-  color: var(--md-sys-color-on-surface-variant);
-  opacity: 0.85;
-}
-
 /* 分割行把手 + 确认条 (line-handle split picker, 2026-10-01; WHOLE-LINE
  * click target 2026-10-03). Every rendered source line gets a small dot in
  * the left gutter (.line-handle inside span.line / div.line-anchor —
