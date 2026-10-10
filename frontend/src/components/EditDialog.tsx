@@ -43,7 +43,6 @@ interface Props {
 }
 
 export const EditDialog: Component<Props> = (props) => {
-  let dialogRef: HTMLElement | undefined
   let texInputRef: any
   let imgFileRef: HTMLInputElement | undefined
   const [loading, setLoading] = createSignal(true)
@@ -159,7 +158,7 @@ export const EditDialog: Component<Props> = (props) => {
     const items = e.clipboardData?.items
     if (!items) return
     const files: File[] = []
-    for (const item of items) {
+    for (const item of Array.from(items)) {
       if (item.type.startsWith('image/')) {
         const f = item.getAsFile()
         if (f) files.push(f)
@@ -325,7 +324,6 @@ export const EditDialog: Component<Props> = (props) => {
       open
       onClose={() => props.onClose()}
       ref={el => {
-        dialogRef = el
         // Must be set before the dialog's open animation runs (the open
         // attribute triggers show() after a connected microtask).
         // Scrim clicks are blocked (user spec 2026-10-05: 误触即关丢编辑) —
