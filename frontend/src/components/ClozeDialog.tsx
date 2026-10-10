@@ -1,24 +1,14 @@
 import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
 import { applyDialogGuard } from '../lib/dialog-guard'
-import { clozeMdToHtml, clozeRanges, renderClozeMd } from '../lib/cloze'
-import { renderMarkdown } from '../lib/markdown'
+import { MARKDOWN_TAG, clozeRanges, renderClozeMd } from '../lib/cloze'
+import { MarkdownField } from './MarkdownField'
+import type { Cm6Handle } from '../lib/cm6-editor'
 import { IconPassword } from './icons'
 
-// 挖空卡编辑框 (user spec 2026-09-19, round 2). Anki-native cloze: the
-// 文字 field is a PLAIN TEXTAREA holding raw {{cN::content::hint}} markers
-// (exactly how Anki's own editor shows them) — no contenteditable
-// serialization to get wrong. Select text → 挖空选中 (or Ctrl/⌘+Shift+C)
-// wraps it in the next {{cN::}}; 取消挖空 unwraps the marker around the
-// cursor. Live 正面/背面 preview parses the markers (正面 shows […]/hint,
-// 背面 reveals the content), math-rendered via KaTeX. Marker parsing lives
-// in lib/cloze.ts — shared with the reading page's 已制卡片 list.
-//
-// Model + field names are data-driven from /api/card/add/info?kind=cloze
-// (填空题: 文字 + 背面额外). The FIRST field is the cloze editor; any
-// remaining fields render as plain textareas. Save → /api/card/add kind=cloze
-// → preview pool suspended (same route as 问答题), provenance-linked to the
-// reading chunk when opened from a reading round.
+// Raw Markdown cloze fields use the shared CM6 source editor. The storage
+// tag is metadata only; no conversion or hidden source markers are added.
+// Selection wrapping, hints and the existing split interaction stay intact.
 
 interface Props {
   /** plain-text base for the 文字 field (whole chunk, selection pre-cloze'd) */
@@ -30,7 +20,7 @@ interface Props {
 }
 
 export const ClozeDialog: Component<Props> = (props) => {
-  let clozeRef: HTMLTextAreaElement | undefined
+  let clozeRef: Cm6Handle | undefined
   const [loading, setLoading] = createSignal(true)
   const [saving, setSaving] = createSignal(false)
   const [error, setError] = createSignal('')
@@ -41,6 +31,9 @@ export const ClozeDialog: Component<Props> = (props) => {
   const [allTags, setAllTags] = createSignal<string[]>([])
   const [tagInput, setTagInput] = createSignal('')
 
+  const [previewN, setPreviewN] = createSignal(1)
+  const ordinals = () => [...new Set(clozeRanges(clozeText()).map(r => r.n))].sort((a,b) => a-b)
+  const activeOrdinal = () => ordinals().includes(previewN()) ? previewN() : ordinals()[0]
   const clozeText = () => values()[0] ?? ''
 
   // seed immediately so the textarea is usable even if add/info fails
@@ -76,8 +69,8 @@ export const ClozeDialog: Component<Props> = (props) => {
   const wrapCloze = () => {
     const ta = clozeRef
     if (!ta) return
-    const s = ta.selectionStart
-    const e = ta.selectionEnd
+    const s = ta.selection().from
+    const e = ta.selection().to
     if (s === e) {
       setError('先在正文里选中要挖空的文字')
       return
@@ -96,8 +89,7 @@ export const ClozeDialog: Component<Props> = (props) => {
     setError('')
     requestAnimationFrame(() => {
       ta.focus()
-      const pos = s + wrapped.length
-      ta.setSelectionRange(pos, pos)
+      ta.replaceRange(s,e,wrapped)
     })
   }
 
@@ -105,7 +97,7 @@ export const ClozeDialog: Component<Props> = (props) => {
   const unwrapCloze = () => {
     const ta = clozeRef
     if (!ta) return
-    const pos = ta.selectionStart
+    const pos = ta.selection().from
     const ranges = clozeRanges(clozeText())
     const hit = ranges.find(r => pos >= r.start && pos <= r.end)
     if (!hit) {
@@ -117,8 +109,7 @@ export const ClozeDialog: Component<Props> = (props) => {
     setError('')
     requestAnimationFrame(() => {
       ta.focus()
-      const p = hit.start + Math.min(ta.selectionStart - hit.start, hit.content.length)
-      ta.setSelectionRange(p, p)
+      ta.replaceRange(hit.start,hit.end,hit.content)
     })
   }
 
@@ -140,7 +131,7 @@ export const ClozeDialog: Component<Props> = (props) => {
     const q = tagInput().toLowerCase()
     if (!q) return []
     return allTags()
-      .filter(t => t.toLowerCase().includes(q) && !tags().includes(t))
+      .filter(t => t !== MARKDOWN_TAG && t.toLowerCase().includes(q) && !tags().includes(t))
       .slice(0, 5)
   }
 
@@ -164,19 +155,7 @@ export const ClozeDialog: Component<Props> = (props) => {
         setSaving(false)
         return
       }
-      // STORE HTML (user spec 2026-09-20): Anki renders fields natively, so
-      // the markdown source is converted (markers protected through the
-      // conversion, $math$ → \(…\)) — the card looks exactly like the chunk
-      // with a hole punched in it. The cloze field goes through
-      // clozeMdToHtml; extra fields through plain markdown conversion (same
-      // reason: literal \n and ** would show as junk otherwise).
-      const clozeFieldName = names[0] ?? '文字'
-      fields[clozeFieldName] = clozeMdToHtml(clozeText())
-      names.slice(1).forEach((n, i) => {
-        const v = vals[i + 1] ?? ''
-        fields[n] = v.trim() ? renderMarkdown(v) : ''
-      })
-      const res = await api.addCard(fields, tags(), props.readingSource ?? null, 'cloze')
+      const res = await api.addCard(fields, [...tags(), MARKDOWN_TAG], props.readingSource ?? null, 'cloze')
       props.onAdded?.(res.noteId)
       props.onClose()
     } catch (e) {
@@ -220,29 +199,25 @@ export const ClozeDialog: Component<Props> = (props) => {
             <label class="field-label md-typescale-label-medium">
               {fieldNames()[0] ?? '文字'}（挖空正文）
             </label>
-            <textarea
-              class="cloze-field md-typescale-body-medium"
-              ref={clozeRef}
-              value={clozeText()}
-              onInput={e => setCloze((e.currentTarget as HTMLTextAreaElement).value)}
-              onKeyDown={onClozeKeyDown}
-              spellcheck={false}
-            />
+            <div onKeyDown={onClozeKeyDown}><MarkdownField label={fieldNames()[0] ?? '文字'} initial={clozeText()} onChange={setCloze} onReady={cm => { clozeRef = cm }} onSave={() => void handleSave()} preview={v => renderClozeMd(v,'a')} /></div>
           </div>
 
+          <div class="cloze-toolbar cloze-ordinals" aria-label="预览挖空编号"><For each={ordinals()}>{n =>
+            <md-text-button onClick={() => setPreviewN(n)} aria-pressed={activeOrdinal() === n}>c{n}</md-text-button>
+          }</For></div>
           <div class="cloze-preview">
-            <div class="cloze-preview-col">
-              <div class="cloze-preview-label md-typescale-label-medium">正面（提问）</div>
+            <div class="cloze-preview-col authoring-preview" role="region" aria-label="正面预览">
+              <div class="cloze-preview-label authoring-preview-label md-typescale-label-medium">正面（提问）</div>
               <div
                 class="cloze-preview-box note-body md-typescale-body-medium"
-                innerHTML={renderClozeMd(clozeText(), 'q')}
+                innerHTML={renderClozeMd(clozeText(), 'q', activeOrdinal())}
               />
             </div>
-            <div class="cloze-preview-col">
-              <div class="cloze-preview-label md-typescale-label-medium">背面（答案）</div>
+            <div class="cloze-preview-col authoring-preview" role="region" aria-label="背面预览">
+              <div class="cloze-preview-label authoring-preview-label md-typescale-label-medium">背面（答案）</div>
               <div
                 class="cloze-preview-box note-body md-typescale-body-medium"
-                innerHTML={renderClozeMd(clozeText(), 'a')}
+                innerHTML={renderClozeMd(clozeText(), 'a', activeOrdinal())}
               />
             </div>
           </div>
@@ -251,18 +226,7 @@ export const ClozeDialog: Component<Props> = (props) => {
             {(name, i) => (
               <div class="field-group">
                 <label class="field-label md-typescale-label-medium">{name}</label>
-                <textarea
-                  class="cloze-field cloze-field--short md-typescale-body-medium"
-                  value={values()[i() + 1] ?? ''}
-                  onInput={e => {
-                    const v = (e.currentTarget as HTMLTextAreaElement).value
-                    setValues(prev => {
-                      const next = [...prev]
-                      next[i() + 1] = v
-                      return next
-                    })
-                  }}
-                />
+                <MarkdownField label={name} initial={values()[i()+1] ?? ''} onChange={v => setValues(prev => { const next=[...prev]; next[i()+1]=v; return next })} onSave={() => void handleSave()} />
               </div>
             )}
           </For>
@@ -298,7 +262,7 @@ export const ClozeDialog: Component<Props> = (props) => {
           </div>
 
           <div class="edit-hint md-typescale-body-small">
-            正文支持 markdown（表格、加粗、$公式$），保存时自动转成 Anki 卡片格式；挖空标记 {'{{c1::答案}}'} 直接写在正文里（和 Anki 一样），可加提示 {'{{c1::答案::提示}}'}。
+            正文支持 markdown（表格、加粗、$公式$），保存时保留 Markdown 原文；挖空标记 {'{{c1::答案}}'} 直接写在正文里（和 Anki 一样），可加提示 {'{{c1::答案::提示}}'}。
             同一编号的多处挖空会一起考。新卡进入预览池（挂起），预览放行后进入复习队列。
           </div>
         </Show>

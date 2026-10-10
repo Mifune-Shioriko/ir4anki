@@ -8,8 +8,8 @@ picker + self-move disabled), delete dialog (typed-name 防呆: confirm button
 stays disabled until the basename matches), and the 409 upload-conflict
 dialog with its 跳过/改名/覆盖 retry policies.
 
-SELF-CONTAINED: throwaway uvicorn on :8907, isolated ANKI_STATE_DIR, temp
-corpus, DEAD AnkiConnect. Live app/collection/notes untouched.
+SELF-CONTAINED: throwaway uvicorn on an allocated loopback port, isolated ANKI_STATE_DIR, temp
+corpus, real isolated pylib collection. Live app/collection/notes untouched.
 
 Run: python3 /tmp/run_ui_test.py scripts/file_mgmt_ui_test.py
 """
@@ -293,10 +293,13 @@ def run(notes: Path, uploads: Path):
         browser.close()
 
 
+from native_fixture import configure, tempdir, run_closed, NativeData, reserve_loopback_port, verify_server, cleanup_after
+
+@cleanup_after
 def main():
-    state = tempfile.mkdtemp(prefix="filemgmt-ui-state-")
-    notes = Path(tempfile.mkdtemp(prefix="filemgmt-ui-notes-"))
-    uploads = Path(tempfile.mkdtemp(prefix="filemgmt-ui-uploads-"))
+    state = tempdir(prefix="filemgmt-ui-state-")
+    notes = Path(tempdir(prefix="filemgmt-ui-notes-"))
+    uploads = Path(tempdir(prefix="filemgmt-ui-uploads-"))
     (notes / "2026" / "解剖").mkdir(parents=True)
     (notes / "2027").mkdir(parents=True)
     (notes / A_REL).write_text(NOTE_A, encoding="utf-8")
@@ -317,19 +320,24 @@ def main():
         "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
-        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
+
+        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO_ROOT / "frontend" / "dist")),
     })
-    py = REPO_ROOT / "backend" / ".venv" / "bin" / "python"
+    py = Path(sys.executable)  # use the test venv, never install into live venv
+    configure(env)
+    global BASE
+    server_port = reserve_loopback_port()
+    BASE = f'http://127.0.0.1:{server_port}'
     proc = subprocess.Popen(
         [str(py), "-m", "uvicorn",
          "--app-dir", str(REPO_ROOT / "backend"),
-         "app:app", "--host", "127.0.0.1", "--port", "8907"],
+         "app:app", "--host", "127.0.0.1", "--port", str(server_port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
+        verify_server(proc, BASE)
         st = wait_ready()
-        check("backend up on :8907", st.get("anki") in ("ok", "error"), st)
+        check("backend up on an allocated loopback port", st.get("anki") in ("ok", "error"), st)
         run(notes, uploads)
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -337,6 +345,7 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the split stale-coordinate guard + empty-selection fix (2026-09-30).
 
-Same harness as reading_test.py: real FastAPI app against a FAKE AnkiConnect
+Same harness as reading_test.py: real FastAPI app against a real isolated pylib collection
 and a TEMPORARY corpus/state — the live app, ~/anki-notes and reading.db are
 untouched.
 
@@ -26,8 +26,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="split-guard-state-")
-NOTES = Path(tempfile.mkdtemp(prefix="split-guard-notes-"))
+from native_fixture import configure, tempdir, run_closed, NativeData
+
+STATE = tempdir(prefix="split-guard-state-")
+NOTES = Path(tempdir(prefix="split-guard-notes-"))
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_NOTES_DIR"] = str(NOTES)
 os.environ["ANKI_PREVIEW_MODE"] = "1"
@@ -39,6 +41,7 @@ os.environ["ANKI_DAILY_READ"] = "50"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
+configure()
 import app as backend  # noqa: E402
 
 PASS = 0
@@ -55,46 +58,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-class FakeAnki:
-    def __init__(self):
-        self.next_note = 900001
-        self.cards = {}
-        self.notes = {}
-
-    async def __call__(self, action, params=None, timeout=30):
-        params = params or {}
-        if action == "addNotes":
-            nid = self.next_note
-            self.next_note += 1
-            note = params["notes"][0]
-            self.notes[nid] = {"tags": [], "fields": dict(note.get("fields") or {}),
-                               "modelName": note.get("modelName")}
-            # /api/card/add does addNotes → findCards "nid:<id>"; without this
-            # echo the add path reports "note created but no card found"
-            self.cards[nid * 10] = {
-                "cardId": nid * 10, "note": nid, "type": 0, "queue": 0,
-                "deckName": "2026", "due": 0, "interval": 0, "factor": 0,
-                "reps": 0, "lapses": 0, "left": 0,
-                "question": "<p>Q</p>", "answer": "<p>A</p>", "css": "",
-                "modelName": note.get("modelName") or "问答题",
-            }
-            return [nid]
-        if action == "findCards":
-            q = params.get("query", "")
-            if q.startswith("nid:"):
-                nid = int(q[4:])
-                return [cid for cid, i in self.cards.items() if i["note"] == nid]
-            return []
-        if action in ("notesInfo", "cardsInfo"):
-            return []
-        if action == "deckNames":
-            return ["2026"]
-        if action == "changeDeck":
-            return None
-        return None
-
-
-backend.anki = FakeAnki()
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")
 
 
@@ -154,6 +117,17 @@ async def main():
         check("chunk line_start == 1", ch and ch["line_start"] == 1, ch)
         fp = ch["fingerprint"]
         sid = ch["seg_id"]
+
+        print("== obsolete policy rejects without persistence ==")
+        for policy in ("extract", "unknown"):
+            before = {str(p): p.read_bytes() for p in Path(STATE).rglob("*") if p.is_file()}
+            r = await c.post("/api/reading/split", json={
+                "path": A, "seg_id": sid,
+                "selections": [{"start_line": 5, "end_line": 7}],
+                "gap_policy": policy})
+            check(f"{policy} rejected at validation", r.status_code == 422, r.text)
+            after = {str(p): p.read_bytes() for p in Path(STATE).rglob("*") if p.is_file()}
+            check(f"{policy} left persisted state unchanged", before == after)
 
         print("== 1. happy path with matching guard → 200 ==")
         # cut lines 5-7 (the aaa/bbb/ccc paragraph body) — bookmark keeps the
@@ -326,4 +300,4 @@ async def main():
     return 1 if FAIL else 0
 
 
-sys.exit(asyncio.run(main()))
+sys.exit(asyncio.run(run_closed(backend, main())))

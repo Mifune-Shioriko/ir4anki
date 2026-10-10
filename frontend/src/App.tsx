@@ -21,7 +21,7 @@ import { SidePanelTabs } from './components/SidePanelTabs'
 import { SegEditDialog } from './components/SegEditDialog'
 import { invalidateFileCache } from './components/FileViewer'
 import { Snackbar } from './components/Snackbar'
-import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingSource, ReadingRoundStats } from './types'
+import type { StudyModes, ReadingChunk, ReadingChunkStatus, ReadingSource } from './types'
 import type { RoundSummary } from './types'
 import type { SplitSelection } from './lib/split-selection'
 import { WIDE_QUERY } from './lib/breakpoints'
@@ -60,6 +60,8 @@ export const App: Component = () => {
   // 阅读清单 (list manager — used to be a phase). Section is NOT persisted
   // across reloads: a page load always lands on 学习 so an active round
   // resumes where it left off.
+  const [nativeEngine, setNativeEngine] = createSignal(false)
+  api.backendStatus().then(d => setNativeEngine(d.anki_backend === 'pylib')).catch(() => {})
   const [section, setSection] = createSignal<Section>('study')
   // reading-list membership for the 文件 browser's 清单 badges — fetched
   // lazily when the section opens (cheap; the list is small)
@@ -120,8 +122,8 @@ export const App: Component = () => {
   const [answering, setAnswering] = createSignal(false)
   // roundTotal is the round's ORIGINAL size (done + pending) — from the
   // server, never cards().length after a mid-round resume.
-  const [roundTotal, setRoundTotal] = createSignal(0)
-  const [totalDone, setTotalDone] = createSignal(0)
+  const [, setRoundTotal] = createSignal(0)
+  const [, setTotalDone] = createSignal(0)
 
   // ---- global stats ----
   const [due, setDue] = createSignal<number | null>(null)
@@ -141,9 +143,6 @@ export const App: Component = () => {
   // counters died with the DoneScreen (2026-09-24).
   const [, setBatchNewTotal] = createSignal(0)
   const [, setBatchReviewTotal] = createSignal(0)
-  // new cards answered THIS round (round-summary hero, 2026-09-27 round 2) —
-  // incremented in answer() when the card was new, decremented on undo
-  const [newAnswered, setNewAnswered] = createSignal(0)
 
   // ---- undo ----
   // Availability mirrors the backend's single undo slot (round.json "last"):
@@ -189,14 +188,13 @@ export const App: Component = () => {
   // dialog to the current chunk (provenance → cards_created).
   const [readingMode, setReadingMode] = createSignal(false)
   const [readingListSize, setReadingListSize] = createSignal(0)
-  const [readingAvailable, setReadingAvailable] = createSignal(0)
+  const [, setReadingAvailable] = createSignal(0)
   const [readingDealable, setReadingDealable] = createSignal(0)
-  const [readingActive, setReadingActive] = createSignal(0)
+  const [, setReadingActive] = createSignal(0)
   const [, setReadingGated] = createSignal(0)
   const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
-  const [rdDone, setRdDone] = createSignal(0)
-  const [rdTotal, setRdTotal] = createSignal(0)
-  const [rdStats, setRdStats] = createSignal<ReadingRoundStats>({})
+  const [, setRdDone] = createSignal(0)
+  const [, setRdTotal] = createSignal(0)
   const [rdBusy, setRdBusy] = createSignal(false)
   // ---- round summary (hero moment, P2 2026-09-27 round 2) ----
   // When the daily chain lands back on the start screen, it shows what the
@@ -270,6 +268,7 @@ export const App: Component = () => {
   const closeTrace = () => {
     setTraceOpen(false)
     setTraceChunk(null)
+    void resync()
   }
 
   // the chunk the add/cloze/split actions target: the trace detour's chunk
@@ -498,9 +497,14 @@ export const App: Component = () => {
   }
 
   // ---- resync from the backend (self-heal after any state drift) ----
+  const [railRing, setRailRing] = createSignal<{ reading: {done:number;total:number}; review: {done:number;total:number} } | null>(null)
   const resync = async () => {
     try {
-      const d = await api.sessionState()
+      const d = await api.flowState()
+      setRailRing(d.flow ? {
+        reading: {done: d.flow.reading_consumed, total: d.flow.reading_slots},
+        review: {done: d.flow.card_handled, total: d.flow.card_count},
+      } : null)
       adoptGlobal(d)
       setCanUndo(d.can_undo)
       // pacing-mode table from the wire (2026-09-14); validate the stored
@@ -536,127 +540,49 @@ export const App: Component = () => {
         setRdChunks(d.reading_round.chunks ?? [])
         setRdDone(d.reading_round.done ?? 0)
         setRdTotal(d.reading_round.total ?? 0)
-        setRdStats(d.reading_round.stats ?? {})
         setPhase('reading')
       } else {
         setPhase('start')
       }
+      if (d.flow) {
+        const rr = d.reading_round
+        setRdChunks(rr?.chunks ?? [])
+        setRdDone(rr?.done ?? 0)
+        setRdTotal(rr?.total ?? d.flow.reading_slots)
+        setRevealedFor(null)
+        if (d.flow.phase === 'complete') {
+          setRoundSummary(d.flow.stats)
+          setPhase('start')
+        } else {
+          setRoundSummary(null)
+          setPhase(d.flow.phase)
+        }
+      }
     } catch {
-      /* keep current view; next interaction will retry */
+      setPhase('loading')
+      setLoadText('加载失败，请重试')
+      setLoadError(true)
     }
   }
 
   // ---- init: resume an in-progress round or show the start screen ----
   createEffect(() => { resync() })
 
-  // ---- 单一流水线 (user spec 2026-09-24; preview stage retired 2026-09-27;
-  //      list-driven reading 2026-10-06) ----
-  // 开始 → 阅读(每文件最多两段) → 复习(全部新卡+全部到期) → 回开始页。
-  // 每段完成自动进入下一段；清单读完/全被门禁 → 直接进复习。
-  // 预览环节已删除：今天制的卡进预览池，后端次日自动放行成新卡。
-  const startReadingStage = async () => {
-    setPhase('loading')
-    setLoadError(false)
-    setLoadText('正在加载阅读片段…')
-    setRdBusy(true)
-    try {
-      const d = await api.readingStart(selectedMode())
-      if (d.study_modes) setStudyModes(d.study_modes)
-      if (!d.chunks.length) {
-        if (d.all_gated) {
-          showSnack('正在制卡的片段都在等卡片过预览池——明天它们会重新推送')
-        }
-        await startReviewStage()
-        return
-      }
-      setRdChunks(d.chunks)
-      setRdDone(0)
-      setRdTotal(d.chunks.length)
-      setPhase('reading')
-    } catch (e) {
-      setLoadText('加载失败：' + (e as Error).message)
-      setLoadError(true)
-    } finally {
-      setRdBusy(false)
-    }
-  }
-
-  const startReviewStage = async () => {
-    setPhase('loading')
-    setLoadError(false)
-    setLoadText('正在同步并加载卡片…')
-    try {
-      const data = await api.start(selectedMode())
-      adoptGlobal(data)
-      if (data.study_modes) setStudyModes(data.study_modes)
-      if (!data.cards.length) {
-        // nothing left anywhere — the chain ends here
-        await api.finish().catch(() => {})
-        setPhase('start')
-        // hero summary only when a stage actually ran (reading counts);
-        // an empty 开始 click gets a plain snackbar instead
-        const rs = rdStats()
-        if ((rs.done ?? 0) + (rs.skipped ?? 0) > 0) {
-          setRoundSummary({ readingDone: rs.done ?? 0, readingSkipped: rs.skipped, reviewed: 0 })
-        } else {
-          showSnack('没有更多卡片了')
-        }
-        setRdStats({})
-        await resync()
-        return
-      }
-      setCanUndo(false) // a fresh round starts with no undo slot
-      loadBatch(data.cards, 0, data.cards.length)
-    } catch (e) {
-      setLoadText('加载失败：' + (e as Error).message)
-      setLoadError(true)
-    }
-  }
-
-  // the single 开始 button: first stage with content wins
+  // Both queues are dealt once; every transition and reload uses the server cursor.
   const beginFlow = async () => {
-    setRoundSummary(null) // fresh round — the summary strip belongs to the last one
-    setRdStats({})
-    // List-driven reading (2026-10-06): no card-making quota gates the
-    // reading stage anymore — if the 阅读清单 has anything dealable, run it.
-    if (readingMode() && ((readingAvailable() > 0) || (readingActive() > 0))) {
-      await startReadingStage()
-    } else {
-      await startReviewStage()
+    setPhase('loading')
+    setLoadError(false)
+    setLoadText('正在加载今日阅读和卡片…')
+    try {
+      await api.flowStart(selectedMode())
+      await resync()
+    } catch (e) {
+      setLoadText('加载失败：' + (e as Error).message)
+      setLoadError(true)
     }
   }
 
-  // stage transitions (each persists its round server-side before chaining)
-  const chainAfterReading = async () => {
-    await api.readingFinish().catch(() => {})
-    rdRefreshCounts()
-    await startReviewStage()
-  }
-  const chainAfterReview = async () => {
-    // local batch is already drained; clear it and sync the day's progress
-    const reviewed = totalDone()
-    const stats = rdStats()
-    setCards([])
-    setIdx(0)
-    setRevealedFor(null)
-    setCanUndo(false)
-    // hero moment (2026-09-27 round 2): the start screen shows what the
-    // round just did. Reading numbers come from the round stats the backend
-    // returned on each rdAct; review count from this session's answers.
-    setRoundSummary({
-      readingDone: stats.done ?? (rdTotal() > 0 ? rdDone() : 0),
-      readingSkipped: stats.skipped,
-      reviewed,
-      newReviewed: newAnswered(),
-    })
-    setNewAnswered(0)
-    setRdStats({})
-    setPhase('loading')
-    setLoadText('正在同步…')
-    await api.finish().catch(() => {})
-    setPhase('start')
-    await resync()
-  }
+  const chainAfterReview = async () => { await resync() }
 
   const answer = async (ease: number) => {
     const card = cards()[idx()]
@@ -672,27 +598,7 @@ export const App: Component = () => {
         return
       }
 
-      // Remove the answered card BY ID — the local array mirrors the
-      // backend's pending list 1:1, so undo positions (backend 'index')
-      // line up. Position-based removal could drop the wrong card if idx
-      // drifted while the request was in flight.
-      setCards(prev => prev.filter(c => c.cardId !== card.cardId))
-      setTotalDone(totalDone() + 1)
-      if (card.isNew) setNewAnswered(v => v + 1) // round-summary hero
-      // idx now naturally points at the next card (or past the end)
-
-      // backend now holds an undo slot for this answer — no time limit
-      setCanUndo(true)
-
-      const roundDone = data.round != null && data.round.state === 'complete'
-      if (!roundDone && idx() < cards().length) {
-        setRevealedFor(null)
-      } else {
-        if (data.round) adoptGlobal(data.round)
-        // 复习是流水线最后一段 (2026-09-24): no stats page — straight back
-        // to the start screen with a completion snackbar
-        await chainAfterReview()
-      }
+      await resync()
     } catch (e) {
       alert('评分失败：' + (e as Error).message)
     } finally {
@@ -701,21 +607,11 @@ export const App: Component = () => {
   }
 
   const undo = async () => {
-    if (undoBusy() || answering()) return
+    if (undoBusy() || answering() || rdBusy()) return
     setUndoBusy(true)
     try {
-      const d = await api.undo()
-      setCards(prev => {
-        const next = [...prev]
-        // defensive: never insert a duplicate if the card somehow stayed
-        next.splice(Math.min(d.index, next.length), 0, d.card)
-        return next
-      })
-      setIdx(Math.min(d.index, cards().length - 1))
-      setTotalDone(v => Math.max(0, v - 1))
-      if (d.card?.isNew) setNewAnswered(v => Math.max(0, v - 1)) // round-summary hero
-      setRevealedFor(null)
-      setCanUndo(false) // the single undo slot is consumed
+      await api.undo()
+      await resync()
     } catch (e) {
       alert('撤销失败：' + (e as Error).message)
     } finally {
@@ -723,9 +619,7 @@ export const App: Component = () => {
     }
   }
 
-  // 中途退出复习 had no UI entry since the DoneScreen retirement
-  // (2026-09-24) — review rounds resume on reload; the natural end is
-  // chainAfterReview. (The old finish() handler lived here.)
+  // Completion and explicit exit belong to the whole-round coordinator.
 
   // ---- card lifecycle: add / delete / back to preview pool (user spec
   // 2026-09-04). Add reuses EditDialog in mode='add'; delete and to-preview
@@ -834,8 +728,7 @@ export const App: Component = () => {
         setTotalDone(v => v + 1)
         if (wasNew) setBatchNewTotal(v => Math.max(0, v - 1))
         else setBatchReviewTotal(v => Math.max(0, v - 1))
-        if (cards().length === 0) await chainAfterReview()
-        else setRevealedFor(null)
+        await chainAfterReview()
       }
     } catch (e) {
       alert('删除失败：' + (e as Error).message)
@@ -860,19 +753,7 @@ export const App: Component = () => {
   // 2026-09-27 — the preview stage is retired, releases are automatic.
 
   // ---- reading actions (渐进制卡, 2026-09-19) ----
-  const rdRefreshCounts = async () => {
-    // cheap count refresh after round changes (list/available/active)
-    try {
-      const d = await api.sessionState()
-      if (d.reading_mode) {
-        setReadingListSize(d.reading_list_size ?? 0)
-        setReadingAvailable(d.reading_available ?? 0)
-        setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
-        setReadingActive(d.reading_active ?? 0)
-        setReadingGated(d.reading_gated ?? 0)
-      }
-    } catch { /* counts are decorative; next resync fixes them */ }
-  }
+  const rdRefreshCounts = async () => { await resync() }
 
   const rdAct = async (action: 'mark_active' | 'complete' | 'skip' | 'next') => {
     const chunk = rdCurrent()
@@ -896,22 +777,9 @@ export const App: Component = () => {
         )
         return
       }
-      // complete / skip / next: remove BY chunk_key (never by position —
-      // the same rule as the review/preview arrays)
-      setRdChunks(prev =>
-        prev.filter(c => !(c.chunk_key === chunk.chunk_key && c.path === chunk.path)),
-      )
-      setRdDone(d.done ?? rdDone() + 1)
-      // one round = one list-driven batch (2026-10-06): the backend's round
-      // stats ARE the flow's stats — no multi-batch accumulation anymore
-      if (d.stats) setRdStats(d.stats)
-      if (d.round_complete || rdChunks().length === 0) {
-        setRdTotal(d.total ?? rdTotal())
-        // 单一流水线 (2026-09-24; preview stage retired 2026-09-27):
-        // reading round drained → review stage, no readingDone stats page
-        await chainAfterReading()
-      }
+      await resync()
     } catch (e) {
+      await resync()
       alert('操作失败：' + (e as Error).message)
     } finally {
       setRdBusy(false)
@@ -922,13 +790,13 @@ export const App: Component = () => {
   // keep their state) and reconcile via resync.
   const rdFinish = async () => {
     setRdBusy(true)
-    try {
-      await api.readingFinish()
-    } catch { /* not critical */ }
-    setRdBusy(false)
-    setPhase('loading')
-    setLoadText('正在同步…')
-    await resync()
+    try { await api.flowEndReading(); await resync() }
+    catch (e) { alert('结束阅读失败：' + (e as Error).message) }
+    finally { setRdBusy(false) }
+  }
+  const exitFlow = async () => {
+    try { await api.flowExit(); setRoundSummary(null); await resync() }
+    catch (e) { alert('退出失败：' + (e as Error).message) }
   }
 
   // ---- keyboard shortcuts ----
@@ -959,6 +827,11 @@ export const App: Component = () => {
         e.preventDefault()
         openReadingCloze('', '')
       }
+      return
+    }
+    if (e.key === 'z' && (e.ctrlKey || e.metaKey) && canUndo() && !answering()) {
+      e.preventDefault()
+      undo()
       return
     }
     if (phase() === 'reading') {
@@ -998,10 +871,7 @@ export const App: Component = () => {
       else if (e.key === '3') answer(3)
       else if (e.key === '4') answer(4)
     }
-    if (e.key === 'z' && (e.ctrlKey || e.metaKey) && canUndo() && !answering()) {
-      e.preventDefault()
-      undo()
-    }
+
   }
 
   // Window-level registration (2026-09-07): works even when focus is on
@@ -1072,15 +942,6 @@ export const App: Component = () => {
   // moved OUT of the strip above the columns into the rail's bottom-left
   // corner. Derived from the ACTIVE round phase — null when no round is on
   // screen (start/done screens have nothing to count).
-  const railRing = () => {
-    // works regardless of the visible section: mid-round browsing of
-    // 文件/阅读清单 still tracks the active round
-    if (phase() === 'review' && currentCard()) return { done: totalDone(), total: roundTotal() }
-    if (phase() === 'reading' && rdCurrent()) {
-      return { done: rdDone(), total: rdTotal() }
-    }
-    return null
-  }
 
   // 三栏 gate helpers (user spec 2026-09-21): the side columns only render
   // while a card/chunk is actually on screen — start/done/empty screens stay
@@ -1194,6 +1055,7 @@ export const App: Component = () => {
 
         <Show when={phase() === 'review' && currentCard() && !traceOpen()}>
           <Flashcard
+            nativeEngine={nativeEngine()}
             card={currentCard()!}
             revealed={revealed()}
             traceAvailable={traceAvailable()}
@@ -1206,11 +1068,22 @@ export const App: Component = () => {
             onDelete={() => askDelete(currentCard()!)}
           />
           <ActionArea
+            nextIntervals={nativeEngine() ? currentCard()?.next_intervals : null}
             revealed={revealed()}
             answering={answering()}
             onReveal={() => setRevealedFor(currentCard()?.cardId ?? null)}
             onAnswer={answer}
           />
+        </Show>
+        <Show when={!traceOpen() && (phase() === 'reading' || phase() === 'review' || (phase() === 'start' && canUndo()))}>
+          <div class="flow-actions">
+            <Show when={phase() !== 'review' && canUndo()}>
+              <md-text-button disabled={undoBusy() || rdBusy()} onClick={undo}>撤销上次评分</md-text-button>
+            </Show>
+            <Show when={phase() !== 'start'}>
+              <md-text-button disabled={answering() || rdBusy() || undoBusy()} onClick={exitFlow}>退出本轮</md-text-button>
+            </Show>
+          </div>
         </Show>
       </div>
 
@@ -1242,10 +1115,10 @@ export const App: Component = () => {
         <EditDialog
           cardId={currentCard()!.cardId}
           onClose={() => setEditOpen(false)}
-          onSaved={(q, a) => {
+          onSaved={(q, a, source) => {
             setCards(prev =>
               prev.map(c =>
-                c.cardId === currentCard()!.cardId ? { ...c, question: q, answer: a } : c
+                c.cardId === currentCard()!.cardId ? { ...c, question: q, answer: a, ...source } : c
               )
             )
             setRevealedFor(null)

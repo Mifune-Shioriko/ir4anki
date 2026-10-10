@@ -1,5 +1,5 @@
 [Unit]
-Description=ir4anki — review web app (FastAPI + AnkiConnect)
+Description=ir4anki — reading/review app (official Anki engine)
 Documentation=https://github.com/Mifune-Shioriko/ir4anki
 After=network-online.target
 Wants=network-online.target
@@ -11,7 +11,9 @@ WorkingDirectory=@REPO@/backend
 Environment=IR4ANKI_HOST=127.0.0.1
 Environment=IR4ANKI_PORT=8901
 EnvironmentFile=-%h/.config/ir4anki.env
-ExecStart=@REPO@/backend/.venv/bin/uvicorn --app-dir @REPO@/backend app:app --host ${IR4ANKI_HOST} --port ${IR4ANKI_PORT}
+ExecStart=@REPO@/backend/.venv/bin/uvicorn --app-dir @REPO@/backend app:app --host ${IR4ANKI_HOST} --port ${IR4ANKI_PORT} --workers 1
+# Allow queued sync/media/backup work to finish and release collection ownership.
+TimeoutStopSec=300
 Restart=on-failure
 RestartSec=5
 

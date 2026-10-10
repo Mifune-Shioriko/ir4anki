@@ -10,8 +10,8 @@ retired. This suite pins the pure dealing semantics; the gate interaction
 (gated active → frontier takes the slot; all-gated file contributes nothing)
 is covered by gate_segment_level_test.py.
 
-Harness pattern = gate_segment_level_test.py: real FastAPI app, FAKE
-AnkiConnect, TEMPORARY corpus/state. PREVIEW_MODE is OFF so _reading_gates
+Harness pattern = gate_segment_level_test.py: real FastAPI app, real isolated
+pylib collection, TEMPORARY corpus/state. PREVIEW_MODE is OFF so _reading_gates
 returns an empty set and dealing never touches AnkiConnect.
 
 Run: backend/.venv/bin/python scripts/list_dealing_test.py
@@ -22,8 +22,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="list-deal-state-")
-NOTES = Path(tempfile.mkdtemp(prefix="list-deal-notes-"))
+from native_fixture import configure, tempdir, run_closed, NativeData
+
+STATE = tempdir(prefix="list-deal-state-")
+NOTES = Path(tempdir(prefix="list-deal-notes-"))
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_NOTES_DIR"] = str(NOTES)
 os.environ["ANKI_PREVIEW_MODE"] = "0"   # gate off — pure dealing semantics
@@ -32,6 +34,7 @@ os.environ["ANKI_READING_MODE"] = "1"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
+configure()
 import app as backend  # noqa: E402
 
 PASS = 0
@@ -48,17 +51,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-class FakeAnki:
-    """Minimal fake — PREVIEW_MODE off means dealing never calls AnkiConnect;
-    this only absorbs the incidental _wire_study_modes due-count probe."""
-    async def __call__(self, action, params=None, timeout=30):
-        if action == "findCards":
-            return []
-        return None
-
-
-fake = FakeAnki()
-backend.anki = fake
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")  # keep the SPA mount away
 
 # ---- corpus: three multi-section files ------------------------------------
@@ -270,4 +262,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_closed(backend, main()))

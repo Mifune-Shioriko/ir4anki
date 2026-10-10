@@ -15,7 +15,9 @@ Session model (single daily flow, user spec 2026-09-24 → 2026-10-09):
     6-file list deals up to 12 segments — 每篇文章推两次. A freshly seeded
     whole-file entry has only one dealable segment and deals 1; files with
     bookmark-split children deal 2. No padding from other files.
-  - the daily chain is 阅读 → 复习 — the manual PREVIEW STAGE is RETIRED
+  - whole-round interleaving: one reading slot followed by its evenly
+    allocated review block; policy and cursor persist in flow.json.
+    The manual PREVIEW STAGE is RETIRED
     (user spec 2026-09-27). New cards still land in the preview pool
     SUSPENDED when they are made, but nobody approves them by hand anymore:
     auto_release_pool() moves every pool card whose note was created on an
@@ -23,7 +25,7 @@ Session model (single daily flow, user spec 2026-09-24 → 2026-10-09):
     become gradeable new cards tomorrow. The overnight gap is the point
     (measured 2026-09-07: same-day grading after first contact is
     recognition, not recall — 61% vs 88% first-review pass).
-  - daily release cap RELEASE_DAILY_GOAL (default 45 = 3 rounds × 15 new):
+  - daily release cap RELEASE_DAILY_GOAL (default 36):
     auto-release never unsuspends more than the cap per Anki day, so a
     heavy card-making day can't flood the new-card queue (user spec
     2026-09-27: 放行太多 → 复习负担太大). Oldest cards release first; the
@@ -35,7 +37,7 @@ Session model (single daily flow, user spec 2026-09-24 → 2026-10-09):
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
-    a LIST-DRIVEN reading round runs BEFORE the review stage — up to TWO
+    a LIST-DRIVEN reading round interleaves with review — up to TWO
     segments per 阅读清单 file (user spec 2026-10-06, raised 1→2 on
     2026-10-09: 每篇文章推两次，一天只做一轮).
     The user reads their own markdown notes (~/anki-notes, whole-file
@@ -72,13 +74,14 @@ import sqlite3
 import sys
 import time
 import uuid
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -90,9 +93,25 @@ from pydantic import BaseModel
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 ANKICONNECT = os.getenv("ANKICONNECT_URL", "http://127.0.0.1:8765")
+ANKI_BACKEND = os.getenv("ANKI_BACKEND", "connect").lower()
+if ANKI_BACKEND not in ("connect", "pylib"):
+    raise RuntimeError("ANKI_BACKEND must be connect or pylib")
+_pylib = None
+if ANKI_BACKEND == "pylib":
+    from anki_backend import PylibClient, BackendError
+    collection_path = os.getenv("ANKI_COLLECTION_PATH")
+    if not collection_path:
+        raise RuntimeError("pylib requires ANKI_COLLECTION_PATH (existing collection.anki2)")
+    _pylib = PylibClient(
+        collection_path,
+        sync_endpoint=os.getenv("ANKI_SYNC_ENDPOINT"),
+        sync_username=os.getenv("ANKI_SYNC_USERNAME"),
+        sync_password=os.getenv("ANKI_SYNC_PASSWORD"),
+        sync_hkey=os.getenv("ANKI_SYNC_HKEY"),
+    )
 
 # Anki collection.media directory (served back at /media/<name>)
-MEDIA_DIR = Path(os.getenv("ANKI_MEDIA_DIR", str(_REPO_ROOT / "collection.media")))
+MEDIA_DIR = Path(os.getenv("ANKI_MEDIA_DIR", str(_pylib.path.with_suffix(".media") if _pylib else _REPO_ROOT / "collection.media")))
 # built SolidJS frontend (served as the SPA; skipped if absent)
 REVIEW_WEB_V2_DIST = Path(
     os.getenv("REVIEW_DIST_DIR", str(_REPO_ROOT / "frontend" / "dist"))
@@ -339,7 +358,62 @@ def _anki_day() -> str:
 SNAPSHOT_FIELDS = ("interval", "factor", "due", "reps", "lapses", "left", "type", "queue")
 RESTORE_KEYS = ["ivl", "factor", "due", "reps", "lapses", "left", "type", "queue"]
 
-app = FastAPI(title="anki-review")
+async def _periodic_backup(stop, *, interval=None):
+    if interval is None:
+        interval = max(60, float(os.getenv("ANKI_BACKUP_INTERVAL", "1800")))
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        try:
+            await anki("createBackup", {"folder": str(BACKUP_DIR)})
+        except Exception:
+            log.error("Anki periodic backup failed")
+
+
+BACKUP_DIR = Path(os.getenv("ANKI_BACKUP_DIR", str(STATE_DIR / "anki-backups")))
+
+
+@asynccontextmanager
+async def _lifespan(app_instance):
+    task = None
+    backup_stop = asyncio.Event()
+    try:
+        if _pylib is not None:
+            await anki("findCards", {"query": ""})
+            recovery = await anki("engineRoundRecovery")
+            if recovery and recovery.get("after"):
+                existing = _round_read()
+                def equivalent_round(left, right):
+                    if left is None or right is None:
+                        return left == right
+                    # Legacy zero counters are equivalent to absent counters;
+                    # nonzero statistics still require an exact journal match.
+                    return {**left, 'answered_count':left.get('answered_count',0), 'new_answered':left.get('new_answered',0)} == {**right, 'answered_count':right.get('answered_count',0), 'new_answered':right.get('new_answered',0)}
+                if equivalent_round(existing, recovery["before"]) or equivalent_round(existing, recovery["after"]):
+                    _round_write(recovery["after"])
+                    if recovery.get("undo"):
+                        await anki("engineUndoAck")
+                else:
+                    raise RuntimeError("native answer journal conflicts with business round; manual recovery required")
+            await anki("createBackup", {"folder": str(BACKUP_DIR)})
+            task = asyncio.create_task(_periodic_backup(backup_stop))
+        yield
+    finally:
+        backup_stop.set()
+        if _sync_timer is not None:
+            _sync_timer.cancel()
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if _pylib is not None:
+            await _pylib.close()
+
+
+app = FastAPI(title="anki-review", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -403,6 +477,14 @@ async def anki(action: str, params: dict | None = None, timeout: float = 30):
     async with _anki_lock:
         t0 = time.monotonic()
         try:
+            if _pylib is not None:
+                try:
+                    result = await _pylib.call(action, params, timeout)
+                except BackendError as e:
+                    raise HTTPException(status_code=409 if action == "nativeUndo" else 502, detail=str(e)) from None
+                ms = (time.monotonic() - t0) * 1000
+                log.info("anki pylib %s %.0fms", action, ms)
+                return result
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(ANKICONNECT, json=payload)
                 r.raise_for_status()
@@ -429,7 +511,9 @@ async def do_sync() -> bool:
     try:
         async with _sync_lock:
             t0 = time.monotonic()
-            await anki("sync", timeout=300)
+            result = await anki("sync", timeout=300)
+            if isinstance(result, dict) and result.get("deferred"):
+                return False
         log.info("sync done in %.1fs", time.monotonic() - t0)
         return True
     except Exception as e:
@@ -495,8 +579,14 @@ def _round_write(rd: dict | None):
         ROUND_FILE.unlink(missing_ok=True)
     else:
         tmp = ROUND_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rd))
+        with tmp.open("w") as f:
+            json.dump(rd, f)
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(ROUND_FILE)  # atomic
+        fd = os.open(STATE_DIR, os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
 
 
 def _round_expired(rd: dict) -> bool:
@@ -512,10 +602,24 @@ def current_round() -> dict | None:
     rd = _round_read()
     if rd is None:
         return None
-    if _round_expired(rd):
+    if _round_expired(rd) and not _flow_read() and not (_pylib is not None and (rd.get("last") or {}).get("snap", {}).get("native_token")):
         _round_write(None)
         return None
     return rd
+
+
+async def _write_new_round(rd):
+    import uuid
+    rd.setdefault("id", uuid.uuid4().hex)
+    rd.setdefault("answered_count", 0)
+    rd.setdefault("new_answered", 0)
+    previous = _round_read()
+    if _pylib is not None and await _round_can_undo(previous):
+        import copy
+        rd["last"] = copy.deepcopy(previous["last"])
+        rd["last"].update(index=0, from_prior_round=True)
+        await anki("engineRoundTransition", {"before":previous,"after":rd})
+    _round_write(rd)
 
 
 async def restore_round_cards(rd: dict) -> list[dict]:
@@ -527,6 +631,8 @@ async def restore_round_cards(rd: dict) -> list[dict]:
     are collection-day numbers); new cards are kept while still unlearned
     (prop:due does not match the new queue).
     """
+    import copy
+    before = copy.deepcopy(rd)
     ids = rd.get("pending", [])
     if not ids:
         return []
@@ -542,12 +648,15 @@ async def restore_round_cards(rd: dict) -> list[dict]:
     ]
     dropped = len(ids) - len(keep)
     if dropped:
+        rd.setdefault("answered_count", before.get("done_count",0))
         rd["done_count"] = rd.get("done_count", 0) + dropped
     rd["pending"] = keep
     if not keep:
         rd["status"] = "complete"
+    if rd != before and _pylib is not None and await _round_can_undo(before):
+        await anki("engineRoundTransition", {"before":before,"after":rd})
     _round_write(rd)
-    return await fetch_cards(keep) if keep else []
+    return cards_from_infos(keep, infos)
 
 
 # ---- card helpers --------------------------------------------------------
@@ -601,9 +710,13 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
     if not ids:
         return []
     infos = await anki("cardsInfo", {"cards": ids})
+    return cards_from_infos(ids, infos)
+
+
+def cards_from_infos(ids, infos):
     # cardsInfo returns cards sorted by id — re-order to match the REQUEST
     # order (matters for due-order batches).
-    # Defensive: AnkiConnect returns [{}] (one EMPTY row) for vanished ids —
+    # Defensive: adapters return empty rows for vanished cards/missing notes —
     # never index those rows directly (KeyError → 500).
     by_id = {i["cardId"]: i for i in infos or [] if i.get("cardId")}
     ordered = [by_id[cid] for cid in ids if cid in by_id]
@@ -613,6 +726,10 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
             {
                 "cardId": info["cardId"],
                 "noteId": info.get("note"),
+                "fields": info.get("fields"),
+                "tags": info.get("tags"),
+                "ord": info.get("ord"),
+                "kind": info.get("kind"),
                 "question": info["question"],
                 "answer": info["answer"],
                 "deckName": info["deckName"],
@@ -620,6 +737,8 @@ async def fetch_cards(ids: list[int]) -> list[dict]:
                 "css": info.get("css", ""),
                 "isNew": info["type"] == 0,
                 "due": info["due"],
+                "next_intervals": info.get("next_intervals"),
+                "memory_state": info.get("memory_state"),
             }
         )
     # NOTE: similar-cards (anki-rag) + AI explanation (anki-explain)
@@ -665,7 +784,7 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
             if n_reviews:
                 for i, c in enumerate(new_cards):
                     # evenly spaced slots; +i accounts for earlier inserts
-                    pos = round((i + 1) * n_reviews / (take + 1)) + i
+                    pos = round((i + 1) * n_reviews / (len(new_cards) + 1)) + i
                     cards.insert(min(len(cards), pos), c)
             else:
                 cards += new_cards
@@ -684,6 +803,7 @@ async def status():
         new = await anki("findCards", {"query": new_card_query()})
         out = {
             "anki": "ok",
+            "anki_backend": ANKI_BACKEND,
             "due_review": len(due or []),
             "new_total": len(new or []),
             "new_per_round": STUDY_MODES[DEFAULT_MODE]["new"],
@@ -707,7 +827,7 @@ async def status():
                 pass  # fail-soft: status must never break on reading state
         return out
     except Exception as e:
-        return {"anki": "error", "detail": str(e)}
+        return {"anki": "error", "anki_backend": ANKI_BACKEND, "detail": str(e)}
 
 
 @app.post("/api/session/start")
@@ -717,8 +837,12 @@ async def start_session(mode: str | None = None):
 
     `mode` is vestigial (single daily tier since 2026-09-24); unknown/absent
     falls back to DEFAULT_MODE."""
+    if _flow_read():
+        raise HTTPException(status_code=409, detail="use the whole-round flow endpoint")
     synced = await do_sync()  # do_sync acquires _sync_lock itself
     async with _state_lock:
+        if _flow_read():
+            raise HTTPException(status_code=409, detail="use the whole-round flow endpoint")
         return await _start_session_impl(synced, study_mode(mode))
 
 
@@ -735,7 +859,7 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
         review_n, allow_new=True, new_count=m["new"]
     )
     if cards:
-        _round_write(
+        await _write_new_round(
             {
                 "status": "active",
                 "created": datetime.now().isoformat(timespec="seconds"),
@@ -841,7 +965,7 @@ async def _session_state_impl():
             "due_remaining": due_left,
             "new_per_round": STUDY_MODES[mode]["new"],
             "new_total": new_total,
-            "can_undo": bool((rd.get("last") or {}).get("snap")),
+            "can_undo": await _round_can_undo(rd),
             "mode": mode,
             **preview,
             **reading,
@@ -857,7 +981,7 @@ async def _session_state_impl():
             "due_remaining": due_left,
             "new_per_round": STUDY_MODES[study_mode(rd.get("mode"))]["new"],
             "new_total": new_total,
-            "can_undo": bool((rd.get("last") or {}).get("snap")),
+            "can_undo": await _round_can_undo(rd),
             "mode": study_mode(rd.get("mode")),
             **preview,
             **reading,
@@ -871,7 +995,7 @@ async def _session_state_impl():
         "due_remaining": due_left,
         "new_per_round": STUDY_MODES[mode]["new"],
         "new_total": new_total,
-        "can_undo": bool((rd.get("last") or {}).get("snap")),
+        "can_undo": await _round_can_undo(rd),
         "mode": mode,
         **preview,
         **reading,
@@ -882,6 +1006,8 @@ async def _session_state_impl():
 async def session_more():
     """Serialized under _state_lock (see its declaration)."""
     async with _state_lock:
+        if _flow_read():
+            raise HTTPException(status_code=409, detail="use the whole-round flow endpoint")
         return await _session_more_impl()
 
 
@@ -903,7 +1029,7 @@ async def _session_more_impl():
         review_n, allow_new=True, new_count=m["new"]
     )
     if cards:
-        _round_write(
+        await _write_new_round(
             {
                 "status": "active",
                 "created": datetime.now().isoformat(timespec="seconds"),
@@ -928,9 +1054,115 @@ async def _session_more_impl():
 async def session_finish():
     """State write under _state_lock; the (slow) sync runs outside it."""
     async with _state_lock:
-        _round_write(None)
+        if _flow_read():
+            raise HTTPException(status_code=409, detail="use the whole-round exit endpoint")
+        rd = current_round()
+        if not (_pylib is not None and (rd or {}).get("last")):
+            _round_write(None)
     synced = await do_sync()
     return {"synced": synced}
+
+
+EXPORT_DIR = Path(os.getenv("ANKI_EXPORT_DIR", str(STATE_DIR / "anki-exports")))
+
+
+def _engine_authorize(request):
+    import secrets
+    token = os.getenv("ANKI_ENGINE_API_TOKEN")
+    if not token or not secrets.compare_digest(request.headers.get("authorization", ""), "Bearer " + token):
+        raise HTTPException(status_code=403, detail="engine administration requires configured bearer token")
+    if _pylib is None:
+        raise HTTPException(status_code=409, detail="native engine capability unavailable in connect mode")
+
+
+@app.get("/api/engine/status")
+async def engine_status():
+    if _pylib is None:
+        return {"backend":"connect", "sync_deferred":False, "undo_available":False,
+                "capabilities":dict.fromkeys(["undo","intervals","memory_state","stats","backup","export"],False)}
+    return await anki("engineStatus")
+
+
+@app.get("/api/engine/stats")
+async def engine_stats(request: Request):
+    _engine_authorize(request)
+    return await anki("engineStats")
+
+
+class EngineSyncBody(BaseModel):
+    commit_undo: bool = False
+
+
+@app.post("/api/engine/sync")
+async def engine_sync(request: Request, body: EngineSyncBody):
+    _engine_authorize(request)
+    async with _state_lock:
+        async with _sync_lock:
+            result = await anki("sync", {"commit_undo":body.commit_undo}, timeout=300)
+        return result if isinstance(result, dict) else {"synced":True,"deferred":False}
+
+
+def _artifact_path(folder, handle):
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+\.colpkg", handle):
+        raise HTTPException(status_code=404, detail="unknown artifact")
+    folder = folder.resolve()
+    path = folder / handle
+    if path.is_symlink() or path.resolve().parent != folder or not path.is_file():
+        raise HTTPException(status_code=404, detail="unknown artifact")
+    return path
+
+
+@app.post("/api/engine/backup")
+async def engine_backup(request: Request):
+    _engine_authorize(request)
+    await anki("createBackup", {"folder":str(BACKUP_DIR)})
+    files = sorted(BACKUP_DIR.glob("*.colpkg"), key=lambda p:p.stat().st_mtime)
+    if not files:
+        raise HTTPException(status_code=502, detail="engine backup produced no artifact")
+    handle=files[-1].name
+    return {"handle":handle,"download_url":"/api/engine/download/backup/"+handle}
+
+
+@app.post("/api/engine/export")
+async def engine_export(request: Request):
+    _engine_authorize(request)
+    import uuid
+    EXPORT_DIR.mkdir(parents=True,exist_ok=True)
+    handle=uuid.uuid4().hex+".colpkg"
+    await anki("exportCollection", {"path":str(EXPORT_DIR / handle)}, timeout=300)
+    return {"handle":handle,"download_url":"/api/engine/download/export/"+handle}
+
+
+@app.get("/api/engine/download/{kind}/{handle}")
+async def engine_download(request: Request, kind: str, handle: str):
+    _engine_authorize(request)
+    folders={"backup":BACKUP_DIR,"export":EXPORT_DIR}
+    if kind not in folders:
+        raise HTTPException(status_code=404, detail="unknown artifact")
+    if (await anki("engineStatus"))["sync_deferred"]:
+        raise HTTPException(status_code=409, detail="download deferred while undo is pending; explicitly commit first")
+    path = _artifact_path(folders[kind],handle)
+    if kind == 'backup':
+        import hashlib
+        marker = path.with_name(path.name+'.ir4anki-provenance.json')
+        try:
+            if marker.is_symlink():
+                raise ValueError('invalid provenance')
+            provenance = json.loads(marker.read_text())
+            payload = path.read_bytes()
+            digest = hashlib.sha256(payload).hexdigest()
+            safe = provenance.get('download_safe') is True and provenance.get('sha256') == digest
+        except (OSError, ValueError, AttributeError):
+            safe = False
+        if not safe:
+            raise HTTPException(status_code=409, detail='backup is local recovery material or lacks verified download provenance; create a fresh backup after resolving undo')
+        from fastapi.responses import Response
+        # Serve exactly the digest-verified bytes, not a path that a periodic
+        # backup can overwrite between validation and FileResponse streaming.
+        return Response(payload, media_type="application/octet-stream",
+                        headers={'Content-Disposition':f'attachment; filename="{handle}"'})
+    return FileResponse(path, filename=handle, media_type="application/octet-stream")
 
 
 @app.post("/api/answer")
@@ -943,6 +1175,11 @@ async def answer(card_id: int, ease: int):
 async def _answer_impl(card_id: int, ease: int):
     if ease not in (1, 2, 3, 4):
         raise HTTPException(status_code=400, detail="ease must be 1-4")
+
+    if _flow_read():
+        wire = await _flow_state_impl(adopt=False)
+        if wire['flow']['phase'] != 'review' or not wire.get('cards') or wire['cards'][0]['cardId'] != card_id:
+            return {"answered":False,"reason":"stale","round":None}
 
     # Guard: only cards in the ACTIVE round may be answered. Refuse BEFORE
     # answerCards — otherwise a stale client (or a stray request) could
@@ -957,18 +1194,31 @@ async def _answer_impl(card_id: int, ease: int):
     ):
         return {"answered": False, "reason": "stale", "round": None}
 
-    # Snapshot scheduling state BEFORE answering. Our background sync wipes
-    # Anki's native undo stack, so /api/undo restores from this snapshot via
-    # setSpecificValueOfCard instead of guiUndo.
+    # Connect retains its legacy snapshot contract. Pylib journals the full
+    # engine state and uses this snapshot only for the business undo token.
     snap = None
     infos = await anki("cardsInfo", {"cards": [card_id]})
     info = next((i for i in infos or [] if i.get("cardId")), None)
     if info is not None:
         snap = {k: info.get(k) for k in SNAPSHOT_FIELDS}
 
-    res = await anki("answerCards", {"answers": [{"cardId": card_id, "ease": ease}]})
+    answer_params = {"answers": [{"cardId": card_id, "ease": ease}]}
+    if _pylib is not None:
+        import copy
+        after = copy.deepcopy(rd_check)
+        index = after["pending"].index(card_id)
+        after["pending"].remove(card_id)
+        after["done_count"] = after.get("done_count",0)+1
+        after["answered_count"] = after.get("answered_count",after["done_count"]-1)+1
+        after["new_answered"] = after.get("new_answered",0)+int(info is not None and info.get("type")==0)
+        after["last"] = {"cardId":card_id,"index":index,"ease":ease,"snap":copy.deepcopy(snap)}
+        if not after["pending"]: after["status"]="complete"
+        answer_params.update(round_before=rd_check, round_after=after)
+    res = await anki("answerCards", answer_params)
     if not (res and res[0]):
         raise HTTPException(status_code=404, detail="card not found")
+    if _pylib is not None and snap is not None:
+        snap["native_token"] = await anki("nativeUndoToken", {"card": card_id})
 
     # update round state synchronously (no awaits between read and write)
     round_info = None
@@ -977,6 +1227,8 @@ async def _answer_impl(card_id: int, ease: int):
         idx_pos = rd["pending"].index(card_id)
         rd["pending"] = [c for c in rd["pending"] if c != card_id]
         rd["done_count"] = rd.get("done_count", 0) + 1
+        rd["answered_count"] = rd.get("answered_count",rd["done_count"]-1)+1
+        rd["new_answered"] = rd.get("new_answered",0)+int(info is not None and info.get("type")==0)
         # single-level undo slot: where the card sat + how to restore it
         rd["last"] = (
             {"cardId": card_id, "index": idx_pos, "ease": ease, "snap": snap}
@@ -1019,12 +1271,23 @@ async def undo():
         return await _undo_impl()
 
 
+async def _round_can_undo(rd):
+    last = (rd or {}).get("last") or {}
+    snap = last.get("snap") or {}
+    if not snap:
+        return False
+    if _pylib is None:
+        return True
+    token = snap.get("native_token")
+    return bool(token and token == await anki("nativeUndoToken", {"card": last["cardId"]}))
+
+
 async def _undo_impl():
     """Undo the last answer of the current round.
 
-    Sync wipes Anki's native undo stack, so this restores the card's
-    scheduling fields from the pre-answer snapshot and puts the card back
-    into the round at its original position.
+    Pylib uses native undo or its guarded full journal; collection sync is
+    deferred until undo ends. Connect retains the legacy snapshot restore.
+    The card returns to the round at its saved position.
     """
     rd = current_round()
     last = (rd or {}).get("last")
@@ -1032,6 +1295,7 @@ async def _undo_impl():
         raise HTTPException(status_code=409, detail="nothing to undo")
 
     cid = last["cardId"]
+    was_pending = cid in rd.get("pending", [])
     snap = last["snap"]
     values = [
         snap["interval"],
@@ -1043,15 +1307,30 @@ async def _undo_impl():
         snap["type"],
         snap["queue"],
     ]
-    res = await anki(
-        "setSpecificValueOfCard",
-        {
-            "card": cid,
-            "keys": RESTORE_KEYS,
-            "newValues": values,
-            "warning_check": True,
-        },
-    )
+    if _pylib is not None:
+        import copy
+        undo_round = copy.deepcopy(rd)
+        pos = min(last.get("index",0),len(undo_round.get("pending",[])))
+        if cid not in undo_round["pending"]: undo_round["pending"].insert(pos,cid)
+        if last.get("from_prior_round"):
+            undo_round["total"] = undo_round.get("total",0) + (0 if was_pending else 1)
+        else:
+            undo_round["done_count"] = max(0, undo_round.get("done_count",0)-1)
+        if undo_round["status"] == "complete": undo_round["status"]="active"
+        undo_round["answered_count"] = max(0,undo_round.get("answered_count",undo_round.get("done_count",0)+1)-1)
+        undo_round["new_answered"] = max(0,undo_round.get("new_answered",0)-int(snap.get("type")==0))
+        undo_round.pop("last",None)
+        res = await anki("nativeUndo", {"card": cid, "token": snap.get("native_token"), "round_undo":undo_round})
+    else:
+        res = await anki(
+            "setSpecificValueOfCard",
+            {
+                "card": cid,
+                "keys": RESTORE_KEYS,
+                "newValues": values,
+                "warning_check": True,
+            },
+        )
     if not (res and res[0] is True):
         raise HTTPException(status_code=502, detail=f"restore failed: {res}")
 
@@ -1060,11 +1339,18 @@ async def _undo_impl():
     pos = min(last.get("index", 0), len(rd.get("pending", [])))
     if cid not in rd.get("pending", []):
         rd["pending"].insert(pos, cid)
-    rd["done_count"] = max(0, rd.get("done_count", 0) - 1)
+    if last.get("from_prior_round"):
+        rd["total"] = rd.get("total",0) + (0 if was_pending else 1)
+    else:
+        rd["done_count"] = max(0, rd.get("done_count", 0) - 1)
     if rd.get("status") == "complete":
         rd["status"] = "active"
+    rd["answered_count"] = max(0,rd.get("answered_count",rd.get("done_count",0)+1)-1)
+    rd["new_answered"] = max(0,rd.get("new_answered",0)-int(snap.get("type")==0))
     rd.pop("last", None)
     _round_write(rd)
+    if _pylib is not None:
+        await anki("engineUndoAck")
 
     cards = await fetch_cards([cid])
     if not cards:
@@ -1287,6 +1573,8 @@ async def get_note(card_id: int):
         "modelName": n["modelName"],
         "fields": {name: fd["value"] for name, fd in n["fields"].items()},
         "tags": n.get("tags", []),
+        "ord": info.get("ord"),
+        "kind": info.get("kind") or ("cloze" if n["modelName"] == ADD_CLOZE_MODEL else "qa"),
     }
 
 
@@ -1338,18 +1626,23 @@ ADD_MODEL = os.getenv("ANKI_ADD_MODEL", "问答题")
 ADD_CLOZE_MODEL = os.getenv("ANKI_ADD_CLOZE_MODEL", "填空题")
 
 
-def _round_remove_card(rd: dict | None, card_id: int) -> None:
+async def _round_remove_card(rd: dict | None, card_id: int) -> None:
     """A card left the review round without being answered (deleted): count
     it as handled so progress, the review/new split and the completion
     detection all stay correct."""
     if not rd or rd.get("status") != "active" or card_id not in rd.get("pending", []):
         return
+    import copy
+    before = copy.deepcopy(rd)
+    rd.setdefault("answered_count", before.get("done_count",0))
     rd["pending"] = [c for c in rd["pending"] if c != card_id]
     rd["done_count"] = rd.get("done_count", 0) + 1
     if (rd.get("last") or {}).get("cardId") == card_id:
         rd.pop("last", None)
     if not rd["pending"]:
         rd["status"] = "complete"
+    if _pylib is not None and await _round_can_undo(before):
+        await anki("engineRoundTransition", {"before":before,"after":rd})
     _round_write(rd)
 
 
@@ -1456,7 +1749,7 @@ async def _delete_card_impl(card_id: int):
     note_id = info["note"]
     await anki("deleteNotes", {"notes": [note_id]})
     # bookkeeping AFTER a successful delete — never strand round state
-    _round_remove_card(current_round(), card_id)
+    await _round_remove_card(current_round(), card_id)
     fire_and_forget_sync()
     return {"deleted": True}
 
@@ -2302,7 +2595,7 @@ if READING_MODE:
     _reading_migrate_round4()
 
 
-def _reading_read() -> dict:
+def _reading_read(*, preserve_round=False) -> dict:
     """Assemble the working state dict from the SQLite store.
 
     Round 4 shape: entries carry `segments` (list of segment dicts incl.
@@ -2402,7 +2695,7 @@ def _reading_read() -> dict:
                 rd = parsed
         except Exception:
             rd = None
-    if isinstance(rd, dict) and _round_expired(rd):
+    if isinstance(rd, dict) and _round_expired(rd) and not preserve_round and not _flow_read():
         rd = None  # half-finished reading round older than 24h
     d["round"] = rd
     return d
@@ -2964,6 +3257,16 @@ def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool) -> None:
                             "UPDATE rround SET data = ? WHERE id = 1",
                             (json.dumps(rd, ensure_ascii=False),),
                         )
+            flow = _flow_read()
+            if flow and flow.get('slots') and mapping:
+                for slot in flow['slots']:
+                    for path, key in list(slot):
+                        alias = [mapping.get(path, path), key]
+                        if alias not in slot:
+                            slot.append(alias)
+                # Keep old aliases across the SQLite/JSON boundary so a
+                # failed transaction cannot consume an unfinished slot.
+                _flow_write(flow)
     finally:
         conn.close()
     for old in mapping:
@@ -3422,6 +3725,8 @@ async def reading_start(mode: str | None = None):
     """Deal one reading round: up to two segments per 阅读清单 file."""
     async with _state_lock:
         _reading_guard()
+        if _flow_read():
+            raise HTTPException(status_code=409, detail="use the whole-round flow endpoint")
         return await _reading_start_impl(study_mode(mode))
 
 
@@ -3455,6 +3760,7 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
             "all_gated": bool(gated),
         }
     data["round"] = {
+        "id": uuid.uuid4().hex,
         "status": "active",
         "created": datetime.now().isoformat(timespec="seconds"),
         "mode": mode,
@@ -3478,6 +3784,11 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
 async def reading_act(path: str, chunk_key: str, action: str):
     async with _state_lock:
         _reading_guard()
+        if _flow_read() and action in ('complete', 'skip', 'next'):
+            wire = await _flow_state_impl(adopt=False)
+            chunks = (wire.get('reading_round') or {}).get('chunks',[])
+            if wire['flow']['phase'] != 'reading' or not chunks or (chunks[0]['path'],chunks[0]['chunk_key']) != (path,chunk_key):
+                return {'ok':False,'reason':'stale'}
         return _reading_act_impl(path, chunk_key, action)
 
 
@@ -3600,11 +3911,177 @@ async def reading_finish():
     (untouched chunks stay todo/active and are re-dealt next round)."""
     async with _state_lock:
         _reading_guard()
+        if _flow_read():
+            raise HTTPException(status_code=409, detail="use the whole-round end-reading endpoint")
         data = _reading_read()
         stats = (data.get("round") or {}).get("stats", {})
         data["round"] = None
         _reading_write(data)
         return {"ok": True, "stats": stats}
+
+
+# ---- persisted whole-round coordinator (independent of both schedulers) ----
+from flow import create as _flow_create, reconcile as _flow_reconcile, replace_slot as _flow_replace_slot
+FLOW_FILE = STATE_DIR / 'flow.json'
+
+
+def _flow_read():
+    if not FLOW_FILE.exists():
+        return None
+    # Fail closed on corruption: never redeal over an unreadable coordinator.
+    try:
+        flow = json.loads(FLOW_FILE.read_text())
+        if not isinstance(flow, dict) or flow.get('status') not in ('initializing','active','complete','exiting'):
+            raise ValueError('invalid flow status')
+        if flow['status'] in ('active','complete') and (flow.get('policy') != 'even-floor-v1' or not isinstance(flow.get('slots'), list) or not isinstance(flow.get('card_ids'), list)):
+            raise ValueError('invalid or unsupported flow policy')
+        return flow
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=409, detail='flow state unreadable; restore its backup') from exc
+
+
+def _flow_write(flow):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if flow is None:
+        FLOW_FILE.unlink(missing_ok=True)
+        return
+    tmp = FLOW_FILE.with_suffix('.tmp')
+    with tmp.open('w') as stream:
+        json.dump(flow, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    tmp.replace(FLOW_FILE)
+    fd = os.open(STATE_DIR, os.O_RDONLY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+async def _flow_initialize(mode, legacy=False):
+    """Write intent before dealing; recover an interrupted deal from its queue."""
+    f = _flow_read()
+    if not f or f.get('status') == 'complete':
+        f = {'status':'initializing', 'mode':mode, 'legacy':legacy}
+        _flow_write(f)
+    if f.get('status') != 'initializing':
+        return
+    if READING_MODE and not f.get('reading_ready'):
+        data = _reading_read()
+        if f.get('fresh') and data.get('round') == f.get('previous_reading'):
+            data['round'] = None
+            _reading_write(data)
+        if not isinstance(data.get('round'), dict):
+            await _reading_start_impl(mode)
+        f['reading_ready'] = True
+        _flow_write(f)
+    if not f.get('cards_ready'):
+        existing = _round_read()
+        if existing is None or (f.get('fresh') and existing == f.get('previous_cards')):
+            batch = await _start_session_impl(False, mode)
+            if not batch['cards']:
+                await _write_new_round({'status':'complete','created':datetime.now().isoformat(timespec='seconds'),
+                                        'total':0,'done_count':0,'pending':[],'new_count':0,'mode':mode})
+        f['cards_ready'] = True
+        _flow_write(f)
+    data = _reading_read() if READING_MODE else {}
+    r = data.get('round') or {}
+    c = _round_read() or {}
+    flow = _flow_create(r.get('pending',[]), c.get('pending',[]), r.get('id',r.get('created')), c.get('id',c.get('created')), f.get('legacy',False))
+    flow['reading_stats_base'] = dict(r.get('stats',{}))
+    _flow_write(flow)
+
+
+async def _flow_state_impl(adopt=True):
+    f = _flow_read()
+    if f and f.get('status') == 'exiting':
+        await _flow_exit_impl()
+        f = None
+    if f and f.get('status') == 'initializing':
+        await _flow_initialize(study_mode(f.get('mode')), f.get('legacy',False))
+        f = _flow_read()
+    if not f and adopt:
+        r = (_reading_read(preserve_round=True).get('round') or {}) if READING_MODE else {}
+        c = _round_read() or {}
+        if r.get('status') == 'active' or c.get('status') == 'active':
+            await _flow_initialize(study_mode(c.get('mode') or r.get('mode')), True)
+            f = _flow_read()
+    d = await _session_state_impl()
+    if not f:
+        return {**d, 'flow':None}
+    r = (_reading_read().get('round') or {}) if READING_MODE else {}
+    c = _round_read() or {}
+    _flow_reconcile(f,r.get('pending',[]),c.get('pending',[]))
+    stats = r.get('stats') or f.get('reading_stats_base',{})
+    f['stats'] = {'readingDone':stats.get('done',0),'readingSkipped':stats.get('skipped',0),
+                  'readingNext':stats.get('next',0),'reviewed':c.get('answered_count',c.get('done_count',0)),
+                  'newReviewed':c.get('new_answered',0)}
+    _flow_write(f)
+    return {**d, 'flow':f}
+
+
+@app.get('/api/flow/state')
+async def flow_state():
+    async with _state_lock:
+        return await _flow_state_impl()
+
+
+@app.post('/api/flow/start')
+async def flow_start(mode: str | None = None):
+    async with _state_lock:
+        f = _flow_read()
+        if f and f.get('status') in ('initializing', 'exiting'):
+            return await _flow_state_impl()
+        if f:
+            # Queues may have changed since the last state poll (especially
+            # undo from another device). Reconcile before declaring a fresh start.
+            wire = await _flow_state_impl(adopt=False)
+            f = wire['flow']
+            if f['status'] != 'complete':
+                return wire
+        r = (_reading_read(preserve_round=True).get('round') if READING_MODE else None)
+        c = _round_read()
+        legacy = not f and ((r or {}).get('status') == 'active' or (c or {}).get('status') == 'active')
+        if f or (not legacy and (r or c)):
+            # Persist prior queue identities before replacing either one.
+            # A retry distinguishes "not dealt yet" from "deal committed".
+            # Completed legacy tombstones also need a fresh deal.
+            _flow_write({'status':'initializing','mode':study_mode(mode),'legacy':False,
+                         'fresh':True,'previous_reading':r,'previous_cards':c})
+        await _flow_initialize(study_mode(mode), legacy)
+        return await _flow_state_impl()
+
+
+@app.post('/api/flow/end-reading')
+async def flow_end_reading():
+    async with _state_lock:
+        await _flow_state_impl()
+        if READING_MODE:
+            data = _reading_read(); r = data.get('round') or {}
+            n = len(r.get('pending',[]))
+            stats = r.setdefault('stats',{})
+            stats['skipped'] = stats.get('skipped',0)+n
+            r.update(pending=[],status='complete',done=r.get('done',0)+n)
+            data['round']=r; _reading_write(data)
+        return await _flow_state_impl()
+
+
+async def _flow_exit_impl():
+    # Commit the existing journal locally before clearing business queues.
+    # Unresolved native recovery rejects this without discarding either queue.
+    if _pylib is not None:
+        await anki('engineCommitUndo')
+    _round_write(None)
+    if READING_MODE:
+        data = _reading_read(); data['round'] = None; _reading_write(data)
+    _flow_write(None)
+
+
+@app.post('/api/flow/exit')
+async def flow_exit():
+    async with _state_lock:
+        _flow_read()  # Fail closed if existing state is corrupt.
+        _flow_write({'status':'exiting'})
+        await _flow_exit_impl()
+        return {'ok':True}
 
 
 # Stale-coordinate sentinel: the client's view of the parent segment no longer
@@ -3820,6 +4297,10 @@ async def reading_split(body: ReadingSplitBody):
                     for c in children
                     if c["status"] == "todo" and c["seg_id"] != tail_seg_id
                 ]
+                flow = _flow_read()
+                if flow:
+                    _flow_replace_slot(flow, {"path":body.path,"chunk_key":key}, todo_children)
+                    _flow_write(flow)
                 pend[at : at + 1] = todo_children
                 rd["pending"] = pend
                 rd["total"] = rd.get("done", 0) + len(pend)

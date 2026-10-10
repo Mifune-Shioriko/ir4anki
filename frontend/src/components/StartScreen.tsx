@@ -67,16 +67,19 @@ export const StartScreen: Component<Props> = (props) => {
                 本轮完成
               </div>
               <div class="round-summary__stats">
-                <Show when={(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0) > 0}>
+                <Show when={(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0) + (props.roundSummary!.readingNext ?? 0) > 0}>
                   <div class="round-summary__stat">
                     <span class="round-summary__num md-typescale-headline-medium">
-                      {(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0)}
+                      {(props.roundSummary!.readingDone ?? 0) + (props.roundSummary!.readingSkipped ?? 0) + (props.roundSummary!.readingNext ?? 0)}
                     </span>
                     <span class="round-summary__label md-typescale-label-small">阅读段处理</span>
                     <Show when={(props.roundSummary!.readingSkipped ?? 0) > 0}>
                       <span class="round-summary__sub md-typescale-label-small">
                         其中跳过 {props.roundSummary!.readingSkipped} 段
                       </span>
+                    </Show>
+                    <Show when={(props.roundSummary!.readingNext ?? 0) > 0}>
+                      <span class="round-summary__sub md-typescale-label-small">稍后继续 {props.roundSummary!.readingNext} 段</span>
                     </Show>
                   </div>
                 </Show>
@@ -99,7 +102,7 @@ export const StartScreen: Component<Props> = (props) => {
           </Show>
           <h1 class="screen-title md-typescale-headline-medium">开始学习</h1>
           <p class="screen-detail md-typescale-body-medium">
-            一轮依次推进：阅读笔记 → 复习。阅读阶段每篇文章最多推进两段，全部过完自动进入复习；复习清掉全部到期卡和当日放行的新卡。今天制的卡进预览池，明天自动放行为新卡。
+            一轮交替推进：读一段，再复习一组卡片。每篇文章最多两段，全部到期卡和可用新卡均匀分配到这些阅读段后；一侧没有内容时继续另一侧。今天制的卡进预览池，明天按每日额度放行为新卡。
           </p>
 
           <Show when={isEmpty() && props.due != null}>

@@ -24,6 +24,8 @@ import { searchKeymap, highlightSelectionMatches } from '@codemirror/search'
 import { closeBrackets, closeBracketsKeymap } from '@codemirror/autocomplete'
 
 export interface Cm6Handle {
+  selection(): { from: number; to: number }
+  replaceRange(from: number, to: number, text: string): void
   getText(): string
   /** replace the current selection (or insert at cursor) */
   insertAtCursor(text: string): void
@@ -145,6 +147,8 @@ export function createMdEditor(parent: HTMLElement, opts: Cm6Options): Cm6Handle
   const view = new EditorView({ state, parent, root: document })
 
   return {
+    selection: () => ({ from: view.state.selection.main.from, to: view.state.selection.main.to }),
+    replaceRange: (from, to, text) => { view.dispatch({changes:{from,to,insert:text},selection:{anchor:from+text.length}}); view.focus() },
     getText: () => view.state.doc.toString(),
     insertAtCursor(text: string) {
       const { from, to } = view.state.selection.main

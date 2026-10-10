@@ -2,20 +2,23 @@
 
 A self-hosted review web app that adds **incremental reading** (渐进制卡) and a
 **preview gate** (先看后考) on top of your existing Anki collection. FastAPI
-backend + SolidJS/Material Design 3 frontend, driven entirely through
-[AnkiConnect](https://ankiweb.net/shared/info/2055492159) — no Anki fork, no
-database migration, no add-on code inside Anki.
+backend + SolidJS/Material Design 3 frontend. Choose the default
+[AnkiConnect](https://ankiweb.net/shared/info/2055492159) backend or embed the
+official headless Anki engine (`anki==25.2.7`, `ANKI_BACKEND=pylib`). No Anki fork
+or custom scheduler. See [native-engine migration](docs/pylib-migration.md).
 
-You keep reviewing in desktop Anki as usual; ir4anki is an *extra* front door
-for the daily flow below. Cards always live in your collection and move
-between your devices via Anki's own sync.
+With AnkiConnect, desktop Anki remains running. With pylib, ir4anki owns the
+collection and desktop Anki must be closed; it is an optional emergency tool.
+Cards stay in Anki's collection format and use Anki's native synchronization.
+New releases are licensed under AGPL-3.0-or-later; see LICENSE and NOTICE.
 
 ## What it adds
 
 ### One daily flow (one button, one round a day)
-A single **开始** button runs the whole day: it deals reading segments first,
-then a review batch, then returns to the start screen — no intermediate
-pick/stats pages. The design is **one round a day** (2026-10-09): the review
+A single **开始** button deals both queues once, then alternates one reading
+segment with an evenly allocated review block across the whole round. The
+server persists the phase, cursor and summary for refresh and other devices;
+the summary appears only after both queues end. The design is **one round a day** (2026-10-09): the review
 batch clears the day's ENTIRE due pile plus the whole dealable new pool, so
 nothing carries over. The review size is dynamic: ⌈D / divisor⌉ where D is the
 day's due-card count, snapshotted at the first review deal of the Anki day
@@ -41,8 +44,11 @@ TO TWO segments per round (2026-10-09, raised from one — 每篇文章推两次
 slot 2 is the next dealable segment in line order. So a 6-file list deals up to
 12 segments. A freshly seeded whole-file entry has only one dealable segment
 and deals 1 until you bookmark-split it. There is no card-making quota
-anywhere: finish the round, the flow hands over to review, and 开始 again deals
-the next segments of every file.
+anywhere. Reading advances consume slots; split children remain in their
+parent slot until advanced. **结束阅读** skips remaining reading slots and
+continues cards; **退出本轮** safely clears both queues. Card undo is available
+during reading and corrects the review block without undoing reading. See
+[the persisted flow policy](docs/interleaved-flow.md) for recovery and statistics.
 
 - **Segment editor** — edit a segment's text in-app (CodeMirror 6 source +
   live markdown preview). Saves atomically rewrite the .md and re-anchor every
@@ -93,11 +99,12 @@ stutters your open Anki window. Slow calls are logged
 - Linux (systemd user services) — the app itself is plain FastAPI/uvicorn and
   runs anywhere Python 3.10+ does, but `deploy/install.sh` assumes systemd
 - Python ≥ 3.10, Node ≥ 18 (+ npm)
-- Desktop **Anki running** with the **AnkiConnect** add-on (code `2055492159`),
-  listening on its default `127.0.0.1:8765`
-- Anki configured with its own sync target (AnkiWeb or a self-hosted sync
-  server) — ir4anki never syncs anything itself; it triggers Anki's sync after
-  each answer
+- Default `connect`: desktop **Anki running** with **AnkiConnect** (code
+  `2055492159`) on `127.0.0.1:8765`, with its own sync target configured.
+- Optional `pylib`: an existing `collection.anki2`, desktop Anki closed, a
+  matching emergency desktop version, and explicit native sync credentials.
+  Normal collection and media sync are supported; full sync is never selected
+  automatically. Only one uvicorn worker may own a collection.
 
 ## Install
 
@@ -123,7 +130,7 @@ Then open <http://127.0.0.1:8901>.
 
 Before the daily flow works end to end, confirm:
 
-1. **Desktop Anki is RUNNING** with the AnkiConnect add-on installed
+1. **Default connect backend: desktop Anki is RUNNING** with the AnkiConnect add-on installed
    (`2055492159`) — ir4anki drives your collection through it. If Anki is
    closed the app shows an Anki-connection error on every action.
 2. **`ANKI_PREVIEW_RELEASE_DECK` (default `2026`) exists in YOUR collection**
@@ -239,9 +246,16 @@ backend/.venv/bin/python scripts/reading_ui_test.py
 backend/.venv/bin/python scripts/file_mgmt_ui_test.py
 ```
 
-Tests spawn throwaway backends on ports 8902–8907 with isolated state dirs and
-fake or dead AnkiConnect endpoints — they never answer cards against the live
-collection.
+Migrated behavioral/UI tests spawn throwaway backends on allocated loopback
+ports with isolated real Anki collections, state and corpus. Targeted connect
+fault/protocol tests remain separate. They never answer or synchronize the live
+collection. See [regression runner](scripts/REGRESSION.md).
+
+New QA/cloze fields retain raw Markdown and share CM6 editing; legacy HTML is
+rendered without bulk conversion. Native mode offers interval/memory previews,
+official statistics, authenticated backups/export and explicit sync confirmation.
+Single-slot undo survives restart through a guarded journal; background sync
+defers until the slot is ended rather than imposing a short undo timeout.
 
 ## Acknowledgements
 
@@ -252,4 +266,5 @@ the overnight-release policy.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+AGPL-3.0 — see [LICENSE](LICENSE). Earlier MIT notices/grants are retained in
+[NOTICE](NOTICE).

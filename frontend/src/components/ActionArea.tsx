@@ -6,6 +6,7 @@ import { Component } from 'solid-js'
 // filled-tonal on its default secondary-container. Keycap hints surface the
 // existing keyboard shortcuts (Space / 1-4) so they're discoverable.
 interface Props {
+  nextIntervals?: [string, string, string, string] | null
   revealed: boolean
   answering: boolean
   onReveal: () => void

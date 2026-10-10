@@ -1,5 +1,9 @@
 import { Component, For, Show, createEffect, createSignal, onMount } from 'solid-js'
 import katex from 'katex'
+import { MarkdownField } from './MarkdownField'
+import { AuthoringToolbar } from './AuthoringToolbar'
+import { cleanCardHtml, cleanEditorHtml } from '../lib/clean'
+import { MARKDOWN_TAG, isMarkdownNote } from '../lib/cloze'
 import { api } from '../api'
 import { applyDialogGuard } from '../lib/dialog-guard'
 import { fromEditorHtml, makeMathChip, makeMediaImg, mathifyField, toEditorHtml } from '../lib/rich'
@@ -38,13 +42,16 @@ interface Props {
    * note id lands in the chunk's cards_created */
   readingSource?: { path: string; chunk_key: string } | null
   onClose: () => void
-  onSaved?: (question: string, answer: string) => void
+  onSaved?: (question: string, answer: string, source: {fields: Record<string,string>; tags: string[]}) => void
   onAdded?: (noteId: number) => void
 }
 
 export const EditDialog: Component<Props> = (props) => {
   let texInputRef: any
   let imgFileRef: HTMLInputElement | undefined
+  const [markdownMode, setMarkdownMode] = createSignal(props.mode === 'add')
+  const mdValues = new Map<string, string>()
+  const [legacyPreview, setLegacyPreview] = createSignal<Record<string,string>>({})
   const [loading, setLoading] = createSignal(true)
   const [saving, setSaving] = createSignal(false)
   const [fields, setFields] = createSignal<Record<string, string>>({})
@@ -85,8 +92,9 @@ export const EditDialog: Component<Props> = (props) => {
           setAllTags(tagsData.tags)
         } else {
           const [noteData, tagsData] = await Promise.all([api.note(props.cardId!), api.tags()])
+          setMarkdownMode(isMarkdownNote(noteData.tags))
           setFields(noteData.fields)
-          setTags(noteData.tags)
+          setTags(noteData.tags.filter(t => t !== MARKDOWN_TAG))
           setAllTags(tagsData.tags)
         }
       } catch (e) {
@@ -99,20 +107,20 @@ export const EditDialog: Component<Props> = (props) => {
 
   // ---- toolbar commands ----
   // pointerdown + preventDefault keeps the text selection inside the field
-  const cmd = (name: string) => (e: PointerEvent) => {
-    e.preventDefault()
+  const cmd = (name: string) => (e?: Event) => {
+    e?.preventDefault()
     if (!activeField) return
     document.execCommand(name, false)
   }
-  const hiliteDown = (e: PointerEvent) => {
-    e.preventDefault()
+  const hiliteDown = (e?: Event) => {
+    e?.preventDefault()
     if (!activeField) return
     document.execCommand('hiliteColor', false, '#fdf3b0')
   }
 
   // ---- images ----
-  const imgDown = (e: PointerEvent) => {
-    e.preventDefault()
+  const imgDown = (e?: Event) => {
+    e?.preventDefault()
     if (!activeField) {
       alert('先点进一个文本框，再选择要插入的位置')
       return
@@ -209,8 +217,8 @@ export const EditDialog: Component<Props> = (props) => {
     requestAnimationFrame(() => texInputRef?.focus?.())
   }
 
-  const mathDown = (e: PointerEvent) => {
-    e.preventDefault()
+  const mathDown = (e?: Event) => {
+    e?.preventDefault()
     openMathPanel(getSelectedChip())
   }
 
@@ -285,7 +293,7 @@ export const EditDialog: Component<Props> = (props) => {
     const q = tagInput().toLowerCase()
     if (!q) return []
     return allTags()
-      .filter(t => t.toLowerCase().includes(q) && !tags().includes(t))
+      .filter(t => t !== MARKDOWN_TAG && t.toLowerCase().includes(q) && !tags().includes(t))
       .slice(0, 5)
   }
 
@@ -294,7 +302,7 @@ export const EditDialog: Component<Props> = (props) => {
     setSaving(true)
     setError('')
     try {
-      const out: Record<string, string> = {}
+      const out: Record<string, string> = markdownMode() ? { ...fields(), ...Object.fromEntries(mdValues) } : {}
       fieldRefs.forEach((el, name) => {
         out[name] = fromEditorHtml(el.innerHTML)
       })
@@ -304,11 +312,11 @@ export const EditDialog: Component<Props> = (props) => {
           setSaving(false)
           return
         }
-        const res = await api.addCard(out, tags(), props.readingSource ?? null)
+        const res = await api.addCard(out, [...tags(), MARKDOWN_TAG], props.readingSource ?? null)
         props.onAdded?.(res.noteId)
       } else {
-        const res = await api.updateNote(props.cardId!, out, tags())
-        props.onSaved?.(res.question, res.answer)
+        const res = await api.updateNote(props.cardId!, out, markdownMode() ? [...tags(), MARKDOWN_TAG] : tags())
+        props.onSaved?.(res.question, res.answer, {fields: out, tags: markdownMode() ? [...tags(), MARKDOWN_TAG] : tags()})
       }
       props.onClose()
     } catch (e) {
@@ -343,33 +351,20 @@ export const EditDialog: Component<Props> = (props) => {
             <div class="edit-error md-typescale-body-medium">{error()}</div>
           </Show>
 
-          <div class="edit-toolbar" role="toolbar" aria-label="格式工具栏">
-            <md-icon-button aria-label="加粗" onPointerDown={cmd('bold')}>
-              <md-icon><IconFormatBold /></md-icon>
-            </md-icon-button>
-            <md-icon-button aria-label="斜体" onPointerDown={cmd('italic')}>
-              <md-icon><IconFormatItalic /></md-icon>
-            </md-icon-button>
-            <md-icon-button aria-label="下划线" onPointerDown={cmd('underline')}>
-              <md-icon><IconFormatUnderlined /></md-icon>
-            </md-icon-button>
-            <span class="tool-sep" />
-            <md-icon-button aria-label="高亮" onPointerDown={hiliteDown}>
-              <md-icon><IconInkHighlighter /></md-icon>
-            </md-icon-button>
-            <span class="tool-sep" />
-            <md-icon-button aria-label="插入公式" onPointerDown={mathDown}>
-              <md-icon><IconFunctions /></md-icon>
-            </md-icon-button>
-            <md-icon-button aria-label="插入图片" onPointerDown={imgDown}>
-              <md-icon><IconImage /></md-icon>
-            </md-icon-button>
-            <span class="tool-sep" />
-            <md-icon-button aria-label="清除格式" onPointerDown={cmd('removeFormat')}>
-              <md-icon><IconFormatClear /></md-icon>
-            </md-icon-button>
+          <Show when={!markdownMode()}><AuthoringToolbar label="格式工具栏" preserveHtmlSelection
+            primary={[
+              { label: '加粗', icon: () => <IconFormatBold />, run: () => cmd('bold')() },
+              { label: '斜体', icon: () => <IconFormatItalic />, run: () => cmd('italic')() },
+            ]}
+            secondary={[
+              { label: '下划线', icon: () => <IconFormatUnderlined />, run: () => cmd('underline')() },
+              { label: '高亮', icon: () => <IconInkHighlighter />, run: () => hiliteDown() },
+              { label: '插入公式', icon: () => <IconFunctions />, run: () => mathDown() },
+              { label: '插入图片', icon: () => <IconImage />, run: () => imgDown() },
+              { label: '清除格式', icon: () => <IconFormatClear />, run: () => cmd('removeFormat')() },
+            ]}>
             <input type="file" ref={imgFileRef} accept="image/*" style="display:none" onChange={onImgPicked} />
-          </div>
+          </AuthoringToolbar>
 
           <Show when={mathOpen()}>
             <div class="math-panel">
@@ -407,20 +402,32 @@ export const EditDialog: Component<Props> = (props) => {
             </div>
           </Show>
 
+          </Show>
           <div class="edit-fields">
             <For each={fieldKeys()}>
               {key => (
                 <div class="field-group">
                   <label class="field-label md-typescale-label-medium">{key}</label>
+                  <Show when={markdownMode()} fallback={
+                  <>
                   <div
                     class="rich-field"
+                    role="textbox" aria-label={key} aria-multiline="true"
                     contentEditable={true}
-                    innerHTML={toEditorHtml(fields()[key])}
+                    innerHTML={toEditorHtml(cleanEditorHtml(fields()[key]))}
                     ref={(el: HTMLDivElement) => fieldRefs.set(key, el)}
+                    onInput={e => setLegacyPreview(v => ({...v, [key]: fromEditorHtml(e.currentTarget.innerHTML)}))}
                     onFocus={() => { activeField = fieldRefs.get(key) }}
                     onPaste={e => handlePaste(e, key)}
                     onClick={e => handleFieldClick(e, key)}
                   />
+                  <section class="authoring-preview" role="region" aria-label={`${key}预览`}>
+                    <div class="authoring-preview-label md-typescale-label-medium">预览</div>
+                    <div class="note-body card-md-preview" innerHTML={cleanCardHtml(legacyPreview()[key] ?? fields()[key])} />
+                  </section>
+                  </>}>
+                    <MarkdownField label={key} initial={fields()[key]} onChange={v => mdValues.set(key,v)} onSave={() => void handleSave()} />
+                  </Show>
                 </div>
               )}
             </For>
@@ -459,7 +466,7 @@ export const EditDialog: Component<Props> = (props) => {
           </div>
 
           <div class="edit-hint md-typescale-body-small">
-            {isAdd()
+            {markdownMode() ? 'Markdown 源码原样保存；Ctrl/⌘+Enter 保存。' : isAdd()
               ? '富文本编辑：格式、公式、图片、标签都会原样写回 Anki。新卡进入预览池（挂起），预览放行后进入复习队列。'
               : '富文本编辑：格式、公式、图片、标签都会原样写回 Anki，保存后立即生效。'}
           </div>

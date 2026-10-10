@@ -1,0 +1,33 @@
+ir4anki
+Copyright (c) 2026 Mifune-Shioriko
+
+Current releases are licensed under GNU AGPL version 3 or later (see LICENSE).
+Source for network users is available at https://github.com/Mifune-Shioriko/ir4anki.
+If you run a modified version over a network, make its corresponding source
+available to its users as required by AGPL section 13. Preserve third-party
+license notices. Anki pylib is AGPL-3.0-or-later.
+
+Historical ir4anki revisions were released under the MIT license. Those grants
+are not revoked. The original notice is preserved below for reused MIT code:
+
+MIT License
+
+Copyright (c) 2026 Mifune-Shioriko
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

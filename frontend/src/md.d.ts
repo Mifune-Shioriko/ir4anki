@@ -27,6 +27,10 @@ declare module 'solid-js' {
       'md-divider': any
       'md-icon': any
 
+      // Field-local authoring overflow (imported by AuthoringToolbar).
+      'md-menu': any
+      'md-menu-item': any
+
       // progress
       'md-circular-progress': any
       'md-linear-progress': any

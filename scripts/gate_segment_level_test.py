@@ -13,7 +13,7 @@ frontier search skips over it and later segments deal normally. Also fixes:
     though it no longer blocks.
 
 Same harness pattern as reading_edit_test.py: real FastAPI app against a
-FAKE AnkiConnect and TEMPORARY corpus/state — prod untouched.
+real isolated pylib collection and TEMPORARY corpus/state — prod untouched.
 
 Run: backend/.venv/bin/python scripts/gate_segment_level_test.py
 """
@@ -24,8 +24,10 @@ import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="gate-b-state-")
-NOTES = Path(tempfile.mkdtemp(prefix="gate-b-notes-"))
+from native_fixture import configure, tempdir, run_closed, NativeData
+
+STATE = tempdir(prefix="gate-b-state-")
+NOTES = Path(tempdir(prefix="gate-b-notes-"))
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_NOTES_DIR"] = str(NOTES)
 os.environ["ANKI_PREVIEW_MODE"] = "1"
@@ -35,6 +37,7 @@ os.environ["ANKI_RELEASE_DAILY_GOAL"] = "45"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
+configure()
 import app as backend  # noqa: E402
 
 PASS = 0
@@ -58,91 +61,12 @@ def nid_for(days_ago: int) -> int:
     rollover no matter when the suite runs — the modes_ui_test fixture bug
     taught this).
     """
-    dt = (datetime.now() - timedelta(days=days_ago)).replace(
+    dt = (datetime.now() - timedelta(hours=4) - timedelta(days=days_ago)).replace(
         hour=12, minute=0, second=0, microsecond=0)
     return int(dt.timestamp() * 1000)
 
 
-class FakeAnki:
-    """Fake covering the gate + auto-release paths.
-
-    notesInfo MUST carry the `cards` list (the gate walks note → cards);
-    cardsInfo carries deckName/queue/type/note.
-    """
-
-    def __init__(self):
-        self.cards = {}   # cid -> info dict
-        self.notes = {}   # nid -> {"tags": [...]}
-        self.next_cid = 900001
-
-    def add_pool_card(self, nid: int, *, deck="预览池", suspended=True, ctype=0):
-        cid = self.next_cid
-        self.next_cid += 1
-        self.cards[cid] = {
-            "cardId": cid, "type": ctype,
-            "queue": -1 if suspended else (0 if ctype == 0 else 2),
-            "deckName": deck, "due": 0, "interval": 0, "factor": 0,
-            "reps": 0, "lapses": 0, "left": 0, "note": nid,
-        }
-        self.notes.setdefault(nid, {"tags": []})
-        return cid
-
-    def cards_of(self, nid: int) -> list:
-        return [c["cardId"] for c in self.cards.values() if c["note"] == nid]
-
-    def _match(self, cid, q):
-        c = self.cards[cid]
-        if 'deck:"预览池"' in q and c["deckName"] != "预览池":
-            return False
-        if 'deck:"2026"' in q and c["deckName"] != "2026":
-            return False
-        if "is:new" in q and c["type"] != 0:
-            return False
-        if "is:suspended" in q and c["queue"] != -1:
-            return False
-        if "-is:suspended" in q and c["queue"] == -1:
-            return False
-        if "tag:released-*" in q and not any(
-                t.startswith("released-") for t in self.notes[c["note"]]["tags"]):
-            return False
-        return True
-
-    async def __call__(self, action, params=None, timeout=30):
-        params = params or {}
-        if action == "findCards":
-            return [cid for cid in self.cards if self._match(cid, params["query"])]
-        if action == "cardsInfo":
-            return [dict(self.cards[c]) for c in params["cards"] if c in self.cards]
-        if action == "notesInfo":
-            out = []
-            for n in params["notes"]:
-                if n in self.notes:
-                    out.append({"noteId": n, "tags": list(self.notes[n]["tags"]),
-                                "fields": {}, "modelName": "问答题",
-                                "cards": self.cards_of(n)})
-                else:
-                    out.append({})  # AnkiConnect deleted-note shape
-            return out
-        if action == "changeDeck":
-            for c in params["cards"]:
-                if c in self.cards:
-                    self.cards[c]["deckName"] = params["deck"]
-            return None
-        if action == "suspend":
-            for c in params["cards"]:
-                if c in self.cards:
-                    self.cards[c]["queue"] = -1
-            return None
-        if action == "unsuspend":
-            for c in params["cards"]:
-                if c in self.cards:
-                    self.cards[c]["queue"] = 0 if self.cards[c]["type"] == 0 else 2
-            return None
-        return None
-
-
-fake = FakeAnki()
-backend.anki = fake
+native = NativeData(backend)
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")  # keep the SPA mount away
 
 NOTE = """# 胸部
@@ -265,7 +189,7 @@ async def main():
         print("== 1. gated middle segment does NOT block the file (option B) ==")
         # a card made TODAY on s2 → s2 flips active + gated (pool, suspended)
         nid2 = nid_for(0)
-        fake.add_pool_card(nid2)
+        native.add_pool_card(nid2)
         backend._reading_record_card({"path": A_PATH, "chunk_key": k2}, nid2)
         check("s2 flipped to active by card creation",
               _seg(A_PATH, k2)["status"] == "active")
@@ -300,24 +224,21 @@ async def main():
         # simulate the Anki-day rollover: the note id becomes an EARLIER day
         # so auto_release_pool (runs at reading/start) releases the card.
         nid2y = nid_for(2)
-        for ci in fake.cards.values():
-            if ci["note"] == nid2:
-                ci["note"] = nid2y
-        fake.notes[nid2y] = fake.notes.pop(nid2)
+        native.age_note(nid2, nid2y)
         _set_seg(A_PATH, k2, cards_created=[nid2y])
         r = await c.post("/api/reading/start?mode=daily")
         dealt = _deal_keys(r)
         check("released s2 resurfaces (phase 0 active-first)", k2 in dealt, str(dealt))
         check("pool card auto-released to 2026 unsuspended",
               all(ci["deckName"] == "2026" and ci["queue"] == 0
-                  for ci in fake.cards.values() if ci["note"] == nid2y))
+                  for ci in native.cards.values() if ci["note"] == nid2y))
         await c.post("/api/reading/finish")
 
         print("== 4. all-gated file: frontier None + gated_frontier chip ==")
         # a NEW today-card on s2 → gated again; then finish off s1 + s3 so
         # the gated s2 is the only live segment left in the file.
-        nid2b = nid_for(0)
-        fake.add_pool_card(nid2b)
+        nid2b = nid_for(0) + 1
+        native.add_pool_card(nid2b)
         _set_seg(A_PATH, k2, cards_created=[nid2b])
         r = await c.post("/api/reading/start?mode=daily")
         check("round dealt {s1, s3} (two-slot; gated s2 skipped)",
@@ -394,7 +315,7 @@ async def main():
         backend._reading_record_card(
             {"path": C_PATH, "chunk_key": str(sel_c)}, nid2y)  # released card
         nid_c = nid_for(0)
-        fake.add_pool_card(nid_c)
+        native.add_pool_card(nid_c)
         _set_seg(C_PATH, bg_c, cards_created=[nid_c])
         r = await c.post("/api/reading/act",
                          params={"path": C_PATH, "chunk_key": str(bg_c),
@@ -421,9 +342,20 @@ async def main():
 
         await c.post("/api/reading/finish")
 
+    # Validate the released card through the real v3/FSRS answer path, after
+    # all original dealing/gating assertions so scheduling cannot alter them.
+    released = next(cid for cid, info in native.cards.items() if info['note'] == nid2y)
+    check('native FSRS configured', native.native(lambda col: col.get_config('fsrs')) is True)
+    answered = await backend.anki('answerCards', {'answers': [{'cardId': released, 'ease': 3}]})
+    check('released card answered by native scheduler', answered == [True])
+    check('native FSRS memory state persisted', native.native(
+        lambda col: col.get_card(released).memory_state) is not None)
+    check('native revlog records release review', native.native(
+        lambda col: col.db.scalar('select count(*) from revlog where cid=?', released)) == 1)
+
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_closed(backend, main()))

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Focused 1280x800 desktop check for the 2026-09-27 redesign.
-Spawns a throwaway backend on :8906 (dead AnkiConnect, isolated state/corpus,
+Spawns a throwaway backend on an allocated loopback port (isolated native engine, isolated state/corpus,
 preview OFF), seeds a reading file, drives the round, and asserts:
   - action bar is sticky and inside the viewport on a tall card
   - content column ~620px, note column wider than old 448px
@@ -30,28 +30,38 @@ def api(p, m="GET", b=None):
 
 NOTE = "# 颈部\n\n## 一、浅层结构\n\n" + ("皮肤薄，移动性大。浅筋膜内含颈阔肌。" * 30) + "\n"
 
+from native_fixture import configure, tempdir, run_closed, NativeData, reserve_loopback_port, verify_server, cleanup_after
+
+@cleanup_after
 def main():
-    state = tempfile.mkdtemp(prefix="desktop-state-")
-    notes = Path(tempfile.mkdtemp(prefix="desktop-notes-"))
+    state = tempdir(prefix="desktop-state-")
+    notes = Path(tempdir(prefix="desktop-notes-"))
     (notes/"2026").mkdir(parents=True)
     (notes/"2026"/"颈部.md").write_text(NOTE, encoding="utf-8")
     env = dict(os.environ)
     env.update({
         "ANKI_STATE_DIR": state, "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1", "ANKI_PREVIEW_MODE": "0",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",
+
         "ANKI_DAILY_READ": "4",
-        "REVIEW_DIST_DIR": str(REPO/"frontend"/"dist"),
+        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO/"frontend"/"dist")),
     })
+    configure(env)
+    global BASE
+    server_port = reserve_loopback_port()
+    BASE = f'http://127.0.0.1:{server_port}'
     proc = subprocess.Popen([sys.executable, "-m", "uvicorn", "--app-dir",
-        str(REPO/"backend"), "app:app", "--host", "127.0.0.1", "--port", "8906"],
+        str(REPO/"backend"), "app:app", "--host", "127.0.0.1", "--port", str(server_port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
+        verify_server(proc, BASE)
         run()
     finally:
         proc.send_signal(signal.SIGTERM)
         try: proc.wait(timeout=10)
-        except subprocess.TimeoutExpired: proc.kill()
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
@@ -129,7 +139,7 @@ def run():
         check("相关卡片 tab switches pane",
               page.locator(".note-column .related-panel").count()==1)
 
-        page.screenshot(path="/tmp/desktop-1280.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "desktop-1280.png"))
 
         # --- unified at 1920 too (user's main display): still two columns ---
         page.set_viewport_size({"width": 1920, "height": 1200})
@@ -138,7 +148,7 @@ def run():
               page.locator(".related-column").count()==0)
         check("1920: SidePanelTabs still the side column",
               page.locator(".note-column .side-panel-tabs").count()==1)
-        page.screenshot(path="/tmp/desktop-1920.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "desktop-1920.png"))
 
         check("no JS errors", not errs, errs[:2])
         b.close()

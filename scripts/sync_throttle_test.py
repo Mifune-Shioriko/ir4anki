@@ -11,7 +11,18 @@ import os
 import sys
 import tempfile
 
-os.environ["ANKI_STATE_DIR"] = tempfile.mkdtemp(prefix="ir4anki-throttle-")
+# Retained connect-specific protocol/fault coverage: transport serialization,
+# burst coalescing and cooldown timing require controlled latency/counts.
+from native_fixture import tempdir
+os.environ['ANKI_BACKEND'] = 'connect'
+os.environ['ANKI_NOTES_DIR'] = tempdir(prefix='throttle-corpus-')
+os.environ['ANKI_MEDIA_DIR'] = tempdir(prefix='throttle-media-')
+os.environ['ANKI_BACKUP_DIR'] = tempdir(prefix='throttle-backups-')
+for key in list(os.environ):
+    if key.startswith('ANKI_SYNC_'):
+        os.environ.pop(key)
+os.environ["ANKI_STATE_DIR"] = tempdir(prefix="ir4anki-throttle-")
+print('fixture backend=connect coverage=protocol/fault-injection (intentional)')
 os.environ["ANKI_SYNC_MIN_INTERVAL"] = "0.5"
 os.environ["ANKICONNECT_URL"] = "http://127.0.0.1:18765"  # dead
 

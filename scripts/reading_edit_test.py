@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Tests for reading-mode segment edit + note-image routes (P5, 2026-09-23).
 
-Same harness pattern as reading_test.py: real FastAPI app against a FAKE
-AnkiConnect and TEMPORARY corpus/state — the live app, ~/anki-notes and
+Same harness pattern as reading_test.py: real FastAPI app against a real isolated
+pylib collection and TEMPORARY corpus/state — the live app, ~/anki-notes and
 the real reading.db are untouched.
 
 Covers /api/reading/edit:
@@ -33,8 +33,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="edit-test-state-")
-NOTES = Path(tempfile.mkdtemp(prefix="edit-test-notes-"))
+from native_fixture import configure, tempdir, run_closed, NativeData
+
+STATE = tempdir(prefix="edit-test-state-")
+NOTES = Path(tempdir(prefix="edit-test-notes-"))
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_NOTES_DIR"] = str(NOTES)
 os.environ["ANKI_PREVIEW_MODE"] = "1"
@@ -45,6 +47,7 @@ os.environ["ANKI_FOCUS_READ"] = "5"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
+configure()
 import app as backend  # noqa: E402
 
 PASS = 0
@@ -61,22 +64,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-class FakeAnki:
-    """Minimal fake: only the actions the edit/media paths can touch."""
-    def __init__(self):
-        self.next_note = 900001
-
-    async def __call__(self, action, params=None, timeout=30):
-        if action == "addNotes":
-            nid = self.next_note
-            self.next_note += 1
-            return [nid]
-        if action in ("findCards", "notesInfo", "cardsInfo"):
-            return []
-        return None
-
-
-backend.anki = FakeAnki()
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")  # keep the SPA mount away
 
 NOTE_A = """# 颈部
@@ -395,5 +382,5 @@ def gate_off_check():
 print("== 0. gate OFF ==")
 gate_off_check()
 print("== main suite ==")
-rc = asyncio.run(main())
+rc = asyncio.run(run_closed(backend, main()))
 sys.exit(rc)

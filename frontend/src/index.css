@@ -2524,3 +2524,66 @@ a:focus-visible,
     min-height: 120px;
   }
 }
+
+.card-md-editor { height: 240px; border: 1px solid var(--md-sys-color-outline-variant); border-radius: 8px; overflow: hidden; }
+.card-md-preview { max-height: 240px; overflow: auto; padding: 12px; }
+.sync-confirm { background: var(--md-sys-color-surface-container-high); border-radius: 12px; padding: 16px; margin-top: 16px; }
+.rating-interval { margin-left: 8px; font-size: 12px; }
+
+.flow-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
+/* Independent server-coordinated reading/review progress. */
+.nav-rail__footer { position: fixed; right: 20px; bottom: 16px; gap: 20px; padding: 8px 12px 24px; border-radius: 16px; background: var(--md-sys-color-surface-container); z-index: 3; }
+.progress-ring__label { position: absolute; top: 66px; width: 100%; text-align: center; font-size: 12px; }
+.progress-ring--reading .progress-ring__arc { stroke: #006a60; }
+.progress-ring--review .progress-ring__arc { stroke: var(--md-sys-color-primary); }
+/* Same visible cloze language for native template, legacy and Markdown. */
+.card-content .cloze, .card-md-preview .cloze, .cloze-preview .cloze {
+  background: #fff19b; color: #332d00;
+  border-radius: 4px; padding: .05em .25em; font-weight: 600;
+  box-decoration-break: clone; -webkit-box-decoration-break: clone;
+}
+.edit-fields { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; }
+.edit-fields .field-group, .markdown-field { min-width: 0; }
+/* Reserve the same preview slot when empty, typed into or cleared. Fixed
+ * scroll regions also keep the centered dialog stationary for long cards. */
+.edit-dialog .card-md-editor { height: clamp(88px, 12vh, 120px); }
+/* .note-body's flex:1 has a zero basis in the legacy column flexbox,
+ * overriding height. Use the reserved height as an inflexible basis instead. */
+.edit-dialog .card-md-preview { flex: none; height: 96px; min-height: 96px; max-height: 96px; overflow: auto; overflow-wrap: anywhere; }
+.edit-dialog .rich-field { height: clamp(88px, 12vh, 120px); min-height: 88px; }
+.edit-dialog .cloze-preview-box { flex: none; height: 96px; min-height: 96px; max-height: 96px; overflow-y: auto; }
+/* Keep ordinal controls in one reserved row, including when empty. More
+ * ordinals scroll horizontally rather than wrapping and moving previews. */
+.edit-dialog .cloze-ordinals { flex: none; height: 40px; min-height: 40px; max-height: 40px; flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden; }
+.edit-dialog .cloze-ordinals md-text-button { flex: none; height: 40px; }
+@media (max-width: 700px) {
+  .edit-fields { grid-template-columns: minmax(0, 1fr); }
+  .nav-rail__footer { right: 8px; bottom: 80px; gap: 10px; }
+}
+
+.dark .progress-ring--reading .progress-ring__arc { stroke: #7bd8c9; }
+.dark .card-content .cloze, .dark .card-md-preview .cloze, .dark .cloze-preview .cloze { background: #665900; color: #fff4a6; }
+
+/* Authoring: M3 Expressive action grouping and outlined supporting content.
+ * Gaps/radii below are local density choices, not Expressive spec dimensions.
+ * Keep the existing compact source / fixed preview / ordinal reservations. */
+.edit-dialog .markdown-field { display: flex; flex-direction: column; gap: 8px; }
+.edit-dialog .edit-toolbar { align-self: flex-start; width: max-content; max-width: 100%; flex-wrap: nowrap; padding: 4px; gap: 0; border-radius: 24px; }
+.edit-dialog .authoring-tool-group { display: flex; align-items: center; flex: none; gap: 0; }
+.edit-dialog .edit-toolbar md-icon-button { flex: none; width: 48px; height: 48px; --md-icon-button-state-layer-width: 48px; --md-icon-button-state-layer-height: 48px; }
+.edit-dialog .tool-sep { flex: none; margin: 0 4px; }
+.edit-dialog .authoring-preview { min-width: 0; border: 1px solid var(--md-sys-color-outline); border-radius: 12px; overflow: hidden; background: var(--md-sys-color-surface); color: var(--md-sys-color-on-surface); }
+.edit-dialog .authoring-preview-label { padding: 8px 12px 0; margin: 0; color: var(--md-sys-color-on-surface-variant); }
+.edit-dialog .cloze-preview-box { border: 0; border-radius: 0; background: transparent; }
+.edit-dialog .cloze-preview { margin: 0; }
+.edit-dialog .tags-section { border-top: 1px solid var(--md-sys-color-outline-variant); padding-top: 16px; gap: 8px; }
+.edit-dialog .edit-hint { margin: 0; }
+.edit-dialog .card-md-editor:focus-within { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; }
+.edit-dialog .authoring-toolbar-shell { container: authoring-tools / inline-size; min-width: 0; width: 100%; }
+.edit-dialog .authoring-overflow { display: none; }
+.edit-dialog .authoring-menu { --md-menu-item-one-line-container-height: 48px; }
+@container authoring-tools (max-width: 399px) {
+  .edit-dialog .authoring-secondary { display: none; }
+  .edit-dialog .authoring-overflow { display: inline-flex; }
+}

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Playwright UI verification of reading mode (渐进制卡, 2026-09-19).
 
-SELF-CONTAINED: spawns a throwaway uvicorn on :8902 with an isolated
-ANKI_STATE_DIR, a temporary markdown corpus (ANKI_NOTES_DIR) and a DEAD
-AnkiConnect URL (127.0.0.1:18765) — the live app (:8901), the live state
+SELF-CONTAINED: spawns a throwaway uvicorn on an allocated loopback port with an isolated
+ANKI_STATE_DIR, a temporary markdown corpus (ANKI_NOTES_DIR) and a real isolated pylib
+collection — the live app (:8901), the live state
 dir, the real collection and ~/anki-notes are all untouched. Preview mode
 is OFF so the funnel is reading → review and no release-budget logic mixes
 in.
@@ -21,12 +21,12 @@ NAV RAIL + progress RING + 文件 browser):
      renders the file with anchors; progress RING in the rail footer
   6. 制卡完成 works straight from 未读 (no active gate); complete advances
   7. refresh mid-round resumes the same chunk
-  8. cloze dialog opens (添加挖空 icon) and degrades gracefully with dead
-     AnkiConnect (error shown, closable)
+  8. cloze dialog opens (添加挖空 icon) and degrades gracefully with focused
+     HTTP failure injection (error shown, closable)
   9. narrow viewport: no right column during reading
  10. draining the reading round AUTO-CHAINS into the next stage (no
-     readingDone stats page; the chain's deal fails against the dead
-     AnkiConnect, proving the transition fired)
+     readingDone stats page; the chain's deal fails against a focused
+     injected HTTP error, proving the transition fired)
  11. backend state after the chain: reading round no longer active; list
      progress updated (1 segment per file)
 
@@ -112,9 +112,12 @@ NOTE_B = """# 上肢
 """
 
 
+from native_fixture import configure, tempdir, run_closed, NativeData, reserve_loopback_port, verify_server, cleanup_after
+
+@cleanup_after
 def main():
-    state = tempfile.mkdtemp(prefix="reading-ui-state-")
-    notes = Path(tempfile.mkdtemp(prefix="reading-ui-notes-"))
+    state = tempdir(prefix="reading-ui-state-")
+    notes = Path(tempdir(prefix="reading-ui-notes-"))
     (notes / "2026" / "解剖").mkdir(parents=True)
     (notes / "2026" / "解剖" / "颈部.md").write_text(NOTE_A, encoding="utf-8")
     (notes / "2026" / "解剖" / "上肢.md").write_text(NOTE_B, encoding="utf-8")
@@ -125,17 +128,22 @@ def main():
         "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
+
         "ANKI_DAILY_READ": "4",
-        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
+        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO_ROOT / "frontend" / "dist")),
     })
+    configure(env)
+    global BASE
+    server_port = reserve_loopback_port()
+    BASE = f'http://127.0.0.1:{server_port}'
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn",
          "--app-dir", str(REPO_ROOT / "backend"),
-         "app:app", "--host", "127.0.0.1", "--port", "8902"],
+         "app:app", "--host", "127.0.0.1", "--port", str(server_port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
+        verify_server(proc, BASE)
         run(state)
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -143,13 +151,14 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
 
 def run(state):
     st = wait_ready()
-    check("backend up on :8902", st.get("anki") in ("ok", "error"), st)
+    check("backend up on an allocated loopback port", st.get("anki") in ("ok", "error"), st)
     rs = api("/api/reading/status")
     check("reading flag on + isolated empty list",
           rs.get("reading_mode") is True and rs.get("list") == [], rs)
@@ -167,7 +176,7 @@ def run(state):
         # ---- 1. nav rail (round 3): three destinations, old top bar gone ----
         page.wait_for_selector(".nav-rail", timeout=30000)
         items = page.locator(".nav-rail__item")
-        check("nav rail renders 3 destinations", items.count() == 3, items.count())
+        check("native nav rail renders study/files/reading plus engine", items.count() == 4, items.count())
         rail_text = page.locator(".nav-rail").inner_text()
         check("rail labels 学习/文件/阅读清单",
               "学习" in rail_text and "文件" in rail_text and "阅读清单" in rail_text,
@@ -195,6 +204,13 @@ def run(state):
               page.locator(".files-viewer-empty").count() == 1)
         page.locator(".files-tree-file", has_text="颈部").click()
         page.wait_for_selector(".files-viewer-body", timeout=15000)
+        # The body mounts before the async markdown renderer finishes. Waiting
+        # for the container alone races the content (screenshot later is fine).
+        page.wait_for_function("""() => {
+          const v = document.querySelector('.files-viewer-body');
+          return v && v.querySelectorAll('h2').length >= 2 &&
+            v.textContent.includes('颈阔肌') && v.textContent.includes('颈动脉三角');
+        }""", timeout=15000)
         viewer = page.locator(".files-viewer-body").inner_text()
         check("viewer renders the WHOLE file",
               "颈阔肌" in viewer and "颈动脉三角" in viewer, viewer[:100])
@@ -204,7 +220,7 @@ def run(state):
               "颈部" in page.locator(".files-viewer-crumb").inner_text())
         check("文件 destination now active",
               "nav-rail__item--active" in items.nth(1).get_attribute("class"))
-        page.screenshot(path="/tmp/reading-ui-files.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-files.png"))
 
         # ---- 3. 阅读清单 section: TREE picker + add + reorder ----
         items.nth(2).click()  # 阅读清单
@@ -274,7 +290,7 @@ def run(state):
         page.wait_for_timeout(700)
         first_title = page.locator(".reading-list-item__title").first.inner_text()
         check("置顶 reorders list (上肢 now first)", "上肢" in first_title, first_title)
-        page.screenshot(path="/tmp/reading-ui-list.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-list.png"))
         # back to the study funnel via the rail (the old 返回 button is gone)
         items.nth(0).click()  # 学习
         page.wait_for_selector(".screen-title", timeout=15000)
@@ -295,7 +311,7 @@ def run(state):
               "阅读" in plan and "2 段" in plan, plan)
         check("single 开始 button",
               page.locator("md-filled-button", has_text="开始").count() == 1)
-        page.screenshot(path="/tmp/reading-ui-start.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-start.png"))
 
         # ---- 4. 开始 → reading stage: WHOLE-FILE segments (no pre-chunking),
         # 上肢 first (置顶 priority). preview mode off → the chain after
@@ -338,25 +354,19 @@ def run(state):
               "腋动脉" in right and "臂前区" in right, right[:100])
         anchors = page.locator(".note-panel .note-body [data-src-line]")
         check("right panel has source anchors", anchors.count() >= 2, anchors.count())
-        # progress RING (2026-09-20): moved into the nav rail's bottom-left
-        # corner; the strip above the columns is gone entirely
-        check("progress ring rendered", page.locator(".progress-ring").count() == 1)
+        # Separate reading/review rings at the bottom-right; no round strip.
+        check("two independent progress rings rendered", page.locator(".progress-ring").count() == 2)
         check("ring lives in the nav rail footer",
-              page.locator(".nav-rail__footer .progress-ring").count() == 1)
+              page.locator(".nav-rail__footer .progress-ring").count() == 2)
         check("ring shows 0/2", "0/2" in
-              page.locator(".progress-ring__text").inner_text(),
-              page.locator(".progress-ring__text").inner_text())
+              page.locator(".progress-ring--reading .progress-ring__text").inner_text(),
+              page.locator(".progress-ring--reading .progress-ring__text").inner_text())
         check("round strip is gone", page.locator(".round-strip").count() == 0)
-        # ring really sits at the bottom of the rail (viewport bottom-left)
-        ring_box = page.locator(".progress-ring").bounding_box()
-        rail_box = page.locator(".nav-rail").bounding_box()
-        check("ring near rail bottom (within 120px of rail bottom edge)",
-              rail_box["y"] + rail_box["height"] - (ring_box["y"] + ring_box["height"]) < 120,
-              f"rail={rail_box} ring={ring_box}")
-        check("ring inside rail's horizontal bounds",
-              ring_box["x"] >= rail_box["x"] and
-              ring_box["x"] + ring_box["width"] <= rail_box["x"] + rail_box["width"] + 1,
-              f"rail={rail_box} ring={ring_box}")
+        # Progress is pinned at viewport bottom-right, with separate labels.
+        ring_box = page.get_by_role('progressbar', name='阅读', exact=True).bounding_box()
+        viewport = page.viewport_size
+        check("reading ring near viewport bottom-right", ring_box['x'] >= viewport['width']-220 and ring_box['y'] >= viewport['height']-140, ring_box)
+        check("review ring independently labelled", page.get_by_role('progressbar',name='复习',exact=True).count()==1)
         # top-edge alignment: card box and the right column's topmost box
         # share the same top (2026-09-27: the right column in the
         # two-column band is SidePanelTabs — its tab strip is the top box)
@@ -367,7 +377,7 @@ def run(state):
         note_top = page.locator(note_sel).first.bounding_box()["y"]
         check("card/note top edges aligned (mid-round)", abs(card_top - note_top) <= 2,
               f"card_top={card_top} note_top={note_top}")
-        page.screenshot(path="/tmp/reading-ui-card.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-card.png"))
 
         # ---- 5. 制卡完成 straight from 未读 (no active gate) ----
         page.locator("md-filled-button", has_text="制卡完成").click()
@@ -375,8 +385,8 @@ def run(state):
         crumb2 = page.locator(".reading-crumb").inner_text()
         check("complete from todo advances to 颈部 一", "颈部" in crumb2, crumb2)
         check("progress ring shows 1/2",
-              "1/2" in page.locator(".progress-ring__text").inner_text(),
-              page.locator(".progress-ring__text").inner_text())
+              "1/2" in page.locator(".progress-ring--reading .progress-ring__text").inner_text(),
+              page.locator(".progress-ring--reading .progress-ring__text").inner_text())
 
         # ---- 6. refresh resumes the round on the pending chunk ----
         page.reload(wait_until="networkidle")
@@ -385,9 +395,15 @@ def run(state):
               "颈部" in page.locator(".reading-crumb").inner_text(),
               page.locator(".reading-crumb").inner_text())
         check("reload keeps progress 1/2",
-              "1/2" in page.locator(".progress-ring__text").inner_text())
+              "1/2" in page.locator(".progress-ring--reading .progress-ring__text").inner_text())
 
-        # ---- 7. cloze dialog opens; dead AnkiConnect → graceful error ----
+        # The real model endpoint must work before the focused UI failure case.
+        model_info = api('/api/card/add/info?kind=cloze')
+        check('native Cloze model fields', model_info.get('fields') == ['文字', '背面额外'], model_info)
+        # Preserve legacy degraded-dialog assertions through one explicit HTTP fault.
+        page.route('**/api/card/add/info*', lambda route: route.fulfill(
+            status=500, content_type='application/json', body='{"detail":"injected model failure"}'))
+        # ---- 7. cloze dialog opens; focused API failure → graceful error ----
         page.locator('.card-header-actions md-icon-button[data-aria-label="添加挖空"]').click()
         page.wait_for_selector(".cloze-dialog", timeout=15000)
         check("cloze dialog headline",
@@ -396,17 +412,18 @@ def run(state):
         dlg_text = page.locator(".cloze-dialog").inner_text()
         check("cloze dialog degrades gracefully (error, no crash)",
               "HTTP 500" in dlg_text or "加载失败" in dlg_text
-              or "后端响应异常" in dlg_text or "失败" in dlg_text, dlg_text[:200])
+              or "后端响应异常" in dlg_text or "失败" in dlg_text or "injected model failure" in dlg_text, dlg_text[:200])
         check("cloze dialog falls back to 文字 field",
               "挖空正文" in dlg_text, dlg_text[:200])
         check("cloze toolbar renders (挖空选中 / 取消挖空)",
               "挖空选中" in dlg_text and "取消挖空" in dlg_text)
         check("cloze preview columns render",
               "正面（提问）" in dlg_text and "背面（答案）" in dlg_text)
-        page.screenshot(path="/tmp/reading-ui-cloze.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-cloze.png"))
         page.locator(".cloze-dialog md-text-button", has_text="取消").last.click()
         page.wait_for_timeout(500)
         check("cloze dialog closes", page.locator(".cloze-dialog").count() == 0)
+        page.unroute("**/api/card/add/info*")
         check("still on the same chunk after closing dialog",
               "颈部" in page.locator(".reading-crumb").inner_text())
 
@@ -418,22 +435,23 @@ def run(state):
         check("narrow: NO right column",
               page.locator(".note-column").count() == 0,
               page.locator(".note-column").count())
-        page.screenshot(path="/tmp/reading-ui-narrow.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-narrow.png"))
         page.set_viewport_size({"width": 1280, "height": 900})
         page.wait_for_timeout(300)
 
         # ---- 9. skip the last chunk → round drains → AUTO-CHAIN into the
-        # next stage (2026-09-24: no readingDone stats page). preview off →
-        # the chain lands on the review deal, which fails against the dead
-        # AnkiConnect — the error screen PROVES the chain fired.
+        # next phase via the persisted coordinator. A focused state-fetch
+        # failure verifies recovery UI without redealing either queue.
+        page.route('**/api/flow/state*', lambda route: route.fulfill(
+            status=500, content_type='application/json', body='{"detail":"injected state failure"}'))
         page.locator("md-text-button", has_text="无需制卡，跳过").click()
         page.wait_for_function(
             "() => document.body.textContent.includes('加载失败')", timeout=20000)
-        check("reading drained → chained into review stage (load error vs dead Anki)",
+        check("reading drained → chained into review stage (focused state error)",
               page.locator(".screen-title", has_text="阅读完成").count() == 0)
-        page.screenshot(path="/tmp/reading-ui-chain.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-chain.png"))
 
-        # ---- 10. backend state: round cleared by the chain's finish ----
+        # ---- 10. backend state: reading queue drained, completed tombstone retained ----
         r = api("/api/reading/state")
         rd_state = r.get("round")
         check("reading round no longer active",

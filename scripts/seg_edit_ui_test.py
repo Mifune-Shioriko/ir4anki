@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Playwright E2E: 片段编辑器 + note images (user spec 2026-09-23, P5).
 
-SELF-CONTAINED: spawns a throwaway uvicorn on :8903 with an isolated
-ANKI_STATE_DIR, a temporary markdown corpus (ANKI_NOTES_DIR) and a DEAD
-AnkiConnect URL — the live app (:8901), the live state dir, the real
+SELF-CONTAINED: spawns a throwaway uvicorn on an allocated loopback port with an isolated
+ANKI_STATE_DIR, a temporary markdown corpus (ANKI_NOTES_DIR) and a real isolated pylib
+collection URL — the live app (:8901), the live state dir, the real
 collection and ~/anki-notes are all untouched.
 
 Covers (round + trace reading card 编辑片段 pencil → SegEditDialog):
@@ -327,9 +327,12 @@ def run(notes: Path):
         browser.close()
 
 
+from native_fixture import configure, tempdir, run_closed, NativeData, reserve_loopback_port, verify_server, cleanup_after
+
+@cleanup_after
 def main():
-    state = tempfile.mkdtemp(prefix="seg-edit-state-")
-    notes = Path(tempfile.mkdtemp(prefix="seg-edit-notes-"))
+    state = tempdir(prefix="seg-edit-state-")
+    notes = Path(tempdir(prefix="seg-edit-notes-"))
     (notes / "2026" / "解剖").mkdir(parents=True)
     (notes / A_REL).write_text(NOTE_A, encoding="utf-8")
 
@@ -339,21 +342,26 @@ def main():
         "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
+
         "ANKI_QUICK_READ": "2",
         "ANKI_FOCUS_READ": "5",
-        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
+        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO_ROOT / "frontend" / "dist")),
     })
-    py = REPO_ROOT / "backend" / ".venv" / "bin" / "python"
+    py = Path(sys.executable)  # use the test venv, never install into live venv
+    configure(env)
+    global BASE
+    server_port = reserve_loopback_port()
+    BASE = f'http://127.0.0.1:{server_port}'
     proc = subprocess.Popen(
         [str(py), "-m", "uvicorn",
          "--app-dir", str(REPO_ROOT / "backend"),
-         "app:app", "--host", "127.0.0.1", "--port", "8903"],
+         "app:app", "--host", "127.0.0.1", "--port", str(server_port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
+        verify_server(proc, BASE)
         st = wait_ready()
-        check("backend up on :8903", st.get("anki") in ("ok", "error"), st)
+        check("backend up on an allocated loopback port", st.get("anki") in ("ok", "error"), st)
         run(notes)
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -361,6 +369,7 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

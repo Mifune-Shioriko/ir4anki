@@ -2,8 +2,8 @@
 """Verify the flat side-panel redesign (user spec 2026-09-27, updated for
 the 2026-09-29 bounded-sidebar + no-header-row pass).
 
-Spawns a throwaway uvicorn on :8905 (isolated ANKI_STATE_DIR + temp corpus,
-dead AnkiConnect) serving the REAL frontend/dist build, then drives it with
+Spawns a throwaway uvicorn on an allocated loopback port (isolated ANKI_STATE_DIR + temp corpus,
+isolated native engine) serving the REAL frontend/dist build, then drives it with
 Playwright at 1920x1200 dark mode (the user's display) and asserts:
 
   right column (笔记 + 相关卡片 tabs, 统一双栏 2026-09-27 round 2):
@@ -91,9 +91,12 @@ NOTE_A = """# 颈部
 """
 
 
+from native_fixture import configure, tempdir, run_closed, NativeData, reserve_loopback_port, verify_server, cleanup_after
+
+@cleanup_after
 def main():
-    state = tempfile.mkdtemp(prefix="flat-ui-state-")
-    notes = Path(tempfile.mkdtemp(prefix="flat-ui-notes-"))
+    state = tempdir(prefix="flat-ui-state-")
+    notes = Path(tempdir(prefix="flat-ui-notes-"))
     (notes / "2026" / "解剖").mkdir(parents=True)
     (notes / "2026" / "解剖" / "颈部.md").write_text(NOTE_A, encoding="utf-8")
 
@@ -103,17 +106,22 @@ def main():
         "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
-        "ANKICONNECT_URL": "http://127.0.0.1:18765",  # dead — never touch live
+
         "ANKI_DAILY_READ": "4",
-        "REVIEW_DIST_DIR": str(REPO_ROOT / "frontend" / "dist"),
+        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO_ROOT / "frontend" / "dist")),
     })
+    configure(env)
+    global BASE
+    server_port = reserve_loopback_port()
+    BASE = f'http://127.0.0.1:{server_port}'
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn",
          "--app-dir", str(REPO_ROOT / "backend"),
-         "app:app", "--host", "127.0.0.1", "--port", "8905"],
+         "app:app", "--host", "127.0.0.1", "--port", str(server_port)],
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     try:
+        verify_server(proc, BASE)
         run()
     finally:
         proc.send_signal(signal.SIGTERM)
@@ -121,13 +129,14 @@ def main():
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             proc.kill()
+            proc.wait()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
 
 def run():
     st = wait_ready()
-    check("backend up on :8905", st.get("anki") in ("ok", "error"), st)
+    check("backend up on an allocated loopback port", st.get("anki") in ("ok", "error"), st)
 
     # seed the reading list (whole-file seeding, escape-hatch API)
     r = api("/api/reading/list/add", "POST",
@@ -151,7 +160,7 @@ def run():
         # (the 1500px three-column path is retired)
         page.wait_for_selector(".note-column .side-panel-tabs", timeout=10000)
         page.wait_for_timeout(800)
-        page.screenshot(path="/tmp/flat-ui-wide.png")
+        page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "flat-ui-wide.png"))
         check("L0 no separate related column (three-col retired)",
               page.locator(".related-column").count() == 0)
 

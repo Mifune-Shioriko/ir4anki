@@ -1,217 +1,131 @@
 #!/usr/bin/env bash
-# ir4anki installer — backend venv + frontend build + config + systemd user
-# service. Debian/Ubuntu-style Linux; requires a RUNNING desktop Anki with
-# the AnkiConnect add-on (code 2055492159).
-#
-# Usage:
-#   bash deploy/install.sh                # interactive (prompts have defaults)
-#   bash deploy/install.sh --non-interactive   # accept all defaults
-#   bash deploy/install.sh --no-service   # build + config only, no systemd
+# New installs use official pylib; --backend connect keeps the rollback path.
+# Existing env files are retained. Run this script yourself for machine changes.
 set -euo pipefail
-
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$HOME/.config/ir4anki.env"
 UNIT_FILE="$HOME/.config/systemd/user/ir4anki.service"
-DEFAULT_STATE_DIR="$HOME/.local/state/ir4anki"
-
 INTERACTIVE=1
 WANT_SERVICE=1
-for arg in "$@"; do
-    case "$arg" in
+ANKI_BACKEND=pylib
+COLLECTION_ARG=""
+while [ "$#" -gt 0 ]; do
+    case "$1" in
         --non-interactive) INTERACTIVE=0 ;;
         --no-service) WANT_SERVICE=0 ;;
-        *) echo "unknown flag: $arg" >&2; exit 2 ;;
+        --backend) [ "$#" -ge 2 ] || exit 2; ANKI_BACKEND="$2"; shift ;;
+        --collection) [ "$#" -ge 2 ] || exit 2; COLLECTION_ARG="$2"; shift ;;
+        --help|-h)
+            printf '%s\n' 'Usage: bash deploy/install.sh [--backend pylib|connect] [--collection /absolute/profile/collection.anki2] [--non-interactive] [--no-service]' 'New installs default to pylib; existing environment files are NEVER overwritten.' 'Close desktop Anki before native ownership; configure sync credentials locally.'
+            exit 0 ;;
+        *) printf 'Unknown flag: %s\n' "$1" >&2; exit 2 ;;
     esac
+    shift
 done
-
-say()  { printf '\n\033[1;35m== %s\033[0m\n' "$*"; }
-warn() { printf '\033[1;33mWARN: %s\033[0m\n' "$*"; }
-die()  { printf '\033[1;31mERROR: %s\033[0m\n' "$*" >&2; exit 1; }
-
-# ask PROMPT VAR DEFAULT — read a line into VAR (DEFAULT when non-interactive
-# or empty input)
+[ "$ANKI_BACKEND" = pylib ] || [ "$ANKI_BACKEND" = connect ] || { printf 'backend must be pylib or connect\n' >&2; exit 2; }
+say() { printf '\n== %s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 ask() {
-    local prompt="$1" varname="$2" default="$3" line=""
-    if [ "$INTERACTIVE" -eq 1 ]; then
-        printf '%s [%s]: ' "$prompt" "$default"
-        read -r line || true
-    fi
-    if [ -n "$line" ]; then
-        printf -v "$varname" '%s' "$line"
-    else
-        printf -v "$varname" '%s' "$default"
-    fi
+    local prompt="$1" variable="$2" default="$3" line=""
+    if [ "$INTERACTIVE" -eq 1 ]; then printf '%s [%s]: ' "$prompt" "$default"; read -r line || true; fi
+    printf -v "$variable" '%s' "${line:-$default}"
 }
-
-say "ir4anki installer"
-echo "repo: $REPO"
-
-# ---- 1/6 prerequisites ------------------------------------------------------
-say "1/6 prerequisites"
-command -v python3 >/dev/null 2>&1 || die "python3 not found (need >= 3.10)"
-python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
-    || die "python3 is $(python3 -c 'import sys;print(sys.version.split()[0])'), need >= 3.10"
-echo "python3 ok ($(python3 -c 'import sys;print(sys.version.split()[0])'))"
-
-command -v node >/dev/null 2>&1 || die "node not found (need >= 18; install e.g. 'apt install nodejs npm')"
-NODE_MAJOR="$(node --version | sed 's/^v\([0-9]*\).*/\1/')"
-[ "$NODE_MAJOR" -ge 18 ] || die "node $(node --version), need >= 18"
-command -v npm >/dev/null 2>&1 || die "npm not found"
-echo "node ok ($(node --version))"
-
-# ---- 2/6 backend venv ---------------------------------------------------------
-say "2/6 backend venv + dependencies"
+say 'Prerequisites'
+command -v python3 >/dev/null || die 'Python >=3.10 required'
+python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' || die 'Python >=3.10 required'
+command -v node >/dev/null || die 'Node >=18 required'
+node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 18 ? 0 : 1)' || die 'Node >=18 required'
+command -v npm >/dev/null || die 'npm required'
+say 'Backend dependencies (official anki==25.2.7)'
 VENV="$REPO/backend/.venv"
-if command -v uv >/dev/null 2>&1; then
+if command -v uv >/dev/null; then
     [ -d "$VENV" ] || uv venv "$VENV" --python python3
-    uv pip install --python "$VENV/bin/python" -r "$REPO/backend/requirements.txt"
+    uv pip install --python "$VENV/bin/python" --index-url https://pypi.org/simple -r "$REPO/backend/requirements.txt"
 else
     [ -d "$VENV" ] || python3 -m venv "$VENV"
-    "$VENV/bin/pip" install --upgrade pip >/dev/null
-    "$VENV/bin/pip" install -r "$REPO/backend/requirements.txt"
+    "$VENV/bin/python" -m pip install --index-url https://pypi.org/simple -r "$REPO/backend/requirements.txt"
 fi
-"$VENV/bin/python" -c 'import fastapi, httpx, uvicorn' || die "backend deps broken"
-echo "backend deps ok"
-
-# ---- 3/6 frontend build --------------------------------------------------------
-say "3/6 frontend build (npm ci + vite build)"
-cd "$REPO/frontend"
-npm ci
-npm run build
-[ -f "$REPO/frontend/dist/index.html" ] || die "frontend build produced no dist/index.html"
-echo "frontend dist ok"
-cd "$REPO"
-
-# ---- 4/6 config -------------------------------------------------------------------
-say "4/6 config (~/.config/ir4anki.env)"
+"$VENV/bin/python" -c 'import fastapi,httpx,uvicorn; from importlib.metadata import version; assert tuple(map(int,version("anki").split(".")))==(25,2,7)' || die 'Pinned backend dependencies failed'
+say 'Machine-local config'
 if [ -f "$ENV_FILE" ]; then
-    echo "exists — keeping it untouched (edit by hand, then: systemctl --user restart ir4anki)"
+    printf 'Keeping existing %s unchanged. Backend selection flags do not rewrite it.\n' "$ENV_FILE"
 else
-    # detect Anki profiles with a collection.media dir
-    MEDIA_DEFAULT=""
-    ANKI2_BASE="$HOME/.local/share/Anki2"
-    if [ -d "$ANKI2_BASE" ]; then
-        # first profile that looks real (has collection.media)
-        for d in "$ANKI2_BASE"/*/; do
-            if [ -d "$d/collection.media" ]; then
-                MEDIA_DEFAULT="${d}collection.media"
-                break
-            fi
+    PROFILES=()
+    BASE="$HOME/.local/share/Anki2"
+    if [ -d "$BASE" ]; then
+        for profile in "$BASE"/*/; do
+            [ ! -f "${profile}collection.anki2" ] || PROFILES+=("${profile}collection.anki2")
         done
-        PROFILES="$(ls -1 "$ANKI2_BASE" 2>/dev/null | tr '\n' ' ')"
-        [ -n "$PROFILES" ] && echo "Anki profiles found under $ANKI2_BASE: $PROFILES"
     fi
-    if [ -z "$MEDIA_DEFAULT" ]; then
-        MEDIA_DEFAULT="$ANKI2_BASE/User 1/collection.media"
-        warn "no Anki profile with collection.media found — using guess: $MEDIA_DEFAULT"
-    fi
-
-    ask "AnkiConnect URL" ANKICONNECT_URL "http://127.0.0.1:8765"
-    ask "collection.media dir (the profile you review in)" ANKI_MEDIA_DIR "$MEDIA_DEFAULT"
-    ask "state dir (round/quota/reading progress)" ANKI_STATE_DIR "$DEFAULT_STATE_DIR"
-    ask "notes corpus dir (markdown, for reading mode)" ANKI_NOTES_DIR "$HOME/anki-notes"
-
-    mkdir -p "$(dirname "$ENV_FILE")" "$ANKI_STATE_DIR" "$ANKI_NOTES_DIR"
-    {
-        echo "# ir4anki machine-local config — generated by deploy/install.sh on $(date -Is)"
-        echo "# every knob is documented in deploy/ir4anki.env.example"
-        echo "IR4ANKI_HOST=127.0.0.1"
-        echo "IR4ANKI_PORT=8901"
-        echo "ANKICONNECT_URL=$ANKICONNECT_URL"
-        echo "ANKI_MEDIA_DIR=$ANKI_MEDIA_DIR"
-        echo "ANKI_STATE_DIR=$ANKI_STATE_DIR"
-        echo "ANKI_NOTES_DIR=$ANKI_NOTES_DIR"
-        echo "ANKI_ROLLOVER_HOUR=4"
-        echo "ANKI_PREVIEW_MODE=1"
-        echo "ANKI_PREVIEW_DECK=预览池"
-        echo "ANKI_PREVIEW_RELEASE_DECK=2026"
-        echo "ANKI_RELEASE_DAILY_GOAL=36"
-        echo "ANKI_READING_MODE=1"
-        echo "ANKI_ADD_MODEL=问答题"
-        echo "ANKI_ADD_CLOZE_MODEL=填空题"
-    } > "$ENV_FILE"
-    echo "wrote $ENV_FILE"
-    [ -d "$ANKI_MEDIA_DIR" ] || warn "ANKI_MEDIA_DIR does not exist yet — card images will 404 until it does"
-fi
-
-# ---- 5/6 systemd user service -------------------------------------------------------
-if [ "$WANT_SERVICE" -eq 1 ]; then
-    say "5/6 systemd user service"
-    if ! command -v systemctl >/dev/null 2>&1; then
-        warn "systemctl not found — skipping service install"
-        warn "run manually: $VENV/bin/uvicorn --app-dir $REPO/backend app:app --host 127.0.0.1 --port 8901"
+    COLLECTION_DEFAULT="$COLLECTION_ARG"
+    if [ "${#PROFILES[@]}" -eq 1 ] && [ -z "$COLLECTION_DEFAULT" ]; then COLLECTION_DEFAULT="${PROFILES[0]}"; fi
+    if [ "${#PROFILES[@]}" -gt 1 ]; then printf 'Select one of these collections explicitly:\n'; printf '  %s\n' "${PROFILES[@]}"; fi
+    if [ "$ANKI_BACKEND" = pylib ]; then
+        ask 'Existing collection.anki2 (absolute path)' ANKI_COLLECTION_PATH "$COLLECTION_DEFAULT"
+        [ -n "$ANKI_COLLECTION_PATH" ] && [ -f "$ANKI_COLLECTION_PATH" ] || die 'Select an existing collection using --collection; no blank profile is created'
+        [[ "$ANKI_COLLECTION_PATH" = /* ]] || die 'Collection path must be absolute'
+        ANKI_MEDIA_DIR="${ANKI_COLLECTION_PATH%.anki2}.media"
     else
-        mkdir -p "$(dirname "$UNIT_FILE")"
-        sed "s|@REPO@|$REPO|g" "$REPO/deploy/ir4anki.service" > "$UNIT_FILE"
-        systemctl --user daemon-reload
-        systemctl --user enable ir4anki.service >/dev/null 2>&1
-        systemctl --user restart ir4anki.service
-        sleep 2
-        if systemctl --user is-active --quiet ir4anki.service; then
-            echo "service active"
-        else
-            warn "service failed to start — check: journalctl --user -u ir4anki -n 30"
-        fi
-        # services die on logout unless lingering is on
-        if command -v loginctl >/dev/null 2>&1 && ! loginctl show-user "$USER" 2>/dev/null | grep -q 'Linger=yes'; then
-            warn "user lingering is OFF: the service stops when you log out."
-            warn "to keep it running: sudo loginctl enable-linger $USER"
-        fi
+        ask 'AnkiConnect URL' ANKICONNECT_URL 'http://127.0.0.1:8765'
+        MEDIA_DEFAULT="${COLLECTION_DEFAULT%.anki2}.media"
+        [ -n "$COLLECTION_DEFAULT" ] || MEDIA_DEFAULT="$BASE/User 1/collection.media"
+        ask 'collection.media dir (absolute)' ANKI_MEDIA_DIR "$MEDIA_DEFAULT"
     fi
-else
-    say "5/6 systemd service SKIPPED (--no-service)"
-    echo "run manually: $VENV/bin/uvicorn --app-dir $REPO/backend app:app --host 127.0.0.1 --port 8901"
+    ask 'Application state dir' ANKI_STATE_DIR "$HOME/.local/state/ir4anki"
+    ask 'Markdown corpus dir' ANKI_NOTES_DIR "$HOME/anki-notes"
+    ask 'Existing QA note type' ANKI_ADD_MODEL '问答题'
+    ask 'Existing cloze note type' ANKI_ADD_CLOZE_MODEL '填空题'
+    mkdir -p "$(dirname "$ENV_FILE")" "$ANKI_STATE_DIR" "$ANKI_NOTES_DIR"
+    # Owner-run config generation, no sync passwords are requested or copied.
+    umask 077
+    {
+        printf '%s\n' '# Machine-local config. See deploy/ir4anki.env.example.' 'IR4ANKI_HOST=127.0.0.1' 'IR4ANKI_PORT=8901'
+        printf 'ANKI_BACKEND=%s\nANKI_MEDIA_DIR=%s\nANKI_STATE_DIR=%s\nANKI_NOTES_DIR=%s\n' "$ANKI_BACKEND" "$ANKI_MEDIA_DIR" "$ANKI_STATE_DIR" "$ANKI_NOTES_DIR"
+        if [ "$ANKI_BACKEND" = pylib ]; then
+            printf 'ANKI_COLLECTION_PATH=%s\nANKI_BACKUP_DIR=%s/anki-backups\nANKI_BACKUP_INTERVAL=1800\n' "$ANKI_COLLECTION_PATH" "$ANKI_STATE_DIR"
+            printf '%s\n' '# Configure ANKI_SYNC_ENDPOINT and ANKI_SYNC_HKEY (or user/password) locally.'
+        else printf 'ANKICONNECT_URL=%s\n' "$ANKICONNECT_URL"; fi
+        printf 'ANKI_ADD_MODEL=%s\nANKI_ADD_CLOZE_MODEL=%s\n' "$ANKI_ADD_MODEL" "$ANKI_ADD_CLOZE_MODEL"
+        printf '%s\n' 'ANKI_ROLLOVER_HOUR=4' 'ANKI_PREVIEW_MODE=1' 'ANKI_PREVIEW_DECK=预览池' 'ANKI_PREVIEW_RELEASE_DECK=2026' 'ANKI_RELEASE_DAILY_GOAL=36' 'ANKI_READING_MODE=1'
+    } > "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
 fi
-
-# ---- 6/6 health ---------------------------------------------------------------------------
-say "6/6 health checks"
-PORT="$(grep -E '^IR4ANKI_PORT=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)"
-PORT="${PORT:-8901}"
-HOSTURL="http://127.0.0.1:$PORT"
-if "$VENV/bin/python" - "$HOSTURL" <<'PYEOF'
-import sys, urllib.request
-try:
-    r = urllib.request.urlopen(sys.argv[1] + "/api/status", timeout=5)
-    sys.exit(0 if r.status == 200 else 1)
-except Exception:
-    sys.exit(1)
-PYEOF
-then
-    echo "backend responding: $HOSTURL/api/status"
-else
-    warn "backend not responding on $HOSTURL — if --no-service was used, start it manually first"
+# Only inspect nonsecret keys. Do NOT source the env as executable shell code.
+SELECTED_BACKEND="$(python3 - "$ENV_FILE" <<'PY'
+import sys
+from pathlib import Path
+backend='connect'
+for line in Path(sys.argv[1]).read_text().splitlines():
+    key, sep, value=line.partition('=')
+    if sep and key.strip()=='ANKI_BACKEND': backend=value.strip().strip('"').strip("'")
+if backend not in ('pylib','connect'): raise SystemExit('Invalid ANKI_BACKEND')
+print(backend)
+PY
+)"
+if [ "$SELECTED_BACKEND" = pylib ]; then
+    "$VENV/bin/python" "$REPO/deploy/native.py" check --env "$ENV_FILE" --require-offline || die 'Native preflight failed; fix paths/models and close desktop Anki'
 fi
-
-# AnkiConnect probe (non-fatal: Anki may simply be closed right now)
-ANKICONNECT="$(grep -E '^ANKICONNECT_URL=' "$ENV_FILE" 2>/dev/null | cut -d= -f2)"
-ANKICONNECT="${ANKICONNECT:-http://127.0.0.1:8765}"
-if "$VENV/bin/python" - "$ANKICONNECT" <<'PYEOF'
-import sys, json, urllib.request
-req = urllib.request.Request(
-    sys.argv[1],
-    data=json.dumps({"action": "version", "version": 6}).encode(),
-    headers={"Content-Type": "application/json"},
-)
-try:
-    r = json.loads(urllib.request.urlopen(req, timeout=3).read())
-    sys.exit(0 if r.get("result") else 1)
-except Exception:
-    sys.exit(1)
-PYEOF
-then
-    echo "AnkiConnect alive: $ANKICONNECT"
+say 'Frontend production build'
+(cd "$REPO/frontend" && npm ci && npm run build)
+[ -f "$REPO/frontend/dist/index.html" ] || die 'No frontend build output'
+if [ "$WANT_SERVICE" -eq 1 ] && command -v systemctl >/dev/null; then
+    say 'Install/start one-worker systemd user service'
+    mkdir -p "$(dirname "$UNIT_FILE")"
+    python3 - "$REPO/deploy/ir4anki.service" "$UNIT_FILE" "$REPO" <<'PY'
+import sys
+from pathlib import Path
+Path(sys.argv[2]).write_text(Path(sys.argv[1]).read_text().replace('@REPO@',sys.argv[3]))
+PY
+    systemctl --user daemon-reload
+    systemctl --user enable ir4anki.service
+    systemctl --user restart ir4anki.service
+    if ! systemctl --user is-active --quiet ir4anki.service; then warn 'Check journalctl --user -u ir4anki -n 40'; exit 1; fi
 else
-    warn "AnkiConnect not reachable at $ANKICONNECT — start Anki (with the AnkiConnect add-on) and the app will work"
+    printf 'Service not changed. Run: %s/bin/uvicorn --app-dir %s/backend app:app --host 127.0.0.1 --port 8901\n' "$VENV" "$REPO"
 fi
-
-say "done"
-cat <<EOF
-Open the app:      $HOSTURL
-Service:           systemctl --user status ir4anki
-Logs:              journalctl --user -u ir4anki -f
-Config:            $ENV_FILE  (restart the service after editing)
-README:            $REPO/README.md
-
-Reminder: Anki must be RUNNING (with AnkiConnect) while you use the app,
-and configure Anki's own sync (AnkiWeb or self-hosted) separately.
-EOF
+say 'Done'
+printf 'Config: %s\nDocs: %s/docs/pylib-migration.md\n' "$ENV_FILE" "$REPO"
+if [ "$SELECTED_BACKEND" = pylib ]; then
+    printf '%s\n' 'No desktop/AnkiConnect prerequisite. Keep desktop CLOSED; configure native sync locally.' 'Verify: backend/.venv/bin/python deploy/native.py health'
+else printf '%s\n' 'Connect rollback selected: desktop Anki must be RUNNING with AnkiConnect; configure its sync separately.'; fi

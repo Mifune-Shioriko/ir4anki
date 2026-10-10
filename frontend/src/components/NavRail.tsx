@@ -23,7 +23,7 @@ interface Props {
   /** badge count on the 阅读清单 destination (files in the list) */
   readingListSize?: number
   /** active round progress (null = no round on screen → ring hidden) */
-  ring?: { done: number; total: number } | null
+  ring?: { reading: {done:number;total:number}; review: {done:number;total:number} } | null
 }
 
 const ITEMS: { key: Section; label: string; icon: Component<IconProps> }[] = [
@@ -61,7 +61,8 @@ export const NavRail: Component<Props> = (props) => {
 
       <Show when={props.ring}>
         <div class="nav-rail__footer">
-          <ProgressRing done={props.ring!.done} total={props.ring!.total} />
+          <ProgressRing label="阅读" kind="reading" done={props.ring!.reading.done} total={props.ring!.reading.total} />
+          <ProgressRing label="复习" kind="review" done={props.ring!.review.done} total={props.ring!.review.total} />
         </div>
       </Show>
     </nav>

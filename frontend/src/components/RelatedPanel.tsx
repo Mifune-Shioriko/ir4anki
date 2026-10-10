@@ -2,8 +2,7 @@ import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
 import { api } from '../api'
-import { cleanCardHtml } from '../lib/clean'
-import { renderClozeField } from '../lib/cloze'
+import { MARKDOWN_TAG, renderField, renderClozeField } from '../lib/cloze'
 import { KATEX_OPTS } from '../lib/math'
 import type { ReadingChunk, ReadingCreatedCard } from '../types'
 
@@ -146,17 +145,17 @@ export const RelatedPanel: Component<Props> = (props) => {
   const cardQuestion = (c: ReadingCreatedCard): string => {
     const fields = c.fields || {}
     if (c.kind === 'cloze') {
-      return renderClozeField(fields['文字'] ?? Object.values(fields)[0] ?? '', 'q')
+      return renderClozeField(fields['文字'] ?? Object.values(fields)[0] ?? '', 'q', c.tags)
     }
-    return cleanCardHtml(fields['正面'] ?? Object.values(fields)[0] ?? '')
+    return renderField(fields['正面'] ?? Object.values(fields)[0] ?? '', c.tags)
   }
   const cardAnswer = (c: ReadingCreatedCard): string => {
     const fields = c.fields || {}
     if (c.kind === 'cloze') {
-      return renderClozeField(fields['文字'] ?? Object.values(fields)[0] ?? '', 'a')
+      return renderClozeField(fields['文字'] ?? Object.values(fields)[0] ?? '', 'a', c.tags)
     }
-    const back = fields['背面'] ?? ''
-    return back ? cleanCardHtml(back) : ''
+    const back = fields['背面'] ?? Object.values(fields)[1] ?? ''
+    return back ? renderField(back, c.tags) : ''
   }
 
   return (
@@ -219,9 +218,9 @@ export const RelatedPanel: Component<Props> = (props) => {
                     <Show when={cardAnswer(c)}>
                       <div class="similar-a md-typescale-body-small" innerHTML={cardAnswer(c)} />
                     </Show>
-                    <Show when={c.tags.length > 0}>
+                    <Show when={c.tags.some(t => t !== MARKDOWN_TAG)}>
                       <div class="reading-made-tags md-typescale-label-small">
-                        {c.tags.map(t => `#${t}`).join(' ')}
+                        {c.tags.filter(t => t !== MARKDOWN_TAG).map(t => `#${t}`).join(' ')}
                       </div>
                     </Show>
                   </div>

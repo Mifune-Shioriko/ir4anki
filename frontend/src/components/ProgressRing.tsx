@@ -12,6 +12,8 @@ import { Component } from 'solid-js'
 // for the sweep animation (same idiom as the old stats gauge).
 
 interface Props {
+  label: string
+  kind: 'reading' | 'review'
   done: number
   total: number
 }
@@ -25,9 +27,11 @@ export const ProgressRing: Component<Props> = (props) => {
   const done = () => props.total > 0 && props.done >= props.total
   return (
     <div
-      class="progress-ring"
+      class={`progress-ring progress-ring--${props.kind}`}
       classList={{ 'progress-ring--done': done() }}
       role="progressbar"
+      aria-label={props.label}
+      aria-valuetext={`${props.label} ${props.done}/${props.total}`}
       aria-valuemin={0}
       aria-valuemax={props.total}
       aria-valuenow={props.done}
@@ -46,6 +50,7 @@ export const ProgressRing: Component<Props> = (props) => {
       <span class="progress-ring__text md-typescale-title-small">
         {props.done}/{props.total}
       </span>
+      <span class="progress-ring__label">{props.label}</span>
     </div>
   )
 }

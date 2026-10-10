@@ -10,7 +10,7 @@ unchanged → segment line numbers/fingerprints stay valid). DELETE is hard:
 disk + all reading progress go (Anki cards untouched). Traversal / protected
 dir / bad-name are all rejected.
 
-Harness pattern = list_dealing_test.py: real FastAPI app, FAKE AnkiConnect,
+Harness pattern = list_dealing_test.py: real FastAPI app, real isolated pylib collection,
 TEMPORARY corpus/state. PREVIEW_MODE off (dealing/gate never touch Anki).
 
 Run: backend/.venv/bin/python scripts/file_mgmt_test.py
@@ -21,8 +21,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-STATE = tempfile.mkdtemp(prefix="filemgmt-state-")
-NOTES = Path(tempfile.mkdtemp(prefix="filemgmt-notes-"))
+from native_fixture import configure, tempdir, run_closed, NativeData
+
+STATE = tempdir(prefix="filemgmt-state-")
+NOTES = Path(tempdir(prefix="filemgmt-notes-"))
 os.environ["ANKI_STATE_DIR"] = STATE
 os.environ["ANKI_NOTES_DIR"] = str(NOTES)
 os.environ["ANKI_PREVIEW_MODE"] = "0"
@@ -31,6 +33,7 @@ os.environ["ANKI_READING_MODE"] = "1"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
 
 import httpx  # noqa: E402
+configure()
 import app as backend  # noqa: E402
 
 PASS = 0
@@ -47,14 +50,6 @@ def check(name, cond, detail=""):
         print(f"  FAIL {name} {detail}")
 
 
-class FakeAnki:
-    async def __call__(self, action, params=None, timeout=30):
-        if action == "findCards":
-            return []
-        return None
-
-
-backend.anki = FakeAnki()
 backend.REVIEW_WEB_V2_DIST = Path("/nonexistent")
 
 NOTE_BODY = ("# 颈部\n\n## 一、浅层结构\n\n"
@@ -332,4 +327,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(run_closed(backend, main()))

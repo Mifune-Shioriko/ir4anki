@@ -70,7 +70,36 @@ function post<T>(url: string, body?: unknown): Promise<T> {
   return fetch(url, init).then(r => parse<T>(r))
 }
 
+// Admin authorization lives only in memory, never in localStorage or URLs.
+let engineToken = ''
+export function setEngineToken(value: string) { engineToken = value }
+async function engineRequest<T>(url: string, body?: unknown): Promise<T> {
+  const headers: Record<string,string> = {}
+  if (engineToken) headers.Authorization = `Bearer ${engineToken}`
+  const init: RequestInit = { headers }
+  if (body !== undefined) { init.method = 'POST'; headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body) }
+  return parse<T>(await fetch(url, init))
+}
+
 export const api = {
+  backendStatus: () => get<{ anki_backend?: string }>('/api/status'),
+  engineStats: () => engineRequest<Record<string, unknown>>('/api/engine/stats'),
+  engineStatus: () => engineRequest<import('./types').EngineStatus>('/api/engine/status'),
+  engineBackup: () => engineRequest<{ handle?: unknown; [key: string]: unknown }>('/api/engine/backup', {}),
+  engineExport: () => engineRequest<{ download_url: string }>('/api/engine/export', {}),
+  engineSync: () => engineRequest<Record<string, unknown>>('/api/engine/sync', { commit_undo: true }),
+  engineDownload: async (path: string): Promise<Blob> => {
+    const safe = engineDownloadPath(path, location.origin)
+    const headers: Record<string,string> = engineToken ? {Authorization: `Bearer ${engineToken}`} : {}
+    const r = await fetch(safe, {headers})
+    if (!r.ok) { await parse<unknown>(r); throw new Error('下载失败') }
+    if (!r.headers.get('Content-Type')?.startsWith('application/octet-stream')) throw new Error('下载响应不是集合文件')
+    return r.blob()
+  },
+  flowState: () => get<SessionStateResponse>('/api/flow/state'),
+  flowStart: (mode?: string) => post<SessionStateResponse>('/api/flow/start' + (mode ? '?mode=' + encodeURIComponent(mode) : '')),
+  flowEndReading: () => post<SessionStateResponse>('/api/flow/end-reading'),
+  flowExit: () => post<{ ok: boolean }>('/api/flow/exit'),
   sessionState: () => get<SessionStateResponse>('/api/session/state'),
   start: (mode?: string) =>
     post<StartResponse>(mode ? `/api/session/start?mode=${mode}` : '/api/session/start'),
@@ -215,4 +244,14 @@ export const api = {
     post<{ ok: boolean; order: string[] }>('/api/reading/list/remove', { path }),
   readingListReorder: (arg: { path: string; top?: boolean } | { order: string[] }) =>
     post<{ ok: boolean; order: string[] }>('/api/reading/list/reorder', arg),
+}
+
+/** Accept only same-origin engine download routes; never navigate to a
+ * backend-provided arbitrary scheme or external host. */
+export function engineDownloadPath(value: string, origin: string): string {
+  const url = new URL(value, origin)
+  if (url.origin !== origin || !url.pathname.startsWith('/api/engine/') || url.username || url.password) {
+    throw new Error('导出下载地址无效')
+  }
+  return url.pathname + url.search
 }

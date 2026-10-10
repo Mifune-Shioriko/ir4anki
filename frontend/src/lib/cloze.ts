@@ -1,175 +1,71 @@
-import MarkdownIt from 'markdown-it'
 import { renderMarkdown } from './markdown'
+import { cleanCardHtml } from './clean'
 
-// Anki-native cloze marker parsing + markdown-aware rendering.
-//
-// STORAGE MODEL (user spec 2026-09-20, "卡片也渲染 md 格式，看起来就是直接在
-// chunk 上挖空"): Anki fields render HTML natively (verified against the live
-// collection: a <table> with {{c1::}} inside a cell renders correctly and
-// each cloze ordinal spawns its own card). So the 填空题 文字 field stores
-// MARKDOWN-CONVERTED HTML with the {{cN::}} markers left verbatim inside it
-// (clozeMdToHtml below) — Anki's cloze engine parses the markers out of the
-// HTML itself. The editor textarea keeps the readable MARKDOWN source
-// (tables/bold/$math$ visible while editing); conversion happens on save.
-//
-// Math: $…$/$$…$$ in the textarea become Anki-native \(…\)/\[…\] delimiters
-// in the stored HTML (desktop MathJax reads them; the web app's KaTeX
-// auto-render KATEX_OPTS includes both delimiters).
+export const MARKDOWN_TAG = 'ir4anki::markdown'
 export const CLOZE_RE = /\{\{c(\d+)::([\s\S]*?)(?:::([\s\S]*?))?\}\}/g
-
-export interface ClozeRange { start: number; end: number; content: string; n: number }
-
+export interface ClozeRange { start: number; end: number; content: string; n: number; hint?: string }
+// Balance braces so TeX groups and nested clozes do not prematurely close a marker.
 export function clozeRanges(text: string): ClozeRange[] {
-  const out: ClozeRange[] = []
-  CLOZE_RE.lastIndex = 0
-  let m: RegExpExecArray | null
-  while ((m = CLOZE_RE.exec(text))) {
-    out.push({ start: m.index, end: m.index + m[0].length, content: m[2] ?? '', n: parseInt(m[1]) })
+ const out: ClozeRange[] = []
+ const open = /\{\{c(\d+)::/g
+ let m: RegExpExecArray | null
+ while ((m = open.exec(text))) {
+  let depth = 0, end = -1, hintAt = -1
+  for (let i = open.lastIndex; i < text.length; i++) {
+   if (text[i] === '{') depth++
+   else if (text[i] === '}') {
+    if (depth) depth--
+    else if (text[i+1] === '}') { end = i; break }
+   } else if (!depth && hintAt < 0 && text.slice(i,i+2) === '::') { hintAt = i; i++ }
   }
-  return out
+  if (end < 0) continue
+  out.push({start:m.index,end:end+2,n:Number(m[1]),content:text.slice(open.lastIndex,hintAt<0?end:hintAt),hint:hintAt<0?undefined:text.slice(hintAt+2,end)})
+  open.lastIndex = end+2
+ }
+ return out
+}
+export function isMarkdownNote(tags: string[] = []): boolean { return tags.includes(MARKDOWN_TAG) }
+export function renderField(field: string, tags: string[] = []): string {
+ return isMarkdownNote(tags) ? renderMarkdown(field) : cleanCardHtml(field)
+}
+function replaceClozes(text: string, mode: 'q'|'a', ordinal?: number, markers?: [string,string], blockMarkers?: [string,string]): string {
+ const ranges = clozeRanges(text)
+ let out = '', pos = 0
+ for (const r of ranges) {
+  const active = ordinal === undefined || r.n === ordinal
+  // Replace before Markdown parsing, including link targets: hidden answers
+  // can never remain in a URL, image alt, code fence, or attribute.
+  const value = active && mode === 'q' ? '[' + replaceClozes(r.hint ?? '…',mode,ordinal,markers,blockMarkers) + ']' : replaceClozes(r.content,mode,ordinal,markers,blockMarkers)
+  const standalone = (r.start === 0 || text[r.start-1] === '\n') && (r.end === text.length || text[r.end] === '\n')
+  // Standalone multiline clozes must leave heading/list/table/fence delimiters intact.
+  const marked = active && markers
+    ? blockMarkers && standalone && (value.includes('\n') || /^(?:#{1,6}\s|>\s?|[-+*]\s|\d+[.)]\s|`{3}|~{3}|\|| {4}|\t)/.test(value))
+      ? blockMarkers[0] + '\n\n' + value + '\n\n' + blockMarkers[1]
+      : markers[0] + value + markers[1]
+    : value
+  out += text.slice(pos,r.start) + marked
+  pos = r.end
+ }
+ return out + text.slice(pos)
+}
+export function renderClozeMd(text: string, mode: 'q'|'a', ordinal?: number): string {
+ let prefix = 'IR4ANKICLOZEMARK'
+ while (text.includes(prefix)) prefix += 'X'
+ const open = prefix + 'OPEN', close = prefix + 'CLOSE'
+ // Add markup only in rendered text, never inside URL/alt attributes.
+ const blockOpen = prefix + 'BLOCKOPEN', blockClose = prefix + 'BLOCKCLOSE'
+ const html = renderMarkdown(replaceClozes(text,mode,ordinal,[open,close],[blockOpen,blockClose]))
+  .replace(new RegExp('<p[^>]*>' + blockOpen + '</p>\\n?', 'g'), '<div class="cloze">')
+  .replace(new RegExp('<p[^>]*>' + blockClose + '</p>\\n?', 'g'), '</div>')
+ return html.split(/(<[^>]+>)/g).map(part =>
+  part.startsWith('<') ? part.split(open).join('').split(close).join('') :
+  part.split(open).join('<span class="cloze">').split(close).join('</span>')
+ ).join('')
+}
+export function renderClozeField(field: string, mode: 'q'|'a', tags: string[] = [], ordinal?: number): string {
+ return isMarkdownNote(tags) ? renderClozeMd(field,mode,ordinal) : cleanCardHtml(replaceClozes(field,mode,ordinal,['<span class="cloze">','</span>']))
 }
 
-// ---- markdown → stored HTML (markers protected through the conversion) ----
-
-const SENT_OPEN = '\uE000'
-const SENT_CLOSE = '\uE001'
-const RESTORE_RE = /\uE000(\d+)\uE001/g
-
-// inline-only renderer for cloze CONTENT: the content sits inside the
-// surrounding block structure (table cell, <p>, <li>…), so it must never
-// gain block wrappers. DELIBERATELY WITHOUT the KaTeX plugin: math inside a
-// cloze must reach the stored field as Anki-native \(…\) (desktop MathJax),
-// not browser-only KaTeX HTML — the conversion runs AFTER renderInline so
-// markdown-it's escape handling never eats the backslashes (\( → literal
-// "(" — bug found in the live round-trip probe 2026-09-20).
-const mdInline = new MarkdownIt({ html: false, linkify: true, breaks: false })
-
-/** Convert Obsidian-style math ($…$/$$…$$) inside a string to Anki-native
- * \(…\)/\[…\] delimiters. Used for cloze CONTENT/HINT (the block-level pass
- * in clozeMdToHtml never sees inside a protected marker). */
-function mathToAnkiDelims(s: string): string {
-  return s
-    .replace(/\$\$([\s\S]+?)\$\$/g, '\\[$1\\]')
-    .replace(/\$([^$\n]+?)\$/g, '\\($1\\)')
-}
-
-/** Rebuild one protected cloze marker with its content inline-rendered
- * ({{c1::**髂结节**}} → {{c1::<strong>髂结节</strong>}}) so markdown the
- * user wrote INSIDE a cloze still renders on the card back. Math inside the
- * content becomes \(…\) FIRST (Anki MathJax; the KaTeX plugin must not eat
- * it). Markers run BEFORE the global math pass in clozeMdToHtml so the
- * natural form {{c1::$x$}} can't produce the }}} sequence that breaks
- * Anki's own marker parser. Unbalanced emphasis markers left over from a
- * selection that straddled ** pairs render as literal asterisks — visible in
- * the live preview, user-fixable. */
-function rerenderClozeMarker(m: string): string {
-  CLOZE_RE.lastIndex = 0
-  const g = CLOZE_RE.exec(m)
-  if (!g) return m
-  // renderInline FIRST (markdown in the content), math conversion AFTER
-  // (the produced \(/\[ backslashes must not pass through markdown-it)
-  const content = mathToAnkiDelims(mdInline.renderInline(g[2] ?? ''))
-  const hint = g[3]
-  return `{{c${g[1]}::${content}${hint !== undefined ? '::' + mathToAnkiDelims(mdInline.renderInline(hint)) : ''}}}`
-}
-
-function makeProtector(stash: string[]) {
-  return (s: string) => {
-    stash.push(s)
-    return SENT_OPEN + (stash.length - 1) + SENT_CLOSE
-  }
-}
-
-function restore(html: string, stash: string[]): string {
-  // iterative: a restored value can itself contain sentinels (nested
-  // protection — e.g. $…{{c1::x}}…$ math around a marker); loop until no
-  // sentinels remain (bounded to avoid a pathological infinite loop)
-  let out = html
-  for (let i = 0; i < 10 && out.includes(SENT_OPEN); i++) {
-    out = out.replace(RESTORE_RE, (_, j) => stash[Number(j)] ?? '')
-  }
-  return out
-}
-
-/**
- * Convert the editor's markdown source to the HTML stored in the Anki
- * field. {{cN::…::hint}} markers pass through VERBATIM (protected by
- * private-use-area sentinels so markdown-it never mangles them — a `*`
- * inside cloze content would otherwise pair across markers). $-math becomes
- * Anki-native \(…\)/\[…\].
- *
- * Known limits (accepted): markers inside a link URL get percent-encoded by
- * markdown-it (don't cloze URLs); block-level content inside a marker may
- * split across <p>s. Both are exotic in the notes corpus.
- */
-export function clozeMdToHtml(text: string): string {
-  const stash: string[] = []
-  const P = makeProtector(stash)
-  // 1. cloze markers FIRST (content's own $math$ → \(…\) inside the marker):
-  //    a marker inside math (${{c1::x}}$) is pathological — Anki's parser
-  //    chokes on the resulting }}} when the math ends with `}`. Protecting
-  //    markers first keeps the natural form {{c1::$x$}} unambiguous.
-  let t = text.replace(CLOZE_RE, m => P(rerenderClozeMarker(m)))
-  // 2. remaining math OUTSIDE markers → Anki-native delimiters ($$…$$ first
-  //    so its content isn't eaten by the $…$ pass)
-  t = t.replace(/\$\$([\s\S]+?)\$\$/g, (_, tex) => P(`\\[${tex}\\]`))
-  t = t.replace(/\$([^$\n]+?)\$/g, (_, tex) => P(`\\(${tex}\\)`))
-  return restore(renderMarkdown(t), stash)
-}
-
-/**
- * Editor/preview renderer: markdown source → HTML with the cloze markers
- * swapped for visual spans. mode 'q' = 正面 ([…]/hint), 'a' = 背面 (content
- * revealed, rendered live so bold/$math$ inside a cloze still work).
- */
-export function renderClozeMd(text: string, mode: 'q' | 'a'): string {
-  const stash: string[] = []
-  const P = makeProtector(stash)
-  const t = text.replace(CLOZE_RE, (_m, _n, content: string, hint?: string) =>
-    mode === 'q'
-      ? P(`<span class="cloze-q">[${hint ? mdInline.renderInline(hint) : '…'}]</span>`)
-      : P('<span class="cloze-a">') + (content ?? '') + P('</span>'),
-  )
-  return restore(renderMarkdown(t), stash)
-}
-
-/** Stored fields: new cards hold HTML (clozeMdToHtml), cards made before
- * 2026-09-20 hold plain text/markdown — sniff and take the right path. */
-export function isFieldHtml(s: string): boolean {
-  return /<[a-z][\s\S]*>/i.test(s)
-}
-
-/**
- * Render a STORED 填空题 field for display (已制卡片 list etc.): markers →
- * cloze-q/cloze-a spans. HTML fields swap markers in place (content is
- * already HTML — \(…\) math inside is handled by the caller's KaTeX
- * auto-render effect); legacy plain/md fields go through renderClozeMd.
- */
-export function renderClozeField(field: string, mode: 'q' | 'a'): string {
-  if (!field) return ''
-  if (!isFieldHtml(field)) return renderClozeMd(field, mode)
-  CLOZE_RE.lastIndex = 0
-  // stored markers hold ALREADY-RENDERED HTML (rerenderClozeMarker ran on
-  // save) — inject content/hint raw, escaping would double-encode it
-  return field.replace(CLOZE_RE, (_m, _n, content: string, hint?: string) =>
-    mode === 'q'
-      ? `<span class="cloze-q">[${hint || '…'}]</span>`
-      : `<span class="cloze-a">${content ?? ''}</span>`,
-  )
-}
-
-// ---- chunk text → cloze seed (user fix 2026-09-20) -------------------------
-// 添加挖空 seeds the dialog from the WHOLE chunk with the selection wrapped
-// in {{c1::…}} IN PLACE (the old selection-only seed produced bare-"[…]"
-// cards with no recall context). The seed keeps the chunk's RAW MARKDOWN —
-// the field is HTML-converted on save, so tables/bold survive into the card
-// (user spec: 卡片看起来就是直接在 chunk 上挖空).
-
-/** Whitespace- and emphasis-marker-insensitive search; returns raw [start,
- * end) or null. `* _ \`` are dropped from BOTH sides (rendered selection
- * text never contains markup asterisks, raw markdown does — "**髂结节**"
- * must match a "髂结节" selection and map back to the RAW positions inside
- * the bold). */
 function buildNorm(text: string): { norm: string; map: number[] } {
   let norm = ''
   const map: number[] = []

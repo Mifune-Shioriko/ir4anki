@@ -85,7 +85,7 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   const srcIdx = token.attrIndex('src')
   if (srcIdx >= 0) {
     const src = String(token.attrs![srcIdx][1] ?? '')
-    if (!/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(src)) {
+    if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
       const base = src.split('/').pop() || src
       token.attrs![srcIdx][1] = '/api/reading/media/' + encodeURIComponent(base)
     }

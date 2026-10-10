@@ -1,8 +1,14 @@
 // Wire shapes of the review-app FastAPI backend (app.py).
 
 export interface Card {
+  kind?: 'qa' | 'cloze'
   cardId: number
   noteId?: number
+  tags?: string[]
+  fields?: Record<string, string | { value: string }>
+  ord?: number
+  next_intervals?: [string, string, string, string] | null
+  memory_state?: { stability: number | null; difficulty: number | null; retention: number | null } | null
   question: string
   answer: string
   deckName: string
@@ -56,7 +62,19 @@ export interface PreviewExtras {
   default_mode?: string
 }
 
-export type SessionStateResponse = PreviewExtras & ReadingExtras & (
+export interface FlowState {
+  id: string
+  policy: 'even-floor-v1'
+  phase: 'reading' | 'review' | 'complete'
+  reading_consumed: number
+  card_handled: number
+  reading_slots: number
+  card_count: number
+  blocks: number[]
+  stats: { readingDone: number; readingSkipped: number; readingNext: number; reviewed: number; newReviewed: number }
+}
+
+export type SessionStateResponse = PreviewExtras & ReadingExtras & { flow?: FlowState | null } & (
   | { state: 'none'; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean }
   | { state: 'complete'; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean; mode?: string }
   | { state: 'active'; cards: Card[]; done: number; total: number; new_in_batch?: number | null; due_remaining: number | null; new_per_round?: number | null; new_total?: number | null; can_undo: boolean; mode?: string }
@@ -95,6 +113,9 @@ export interface UndoResponse {
 }
 
 export interface NoteResponse {
+  kind?: 'qa' | 'cloze'
+  /** Zero-based template/cloze ordinal, forwarded from cardsInfo. */
+  ord?: number
   cardId: number
   noteId: number
   modelName: string
@@ -251,6 +272,7 @@ export interface ReadingRoundStats {
 /** What the last completed round accomplished — rendered as the start
  *  screen's summary strip (hero moment, 2026-09-27 round 2). */
 export interface RoundSummary {
+  readingNext?: number
   /** reading chunks marked done this round */
   readingDone?: number
   /** reading chunks skipped */
@@ -340,4 +362,11 @@ export interface ReadingExtras {
   /** active reading round only (resume after refresh) — the completed
    * tombstone is fetched via GET /api/reading/state */
   reading_round?: ReadingRound
+}
+
+export interface EngineStatus {
+  sync?: unknown
+  undo?: unknown
+  sync_deferred?: boolean
+  [key: string]: unknown
 }

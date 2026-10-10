@@ -5,9 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "build:check": "tsc -b && vite build",
-    "preview": "vite preview"
+    "build": "vite build --configLoader runner",
+    "build:check": "tsc -b && vite build --configLoader runner",
+    "preview": "vite preview",
+    "test:markdown": "node --loader ./tests/loader.mjs cloze_roundtrip.mjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
