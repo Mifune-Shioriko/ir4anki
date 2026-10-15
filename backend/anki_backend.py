@@ -28,6 +28,7 @@ class PylibClient:
         self._auth = None
         self._journal = None
         self._last_sync_error = None
+        self._sync_meta = {}
 
     async def call(self, action, params=None, timeout=30):
         if self._closed:
@@ -73,6 +74,17 @@ class PylibClient:
             except Exception:
                 self._close()
                 raise BackendError('undo journal cannot be opened or collection binding mismatch; manual recovery required') from None
+            # Observability never gates offline collection ownership/recovery.
+            import json
+            status_path = Path(str(self.path)+'.ir4anki-sync.json')
+            try:
+                status = json.loads(status_path.read_text()) if status_path.exists() else {}
+                if isinstance(status, dict) and status.get('binding') == self._journal.binding:
+                    self._sync_meta = status
+                    self._last_sync_error = status.get('error')
+            except (OSError, ValueError):
+                self._sync_meta = {}
+                self._last_sync_error = 'Cannot read sync status; local collection is available'
         return self._col
 
     @staticmethod
@@ -80,7 +92,7 @@ class PylibClient:
         return {key: {'value': note[key], 'order': i} for i, key in enumerate(note.keys())}
 
     def _card_info(self, cid):
-        from anki.errors import NotFoundError, AnkiException
+        from anki.errors import NotFoundError
         col = self._open()
         try:
             card = col.get_card(cid)
@@ -93,20 +105,6 @@ class PylibClient:
         rendered = card.render_output()
         intervals = None
         memory = {'stability':None,'difficulty':None,'retention':None}
-        try:
-            intervals = list(col.sched.describe_next_states(col._backend.get_scheduling_states(cid)))
-        except (AttributeError, RuntimeError, AnkiException):
-            pass
-        state = card.memory_state
-        if state is not None:
-            memory.update(stability=state.stability, difficulty=state.difficulty)
-            # Current recall probability from the pinned native engine, when exposed.
-            try:
-                stats = col._backend.card_stats(cid=cid)
-                if stats.HasField('fsrs_retrievability'):
-                    memory['retention'] = stats.fsrs_retrievability
-            except (AttributeError, AnkiException):
-                pass
         return {'next_intervals':intervals, 'memory_state':memory, 'cardId': card.id, 'note': card.nid, 'deckName': col.decks.name(card.did),
                 'modelName': model['name'], 'fields': self._fields(note), 'tags': list(note.tags),
                 'question': rendered.question_text, 'answer': rendered.answer_text,
@@ -144,16 +142,7 @@ class PylibClient:
                 if self._journal.data:
                     if self._journal.data['phase'] not in ('committed','exporting'):
                         raise BackendError('unresolved prepared undo journal; manual recovery required')
-                    try:
-                        self._flush_answer(sync=bool(self._sync_endpoint))
-                        self._last_sync_error = None
-                    except BackendError as exc:
-                        # Grading the next card deliberately ends prior undo.
-                        # Prior changes remain in native SQLite with their usn,
-                        # even if sync failed or its response was lost. They can
-                        # be retried later; never undo potentially exported data.
-                        self._last_sync_error = str(exc)
-                        self._journal.save(None)
+                    self._flush_answer(sync=False)
                     card = col.get_card(answer['cardId'])
                 token = uuid.uuid4().hex
                 # State lookup initializes native rollover/localOffset defaults.
@@ -208,28 +197,41 @@ class PylibClient:
         if action == 'engineStatus':
             d = self._journal.data
             return {'backend':'pylib', 'sync_deferred':bool(d), 'undo_available':self._journal.valid(),
+                    'last_sync_success':self._sync_meta.get('success_at'),
+                    'last_collection_sync':self._sync_meta.get('collection_at'),
+                    'last_sync_attempt':self._sync_meta.get('attempt_at'),
+                    'sync_stage':self._sync_meta.get('stage', 'never'),
+                    'local_changes_pending':bool(col.db.scalar(
+                        'select 1 from cards where usn=-1 union all select 1 from notes where usn=-1 '
+                        'union all select 1 from revlog where usn=-1 union all select 1 from graves where usn=-1 '
+                        'union all select 1 from decks where usn=-1 union all select 1 from deck_config where usn=-1 '
+                        'union all select 1 from notetypes where usn=-1 union all select 1 from config where usn=-1 limit 1')),
+                    'media_changes_possible':True,
                     'last_sync_error':self._last_sync_error,
                     'journal_phase':d['phase'] if d else None,
                     'pending_export':bool(d and d['phase']=='exporting'),
                     'sync_deferred_reason': ('pending_undo' if d['phase']=='committed' else d['phase']) if d else None,
-                    'capabilities':dict.fromkeys(['undo','intervals','memory_state','stats','backup','export'],True)}
+                    'capabilities':{**dict.fromkeys(['undo','stats','backup','export'],True),
+                                    'intervals':False,'memory_state':False}}
         if action == 'nativeUndoToken':
             d = self._journal.data
             return d['token'] if self._journal.valid() and d['cid']==params['card'] else None
         if action == 'nativeUndo':
             d = self._journal.data
-            if not d or d['cid'] != params['card'] or d['token'] != params.get('token') or not self._journal.valid():
+            if not d or d['cid'] != params['card'] or d['token'] != params.get('token'):
                 raise BackendError('undo unavailable: journal scheduling guard mismatch')
-            d = dict(d, round_undo=params.get('round_undo'), phase='restoring')
-            self._journal.save(d)
             saved = self._answer_undo
             if saved and col.undo_status().last_step == saved[2]:
+                if not self._journal.valid():
+                    raise BackendError('undo unavailable: journal scheduling guard mismatch')
+                d = dict(d, round_undo=params.get('round_undo'), phase='restoring')
+                self._journal.save(d)
                 col.undo()
                 if self._journal.snapshot(d['cid']) != d['before']:
                     raise BackendError('native undo did not match the full journal; recovery required')
                 self._journal.save(dict(d, phase='undone') if d.get('round_undo') else None)
             else:
-                try: self._journal.restore()
+                try: self._journal.restore(round_undo=params.get('round_undo'))
                 except RuntimeError as e: raise BackendError(str(e)) from None
             self._answer_undo = None
             return [True]
@@ -281,6 +283,18 @@ class PylibClient:
             return self._sync()
         if action == 'findCards':
             return list(col.find_cards(params['query']))
+        if action == 'cardsMetadata':
+            ids = params['cards']
+            columns = ('cardId','note','type','queue','due','interval','factor','reps','lapses','left')
+            rows = []
+            for offset in range(0, len(ids), 500):
+                batch = ids[offset:offset+500]
+                rows.extend(col.db.all('select c.id,c.nid,c.did,c.type,c.queue,c.due,c.ivl,c.factor,c.reps,c.lapses,c.left '
+                                       'from cards c join notes n on n.id=c.nid where c.id in ('+
+                                       ','.join('?' for _ in batch)+')', *batch))
+            decks = {did:col.decks.name(did) for did in {row[2] for row in rows}}
+            by_id = {row[0]:dict(zip(columns, [row[0],row[1],*row[3:]]), deckName=decks[row[2]]) for row in rows}
+            return [by_id.get(cid,{}) for cid in ids]
         if action == 'cardsInfo':
             return [self._card_info(cid) for cid in params['cards']]
         if action == 'notesInfo':
@@ -349,19 +363,36 @@ class PylibClient:
         # Persist commit intent before touching the server; explicit failed sync
         # keeps an exporting barrier. The next grade may end that prior slot,
         # retaining local native changes while never undoing exported data.
-        self._journal.save(dict(self._journal.data, phase='exporting'))
+        if sync:
+            self._journal.save(dict(self._journal.data, phase='exporting'))
         self._answer_undo = None
         if sync:
             self._sync()
         self._journal.save(None)
 
+    def _save_sync_status(self, **changes):
+        import json, os
+        self._sync_meta.update(changes, binding=self._journal.binding)
+        target = Path(str(self.path)+'.ir4anki-sync.json')
+        temp = target.with_suffix('.tmp')
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as f:
+            json.dump(self._sync_meta, f); f.flush(); os.fsync(f.fileno())
+        os.replace(temp, target)
+        fd = os.open(target.parent, os.O_RDONLY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+
     def _sync(self):
         import time
+        from datetime import datetime, timezone
         from anki.sync_pb2 import SyncAuth, SyncCollectionResponse
         col = self._open()
-        if not self._sync_endpoint or not (self._sync_hkey or (self._sync_username and self._sync_password)):
-            raise BackendError('Anki sync is not configured; explicit endpoint and credentials required')
+        now = lambda: datetime.now(timezone.utc).isoformat(timespec='seconds')
+        self._save_sync_status(attempt_at=now(), stage='collection', error=None)
         try:
+            if not self._sync_endpoint or not (self._sync_hkey or (self._sync_username and self._sync_password)):
+                raise BackendError('Anki sync is not configured; explicit endpoint and credentials required')
             if self._auth is None:
                 if self._sync_hkey:
                     self._auth = SyncAuth(hkey=self._sync_hkey, endpoint=self._sync_endpoint)
@@ -370,6 +401,7 @@ class PylibClient:
             out = col.sync_collection(self._auth, sync_media=False)
             if out.required not in (SyncCollectionResponse.NO_CHANGES, SyncCollectionResponse.NORMAL_SYNC):
                 raise BackendError('Anki requires full sync; resolve upload/download in desktop Anki, never chosen automatically')
+            self._save_sync_status(collection_at=now(), stage='media')
             col.sync_media(self._auth)
             deadline = time.monotonic() + 300
             while col.media_sync_status().active:
@@ -377,12 +409,14 @@ class PylibClient:
                     col.abort_media_sync()
                     raise BackendError('Anki media sync timed out')
                 time.sleep(0.05)
-        except BackendError:
-            raise
-        except Exception:
+        except Exception as exc:
             self._auth = None
-            raise BackendError('Anki sync failed; verify credentials and server availability') from None
+            message = str(exc) if isinstance(exc, BackendError) else 'Anki sync failed; verify credentials and server availability'
+            self._last_sync_error = message
+            self._save_sync_status(stage='failed', failed_stage=self._sync_meta['stage'], error=message)
+            raise BackendError(message) from None
         self._last_sync_error = None
+        self._save_sync_status(success_at=now(), stage='complete', error=None, failed_stage=None)
         return None
 
     def _close(self):

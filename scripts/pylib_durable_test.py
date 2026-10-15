@@ -127,9 +127,9 @@ def test_failed_prior_sync_does_not_block_local_grades(tmp_path):
             c._sync=fail
             for _ in range(2):
                 assert await c.call('answerCards',{'answers':[{'cardId':cid,'ease':3}]}) == [True]
-            assert len(attempts)==2
+            assert len(attempts)==0
             assert (await c.call('cardsInfo',{'cards':[cid]}))[0]['reps']==3
-            assert (await c.call('engineStatus'))['last_sync_error'] == 'injected sync failure'
+            assert (await c.call('engineStatus'))['last_sync_error'] is None
             assert await c.call('nativeUndoToken',{'card':cid})
         finally:await c.close()
     asyncio.run(run())
@@ -263,5 +263,24 @@ asyncio.run(run())
             assert not status['sync_deferred'] and not status['undo_available']
             assert (await c.call('cardsInfo',{'cards':[cid]}))[0]['reps']==0
             assert await c.call('answerCards',{'answers':[{'cardId':cid,'ease':3}]}) == [True]
+        finally:await c.close()
+    asyncio.run(run())
+
+
+def test_daily_unbury_bookkeeping_preserved_without_weakening_fsrs_guard(tmp_path):
+    p=tmp_path/'collection.anki2';cid=seed(p)
+    async def run():
+        c=client_type()(p)
+        try:
+            await c.call('answerCards',{'answers':[{'cardId':cid,'ease':3}]})
+            token=await c.call('nativeUndoToken',{'card':cid})
+            await c._wait_owner(asyncio.get_running_loop().run_in_executor(
+                c._executor,lambda:c._col.set_config('lastUnburied',42)))
+            assert (await c.call('engineStatus'))['undo_available']
+            await c.close();c=client_type()(p)
+            await c.call('nativeUndo',{'card':cid,'token':token})
+            value=await c._wait_owner(asyncio.get_running_loop().run_in_executor(
+                c._executor,lambda:c._col.get_config('lastUnburied')))
+            assert value==42
         finally:await c.close()
     asyncio.run(run())

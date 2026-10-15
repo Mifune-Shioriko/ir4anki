@@ -4,6 +4,8 @@ from pylib_test_support import run_alive
 import importlib
 import sys
 from pathlib import Path
+from datetime import datetime
+ROUND_CREATED = datetime.now().isoformat()
 import httpx
 import pytest
 from anki.collection import Collection
@@ -110,7 +112,7 @@ def test_engine_http_security_and_restart_round(tmp_path,monkeypatch):
                     app.FileResponse=original_response
                     backup_file.write_bytes(original_bytes)
                 assert (await c.get('/api/engine/download/export/..colpkg')).status_code==404
-                app._round_write({'status':'active','created':'2026-10-10T00:00:00','pending':[cid], 'done_count':0,'total':1})
+                app._round_write({'status':'active','created':ROUND_CREATED,'pending':[cid], 'done_count':0,'total':1})
                 # Recovery backups may capture an undoable answer but must
                 # never become a downloadable exported copy after it is undone.
                 assert (await c.post('/api/answer', params={'card_id':cid,'ease':3})).status_code == 200
@@ -120,7 +122,7 @@ def test_engine_http_security_and_restart_round(tmp_path,monkeypatch):
                 assert (await c.post(f'/api/answer?card_id={cid}&ease=3')).status_code==200
                 assert (await c.post('/api/engine/sync',json={})).json()['deferred']
                 # Simulate loss of the round write following a durable answer.
-                app._round_write({'status':'active','created':'2026-10-10T00:00:00','pending':[cid], 'done_count':0,'total':1})
+                app._round_write({'status':'active','created':ROUND_CREATED,'pending':[cid], 'done_count':0,'total':1})
         sys.modules.pop('app',None)
         reopened=importlib.import_module('app');reopened.fire_and_forget_sync=lambda:None
         async with reopened.app.router.lifespan_context(reopened.app):
@@ -144,7 +146,7 @@ def test_delete_pending_card_preserves_restart_and_prior_undo(tmp_path,monkeypat
     module=importlib.import_module('app');module.fire_and_forget_sync=lambda:None
     async def run():
         async with module.app.router.lifespan_context(module.app):
-            module._round_write({'status':'active','created':__import__('datetime').datetime.now().isoformat(),'pending':[a,b],'done_count':0,'total':2})
+            module._round_write({'status':'active','created':ROUND_CREATED,'pending':[a,b],'done_count':0,'total':2})
             await module._answer_impl(a,3)
             if crash_after_delete:
                 async def crash(*args):raise RuntimeError('injected deletion bookkeeping crash')
@@ -175,7 +177,7 @@ def test_undo_round_write_crash_recovery(tmp_path,monkeypatch):
     app=importlib.import_module('app');app.fire_and_forget_sync=lambda:None
     async def run():
         async with app.app.router.lifespan_context(app.app):
-            app._round_write({'status':'active','created':'2026-10-10T00:00:00','pending':[cid],'done_count':0,'total':1})
+            app._round_write({'status':'active','created':ROUND_CREATED,'pending':[cid],'done_count':0,'total':1})
             await app._answer_impl(cid,3)
             write=app._round_write
             def fail(rd):raise OSError('simulated round write crash')

@@ -9,14 +9,14 @@ def test_even_actual_sequence():
         readings=[{'path':'a','chunk_key':str(i)} for i in range(s)]
         cards=list(range(c))
         f=create(readings,cards,'r','c')
-        seq=[]
+        seq=[];answered=0
         while True:
-            reconcile(f,readings,cards)
+            reconcile(f,readings,cards,answered_count=answered)
             if f['phase']=='complete':break
             if f['phase']=='reading':
                 seq.append('R');readings.pop(0)
             else:
-                seq.append('C');cards.pop(0)
+                seq.append('C');cards.pop(0);answered+=1
         expected=[]
         if s:
             for i in range(1,s+1):
@@ -33,9 +33,9 @@ def test_split_drift_undo():
     reconcile(f,children+[b],[10,11,12,13]);assert f['phase']=='reading'
     reconcile(f,children[1:]+[b],[10,11,12,13]);assert f['phase']=='reading'
     reconcile(f,[b],[10,11,12,13]);assert f['phase']=='review'
-    reconcile(f,[b],[12,13]);assert f['phase']=='reading'
-    reconcile(f,[b],[11,12,13]);assert f['phase']=='review' # cross-phase undo
-    reconcile(f,[],[]);assert f['phase']=='complete'
+    reconcile(f,[b],[12,13],answered_count=2);assert f['phase']=='reading'
+    reconcile(f,[b],[11,12,13],answered_count=1);assert f['phase']=='review' # cross-phase undo
+    reconcile(f,[],[],answered_count=4);assert f['phase']=='complete'
 
 if __name__=='__main__':
     test_even_actual_sequence();test_split_drift_undo();print('2 policy tests passed')

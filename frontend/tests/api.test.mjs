@@ -7,9 +7,11 @@ globalThis.fetch = async (url,init) => {
  return new Response(JSON.stringify(url.endsWith('/export') ? {download_url:'/api/engine/download/handle'} : {ok:true}),{headers:{'Content-Type':'application/json'}})
 }
 await api.engineStats(); await api.engineStatus(); await api.engineBackup(); await api.engineExport(); await api.engineSync()
-assert.deepEqual(calls.map(c=>c.url),['/api/engine/stats','/api/engine/status','/api/engine/backup','/api/engine/export','/api/engine/sync'])
+assert.deepEqual(calls.map(c=>c.url),['/api/engine/stats','/api/engine/status','/api/engine/backup','/api/engine/export','/api/local/sync'])
 assert.equal(calls[0].init.headers.Authorization,'Bearer isolated-test-token')
-assert.equal(calls[4].init.headers.Authorization,'Bearer isolated-test-token')
+assert.equal(calls[4].init.headers.Authorization,undefined)
+assert.equal(calls[4].init.headers['X-IR4Anki-Local-Sync'],'confirm')
+for (const call of calls.slice(0,4)) assert.equal(call.init.headers.Authorization,'Bearer isolated-test-token')
 assert.deepEqual(JSON.parse(calls[4].init.body),{commit_undo:true})
 const fields={Front:'  **exact** <br>\n',Back:'$x$ ![](/media/a.png)'}
 await api.addCard(fields,['user','ir4anki::markdown'])

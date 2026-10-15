@@ -1,3 +1,4 @@
+import { StudyActionDock } from './StudyCardShell'
 import { Component } from 'solid-js'
 
 // Reveal / ease buttons. Expressive color language (2026-09-27 桌面重设计):
@@ -17,14 +18,14 @@ const Keycap = (k: string) => <span class="keycap" aria-hidden="true">{k}</span>
 
 export const ActionArea: Component<Props> = (props) => {
   return (
-    <div class="action-area">
+    <StudyActionDock>
       {!props.revealed ? (
         <md-filled-tonal-button onClick={() => props.onReveal()} disabled={props.answering}>
           显示答案
           {Keycap('Space')}
         </md-filled-tonal-button>
       ) : (
-        <div class="ease-buttons">
+        <>
           <md-filled-tonal-button class="ease-again" onClick={() => props.onAnswer(1)} disabled={props.answering}>
             Again
             {Keycap('1')}
@@ -41,8 +42,8 @@ export const ActionArea: Component<Props> = (props) => {
             Easy
             {Keycap('4')}
           </md-filled-tonal-button>
-        </div>
+        </>
       )}
-    </div>
+    </StudyActionDock>
   )
 }

@@ -23,6 +23,7 @@ for key in list(os.environ):
         os.environ.pop(key)
 os.environ["ANKI_STATE_DIR"] = tempdir(prefix="ir4anki-throttle-")
 print('fixture backend=connect coverage=protocol/fault-injection (intentional)')
+os.environ["ANKI_SYNC_POLICY"] = "legacy" # explicitly test retained automatic policy
 os.environ["ANKI_SYNC_MIN_INTERVAL"] = "0.5"
 os.environ["ANKICONNECT_URL"] = "http://127.0.0.1:18765"  # dead
 

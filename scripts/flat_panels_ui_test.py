@@ -154,7 +154,7 @@ def run():
 
         # start the round from the unified start screen
         page.locator("md-filled-button", has_text="开始").first.click()
-        page.wait_for_selector(".reading-crumb", timeout=30000)
+        page.wait_for_selector(".stage-reading .reading-chunk-body h1", timeout=30000)
         # 统一双栏 (2026-09-27 round 2): the note column with its
         # 笔记/相关卡片 tabs is the ONLY side column — at EVERY width
         # (the 1500px three-column path is retired)

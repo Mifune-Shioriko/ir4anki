@@ -1,5 +1,5 @@
 import { Component, createEffect, createSignal, onCleanup } from 'solid-js'
-import { renderMarkdown } from '../lib/markdown'
+import { acquireDocument, invalidateDocuments, observeDocuments } from '../lib/file-cache'
 
 // Shared whole-file markdown viewer with source-line anchoring.
 // Extracted from NotePanel (2026-09-19, 渐进制卡) so the card→note panel and
@@ -20,16 +20,7 @@ import { renderMarkdown } from '../lib/markdown'
 // scrollIntoView. File texts are cached module-wide (same cache NotePanel
 // used) so tab/panel switches never re-fetch.
 
-const fileCache = new Map<string, string>()
-
-/** Drop one file (or everything) from the module-wide text cache.
- *  Called after an in-app segment edit (/api/reading/edit rewrites the
- *  .md): without this the right column would keep rendering the stale
- *  pre-edit text. */
-export function invalidateFileCache(path?: string) {
-  if (path) fileCache.delete(path)
-  else fileCache.clear()
-}
+export const invalidateFileCache = invalidateDocuments
 
 interface Props {
   /** corpus-relative path; null renders nothing */
@@ -49,9 +40,11 @@ interface Props {
   reloadToken?: unknown
   /** fetcher: NotePanel → /api/reading/file (corpus-direct),
    *  reading panel → /api/reading/file */
-  fetchFile: (path: string) => Promise<{ text: string }>
+  fetchFile: (path: string, signal?: AbortSignal) => Promise<{ text: string; revision?: string }>
+  revision?: string
   class?: string
   onError?: () => void
+  onReady?: (path: string) => void
 }
 
 function findAnchor(root: HTMLElement, line: number): HTMLElement | null {
@@ -83,6 +76,11 @@ function findAnchor(root: HTMLElement, line: number): HTMLElement | null {
 export const FileViewer: Component<Props> = (props) => {
   const [html, setHtml] = createSignal('')
   const [loading, setLoading] = createSignal(false)
+  const [error, setError] = createSignal('')
+  const [retry, setRetry] = createSignal(0)
+  const [invalidated, setInvalidated] = createSignal(0)
+  let release: (() => void) | undefined
+  let alive = true
   let rootRef: HTMLDivElement | undefined
   // monotonic request token: a stale fetch (path swapped mid-flight) can
   // never overwrite the newer file's state
@@ -90,6 +88,7 @@ export const FileViewer: Component<Props> = (props) => {
   let flashTimer: ReturnType<typeof setTimeout> | null = null
 
   const load = () => {
+    release?.()
     const path = props.path
     const token = ++reqToken
     if (flashTimer) {
@@ -97,35 +96,41 @@ export const FileViewer: Component<Props> = (props) => {
       flashTimer = null
     }
     if (!path) {
+      setError('')
       setHtml('')
       setLoading(false)
       return
     }
-    const cached = fileCache.get(path)
-    if (cached != null) {
-      setHtml(renderMarkdown(cached))
-      setLoading(false)
-      return
-    }
+    setHtml('')
+    setError('')
     setLoading(true)
-    props
-      .fetchFile(path)
-      .then(d => {
-        if (token !== reqToken) return
-        fileCache.set(path, d.text)
-        setHtml(renderMarkdown(d.text))
-        setLoading(false)
+    const request = acquireDocument(path, props.revision, props.fetchFile)
+    release = request.release
+    request.promise.then(d => {
+      if (!alive || token !== reqToken) return
+      const start = performance.now()
+      setHtml(d.html)
+      setLoading(false)
+      requestAnimationFrame(() => {
+        if (!alive || token !== reqToken) return
+        // Include the DOM commit + one layout opportunity, not a live latency promise.
+        rootRef?.getBoundingClientRect()
+        performance.measure('files-dom-layout', { start, end: performance.now() })
+        props.onReady?.(path)
       })
-      .catch(() => {
-        if (token !== reqToken) return
-        setLoading(false)
-        setHtml('')
-        props.onError?.()
-      })
+    }).catch(e => {
+      if (!alive || token !== reqToken || e?.name === 'AbortError') return
+      setLoading(false)
+      setError(e?.message || '读取失败')
+      props.onError?.()
+    }).finally(request.release)
   }
 
   createEffect(() => {
     props.path // track
+    props.revision
+    retry()
+    invalidated()
     props.reloadToken // track: in-app edit bumped it → re-fetch fresh text
     load()
   })
@@ -139,13 +144,14 @@ export const FileViewer: Component<Props> = (props) => {
     const tok = props.anchorToken
     void tok
     if (!h || line == null) return
+    const generation = reqToken
     requestAnimationFrame(() => {
       const root = rootRef
-      if (!root) return
+      if (!alive || generation !== reqToken || !root) return
       root.querySelectorAll('.note-hl').forEach(el => el.classList.remove('note-hl'))
       const anchor = findAnchor(root, line)
       if (!anchor) return
-      anchor.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      anchor.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
       const els: HTMLElement[] = []
       if (endLine == null) {
         // section mode: the anchor heading + following siblings up to the
@@ -181,7 +187,14 @@ export const FileViewer: Component<Props> = (props) => {
     })
   })
 
+  const unsubscribe = observeDocuments(path => {
+    if (!path || props.path === path || props.path?.startsWith(path + '/')) setInvalidated(n => n + 1)
+  })
   onCleanup(() => {
+    alive = false
+    reqToken++
+    release?.()
+    unsubscribe()
     if (flashTimer) clearTimeout(flashTimer)
   })
 
@@ -192,7 +205,11 @@ export const FileViewer: Component<Props> = (props) => {
           <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />
         </div>
       )}
-      <div class={props.class ?? ''} ref={rootRef} innerHTML={html()} />
+      {error() && <div class="file-viewer-error" role="alert">
+        无法读取 {props.path}：{error()}
+        <md-text-button onClick={() => setRetry(n => n + 1)}>重试</md-text-button>
+      </div>}
+      <div aria-busy={loading()} data-file-path={props.path ?? ''} class={props.class ?? ''} ref={rootRef} innerHTML={html()} />
     </>
   )
 }

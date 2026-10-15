@@ -1,4 +1,5 @@
-import { Component, Show, createEffect, createSignal, on } from 'solid-js'
+import { StudyCardShell, StudyToolbar, StudyActionDock } from './StudyCardShell'
+import { Component, Show, createEffect, createMemo, createSignal, on } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
 import {
@@ -8,8 +9,8 @@ import {
   resolveLineAt,
   type SplitSelection,
 } from '../lib/split-selection'
-import type { ReadingChunk, ReadingChunkStatus } from '../types'
-import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
+import type { ReadingChunk } from '../types'
+import { IconAdd, IconArrowBack, IconClose, IconEdit, IconPassword, IconUndo } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign round 2;
 // 三栏重构 2026-09-21). One note chunk to read and turn into cards BY HAND.
@@ -19,7 +20,7 @@ import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 // (RelatedPanel) — the card body stays clean.
 //
 // Layout mirrors Flashcard/PreviewCard:
-//   header  = status chips (left) + icon actions (right):
+//   header  = trace identification (left) + icon actions (right):
 //             添加卡片 / 添加挖空 (+ 编辑片段, + 回到复习 in trace mode)
 //   bottom  = status buttons ONLY: 结束阅读 | 无需制卡，跳过 |
 //             下一张（稍后继续） | 制卡完成 (filled)
@@ -48,7 +49,7 @@ import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 // activation of the icon button).
 //
 // Two variants:
-//   round (default) — dealt inside a reading round: progress chip + bottom
+//   round (default) — dealt inside a reading round: bottom
 //                     action row + A/C/S/N shortcuts (App-level).
 //   trace (溯源)    — a review/preview card's source segment, opened via
 //                     溯源: no round actions (there is no reading round),
@@ -56,15 +57,6 @@ import { IconAdd, IconArrowBack, IconEdit, IconPassword } from './icons'
 //
 // Keyboard (App-level, window listener): Space = 制卡完成,
 // A = 添加卡片, C = 添加挖空, S = 跳过, N = 下一张.
-
-const STATUS_LABEL: Record<ReadingChunkStatus, string> = {
-  todo: '未读',
-  active: '正在制卡',
-  done: '制卡完成',
-  skipped: '已跳过',
-  background: '背景',
-  container: '已分割',
-}
 
 interface Props {
   chunk: ReadingChunk
@@ -91,12 +83,25 @@ interface Props {
   onEdit?: () => void
   /** mid-round exit: untouched chunks stay todo/active (round only) */
   onExit: () => void
+  /** Whole-flow controls supplied only for the READING phase. */
+  onUndo?: () => void
+  undoEnabled?: boolean
+  undoBusy?: boolean
+  onExitRound?: () => void
+  exitDisabled?: boolean
   /** 回到复习 (trace only) */
   onBack?: () => void
 }
 
 export const ReadingCard: Component<Props> = (props) => {
+  // Keep identical source HTML stable when chunk metadata changes. Rewriting
+  // innerHTML would discard the line handles already annotated for this text.
+  const bodyHtml = createMemo(() => renderMarkdown(props.chunk.text))
   let bodyRef: HTMLDivElement | undefined
+  // Let Material activate the control without the page's Space-to-complete shortcut.
+  const roundControlKeyDown = (event: KeyboardEvent) => {
+    if (event.key === ' ' || event.key === 'Enter') event.stopPropagation()
+  }
   const trace = () => (props.variant ?? 'round') === 'trace'
 
   const sel = trackChunkSelection(
@@ -258,39 +263,31 @@ export const ReadingCard: Component<Props> = (props) => {
     const heads = props.chunk.heading_path.join(' › ')
     return heads ? `${file} › ${heads}` : file
   }
-  const fileProgress = () => {
-    const done = props.chunk.file_done + props.chunk.file_skipped
-    return `${done} / ${props.chunk.file_chunks}`
-  }
 
   return (
-    <div class="flashcard-wrapper stage-reading">
-      <md-elevated-card class="card-container">
-        <div class="card-inner">
-          <div class="card-header">
-            <div class="card-chips" aria-label="片段信息">
-              {trace() && (
-                <span class="info-chip md-typescale-label-small">溯源 · 来源片段</span>
-              )}
-              <span
-                class={`info-chip reading-status-chip reading-status-${props.chunk.status} md-typescale-label-small`}
-              >
-                {STATUS_LABEL[props.chunk.status] ?? props.chunk.status}
-              </span>
-              <Show when={!trace() && props.chunk.file_chunks > 0}>
-                <span class="info-chip md-typescale-label-small">本文件进度 {fileProgress()}</span>
+    <StudyCardShell stage="reading" source={crumb()} toolbar={
+      <StudyToolbar label="阅读操作">
+              <Show when={!trace() && props.onExitRound}>
+                <md-icon-button aria-label="撤销上次评分" title="撤销上次评分"
+                  disabled={!props.undoEnabled || props.undoBusy || props.busy}
+                  onKeyDown={roundControlKeyDown} onClick={() => props.onUndo?.()}>
+                  <md-icon><IconUndo /></md-icon>
+                </md-icon-button>
+                <md-icon-button aria-label="退出本轮" title="退出本轮"
+                  disabled={props.exitDisabled}
+                  onKeyDown={roundControlKeyDown} onClick={() => props.onExitRound?.()}>
+                  <md-icon><IconClose /></md-icon>
+                </md-icon-button>
               </Show>
-            </div>
-            <div class="card-header-actions">
               <md-icon-button
-                aria-label="添加卡片"
+                aria-label="添加卡片" title="添加卡片"
                 disabled={props.busy}
                 onClick={() => props.onAdd()}
               >
                 <md-icon><IconAdd /></md-icon>
               </md-icon-button>
               <md-icon-button
-                aria-label="添加挖空"
+                aria-label="添加挖空" title="添加挖空"
                 disabled={props.busy}
                 onClick={() => props.onCloze(sel.selText(), sel.selBlock())}
               >
@@ -309,19 +306,24 @@ export const ReadingCard: Component<Props> = (props) => {
                 </md-icon-button>
               </Show>
               <Show when={trace()}>
-                <div class="header-actions-sep" aria-hidden="true" />
                 <md-icon-button
-                  aria-label="回到复习"
+                  aria-label="回到复习" title="回到复习"
                   onClick={() => props.onBack?.()}
                 >
                   <md-icon><IconArrowBack /></md-icon>
                 </md-icon-button>
               </Show>
-            </div>
-          </div>
-
-          <div class="reading-crumb md-typescale-label-small">{crumb()}</div>
-
+      </StudyToolbar>
+    } dock={
+      <Show when={!trace()}>
+        <StudyActionDock>
+          <md-text-button onClick={() => props.onExit()} disabled={props.busy}>结束阅读</md-text-button>
+          <md-text-button onClick={() => props.onSkip()} disabled={props.busy}>{props.chunk.status === 'active' ? '跳过' : '无需制卡，跳过'}</md-text-button>
+          <md-text-button onClick={() => props.onNext()} disabled={props.busy}>下一张（稍后继续）</md-text-button>
+          <md-filled-button onClick={() => props.onComplete()} disabled={props.busy}>制卡完成</md-filled-button>
+        </StudyActionDock>
+      </Show>
+    }>
           {/* 分割确认条 (line-handle picker, 2026-10-01): appears once a
               line handle is clicked; shows the EXACT whole-line cut range
               plus a head AND tail preview of the source lines (user spec:
@@ -368,35 +370,14 @@ export const ReadingCard: Component<Props> = (props) => {
           </Show>
 
           <div
-            class="card-content reading-chunk-body note-body md-typescale-body-medium"
+            class="card-content study-content reading-chunk-body"
             ref={bodyRef}
-            innerHTML={renderMarkdown(props.chunk.text)}
+            innerHTML={bodyHtml()}
             onMouseDown={onBodyMouseDown}
             onClick={onBodyClick}
             onMouseMove={onBodyMove}
             onMouseLeave={onBodyLeave}
           />
-        </div>
-      </md-elevated-card>
-
-      <Show when={!trace()}>
-        <div class="action-area">
-          <div class="ease-buttons">
-            <md-text-button onClick={() => props.onExit()} disabled={props.busy}>
-              结束阅读
-            </md-text-button>
-            <md-text-button onClick={() => props.onSkip()} disabled={props.busy}>
-              {props.chunk.status === 'active' ? '跳过' : '无需制卡，跳过'}
-            </md-text-button>
-            <md-text-button onClick={() => props.onNext()} disabled={props.busy}>
-              下一张（稍后继续）
-            </md-text-button>
-            <md-filled-button onClick={() => props.onComplete()} disabled={props.busy}>
-              制卡完成
-            </md-filled-button>
-          </div>
-        </div>
-      </Show>
-    </div>
+    </StudyCardShell>
   )
 }

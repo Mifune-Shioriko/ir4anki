@@ -115,7 +115,7 @@ def test_card_removal_counts_and_legacy_resume(tmp_path,monkeypatch):
             d=await state();assert d['flow']['stats']['reviewed']==0 and d['flow']['card_handled']==2
             ch=d['reading_round']['chunks'][0]
             await post('/api/reading/act',params={'path':ch['path'],'chunk_key':ch['chunk_key'],'action':'skip'})
-            d=await state();assert d['flow']['phase']=='reading' # first block's cards disappeared
+            d=await state();assert d['flow']['phase']=='review' # effective first block still owes one real answer
             await post('/api/flow/end-reading');d=await state();assert d['flow']['phase']=='review'
             while d['flow']['phase']=='review':
                 await post('/api/answer',params={'card_id':d['cards'][0]['cardId'],'ease':3});d=await state()
@@ -129,7 +129,7 @@ def test_card_removal_counts_and_legacy_resume(tmp_path,monkeypatch):
             seed.clear()
             for i in range(3):seed.add_card(300+i,deck='2026',note=3000+i)
             b._round_write({'status':'active','created':'2000-01-01T00:00:00',
-                            'pending':[300,301,302],'total':5,'done_count':2,'new_count':3})
+                            'pending':[300,301,302],'total':5,'done_count':2,'answered_count':2,'new_count':3})
             d=await state();assert d['flow']['legacy'] and d['flow']['stats']['reviewed']==2
             await post('/api/flow/end-reading');d=await state()
             await post('/api/answer',params={'card_id':d['cards'][0]['cardId'],'ease':3})

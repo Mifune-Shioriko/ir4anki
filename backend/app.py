@@ -33,7 +33,7 @@ Session model (single daily flow, user spec 2026-09-24 → 2026-10-09):
     state/auto_release.json ({day, released}).
   - new cards: NO hourly quota — every round draws up to `new` cards
     UNIFORMLY AT RANDOM from the dealable new pool (user spec 2026-09-04).
-  - every answer triggers a fire-and-forget sync to the self-hosted server
+  - manual sync is default; legacy automatic sync is explicit opt-in
   - round state persists in state/round.json: refreshing the page resumes
     the in-progress round instead of dealing a fresh one (GET /api/session/state)
   - READING MODE (渐进制卡, user spec 2026-09-19, gated ANKI_READING_MODE):
@@ -82,7 +82,6 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -158,6 +157,8 @@ DEFAULT_MODE = "daily"
 # in that single round — 今天的账今天清，不积压. The old default 3 (ceil(D/3)
 # per round × 早中晚三轮) is retired; set ANKI_REVIEW_DUE_DIVISOR=3 to get the
 # legacy three-round pacing back.
+REVIEW_DECK = os.getenv("ANKI_REVIEW_DECK", "").strip()
+
 REVIEW_DUE_DIVISOR = max(1, _env_int("ANKI_REVIEW_DUE_DIVISOR", 1))
 
 # Daily due snapshot (user spec 2026-09-24): D is captured ONCE per Anki day
@@ -195,17 +196,18 @@ async def _daily_review_size(snapshot: bool = False) -> int:
     (new cards still deal); no snapshot is written on failure."""
     day = _anki_day()
     d = _daily_read()
-    if d.get("day") == day and isinstance(d.get("due"), int):
+    if d.get("day") == day and d.get("review_deck", "") == REVIEW_DECK and isinstance(d.get("due"), int):
         due = d["due"]
     else:
         try:
-            ids = await anki("findCards", {"query": "is:due -is:new"})
+            ids = await anki("findCards", {"query": due_review_query()})
             due = len(ids or [])
         except Exception:
             return 0
         if snapshot:
             _daily_write({
                 "day": day,
+                "review_deck": REVIEW_DECK,
                 "due": due,
                 "snapshot_at": datetime.now().isoformat(timespec="seconds"),
             })
@@ -400,6 +402,7 @@ async def _lifespan(app_instance):
                     raise RuntimeError("native answer journal conflicts with business round; manual recovery required")
             await anki("createBackup", {"folder": str(BACKUP_DIR)})
             task = asyncio.create_task(_periodic_backup(backup_stop))
+        _files_relocator().recover()
         yield
     finally:
         backup_stop.set()
@@ -414,12 +417,57 @@ async def _lifespan(app_instance):
 
 
 app = FastAPI(title="anki-review", lifespan=_lifespan)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Ordinary APIs use same-origin browser access and explicit Host allowlisting.
+# Non-browser local tools need no Origin or token; admin/sync retain their own guards.
+class APIAccessGuard:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or not scope['path'].startswith(('/api/', '/media/')):
+            return await self.app(scope, receive, send)
+        from urllib.parse import urlsplit
+        from starlette.responses import JSONResponse
+        headers = httpx.Headers(scope.get('headers', []))
+        host = headers.get('host', '')
+        allowed = {'localhost', '127.0.0.1', '::1'}
+        allowed.update(x.strip().lower() for x in os.getenv('ANKI_TRUSTED_HOSTS', '').split(',') if x.strip())
+        try:
+            parsed = urlsplit('//' + host)
+            hostname = parsed.hostname
+            port = parsed.port
+            import ipaddress
+            try:
+                local_ip = ipaddress.ip_address(hostname).is_loopback
+            except (ValueError, TypeError):
+                local_ip = False
+            valid_host = bool(hostname and (hostname.lower() in allowed or local_ip) and not parsed.username
+                              and not parsed.password and not parsed.path and not parsed.query
+                              and not parsed.fragment and host.count(',') == 0)
+        except ValueError:
+            valid_host = False
+        origin = headers.get('origin')
+        valid_origin = origin is None
+        if origin is not None:
+            try:
+                o = urlsplit(origin)
+                scheme = scope.get('scheme', 'http')
+                default_port = 443 if scheme == 'https' else 80
+                valid_origin = (valid_host and o.scheme == scheme and o.hostname and o.hostname.lower() == hostname.lower()
+                                and (o.port or default_port) == (port or default_port)
+                                and not o.path and not o.query and not o.fragment and not o.username and not o.password)
+            except ValueError:
+                valid_origin = False
+        # Fetch metadata protects browser requests without Origin, including GET.
+        site = headers.get('sec-fetch-site')
+        if not valid_host or not valid_origin or site not in (None, 'none', 'same-origin'):
+            return await JSONResponse({'detail': 'untrusted API host or browser origin'}, status_code=403)(scope, receive, send)
+        # No cross-origin CORS permission. Same-origin preflight is harmless.
+        if scope['method'] == 'OPTIONS':
+            return await JSONResponse({}, status_code=200)(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+app.add_middleware(APIAccessGuard)
 
 _sync_lock = asyncio.Lock()
 _sync_pending = False  # coalesce fire-and-forget syncs
@@ -504,10 +552,17 @@ async def anki(action: str, params: dict | None = None, timeout: float = 30):
     return data.get("result")
 
 
+SYNC_POLICY = os.getenv("ANKI_SYNC_POLICY", "manual")
+if SYNC_POLICY not in ("manual", "legacy"):
+    raise RuntimeError("ANKI_SYNC_POLICY must be manual or legacy")
+
+
 async def do_sync() -> bool:
     """One sync through AnkiConnect. Forced paths call this directly;
     fire_and_forget_sync() throttles the per-answer background path."""
     global _sync_pending, _sync_timer, _sync_last_finish
+    if SYNC_POLICY == "manual":
+        return False
     try:
         async with _sync_lock:
             t0 = time.monotonic()
@@ -533,6 +588,8 @@ def fire_and_forget_sync():
     time, and at most one per SYNC_MIN_INTERVAL seconds (tail delayed,
     never dropped)."""
     global _sync_pending, _sync_timer
+    if SYNC_POLICY == "manual":
+        return
     if _sync_pending:
         return
     _sync_pending = True
@@ -551,14 +608,22 @@ def fire_and_forget_sync():
 # written.
 
 
-def new_card_query() -> str:
-    """Search for dealable new cards.
+def review_scope_query(query: str) -> str:
+    """Anki deck searches include descendants; escape search syntax literally."""
+    if not REVIEW_DECK:
+        return query
+    deck = REVIEW_DECK.replace("\\", "\\\\").replace('"', '\\"')
+    deck = deck.replace("*", "\\*").replace("_", "\\_")
+    return f'{query} deck:"{deck}"'.strip()
 
-    In preview mode, new cards in the preview pool sit SUSPENDED and must
-    not leak into the regular new-card queue, so exclude suspended cards.
-    Preview mode off: the historical query, unchanged.
-    """
-    return "is:new -is:suspended" if PREVIEW_MODE else "is:new"
+
+def due_review_query() -> str:
+    return review_scope_query("is:due -is:new")
+
+
+def new_card_query() -> str:
+    """Preserve the existing preview suspension exclusion and limit recall."""
+    return review_scope_query("is:new -is:suspended" if PREVIEW_MODE else "is:new")
 
 
 # ---- round persistence (survives page refresh) ---------------------------
@@ -622,7 +687,7 @@ async def _write_new_round(rd):
     _round_write(rd)
 
 
-async def restore_round_cards(rd: dict) -> list[dict]:
+async def restore_round_cards(rd: dict, *, current_only=False, render=True) -> list[dict]:
     """Fetch the round's still-pending cards.
 
     Cards answered on another device since the round started are dropped
@@ -636,19 +701,22 @@ async def restore_round_cards(rd: dict) -> list[dict]:
     ids = rd.get("pending", [])
     if not ids:
         return []
-    due_ids = set(await anki("findCards", {"query": "prop:due<=0"}) or [])
-    infos = await anki("cardsInfo", {"cards": ids})
+    due_ids = set(await anki("findCards", {"query": "cid:" + ",".join(map(str, ids)) + " prop:due<=0"}) or [])
+    scoped_ids = set(await anki("findCards", {"query": review_scope_query(
+        "cid:" + ",".join(map(str, ids)))}) or []) if REVIEW_DECK else set(ids)
+    infos = await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": ids})
     # filter [{}] empty rows (vanished cards) before indexing
     info_by_id = {i["cardId"]: i for i in infos or [] if i.get("cardId")}
     keep = [
         cid
         for cid in ids
-        if cid in info_by_id
+        if cid in info_by_id and cid in scoped_ids
+        and info_by_id[cid].get("queue", 0) >= 0
         and (info_by_id[cid]["type"] == 0 or cid in due_ids)
     ]
     dropped = len(ids) - len(keep)
     if dropped:
-        rd.setdefault("answered_count", before.get("done_count",0))
+        rd.setdefault("answered_count", _answer_count(before))
         rd["done_count"] = rd.get("done_count", 0) + dropped
     rd["pending"] = keep
     if not keep:
@@ -656,7 +724,12 @@ async def restore_round_cards(rd: dict) -> list[dict]:
     if rd != before and _pylib is not None and await _round_can_undo(before):
         await anki("engineRoundTransition", {"before":before,"after":rd})
     _round_write(rd)
-    return cards_from_infos(keep, infos)
+    if not render:
+        return []
+    shown = keep[:1] if current_only else keep
+    if _pylib is not None:
+        infos = await anki("cardsInfo", {"cards": shown}) if shown else []
+    return cards_from_infos(shown, infos)
 
 
 # ---- card helpers --------------------------------------------------------
@@ -748,7 +821,7 @@ def cards_from_infos(ids, infos):
     return out
 
 
-async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
+async def build_batch(review_count: int, allow_new: bool, new_count: int = 0, *, render=True):
     """Assemble one study batch.
 
     New cards are INTERLEAVED evenly among the review cards (like Anki's
@@ -761,15 +834,20 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
     priority deal, so nothing starves.
     """
     cards: list[dict] = []
+    async def fetch_dealt(ids):
+        if render or _pylib is None:
+            return await fetch_cards(ids)
+        infos = await anki('cardsMetadata', {'cards': ids})
+        return [{**info, 'isNew': info['type'] == 0} for info in infos if info.get('cardId')]
 
     # review cards: due but not new, most overdue first
-    due_ids = await anki("findCards", {"query": "is:due -is:new"}) or []
+    due_ids = await anki("findCards", {"query": due_review_query()}) or []
     if due_ids:
-        infos = await anki("cardsInfo", {"cards": due_ids})
+        infos = await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": due_ids})
         # filter [{}] empty rows before indexing "due"
         infos = [i for i in infos or [] if i.get("cardId")]
         infos.sort(key=lambda i: i["due"])
-        cards += await fetch_cards([i["cardId"] for i in infos[:review_count]])
+        cards += await fetch_dealt([i["cardId"] for i in infos[:review_count]])
 
     # new cards: random sample within the per-round cap, spread evenly
     if allow_new:
@@ -779,7 +857,7 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
         take = len(new_ids) if new_count <= 0 else min(new_count, len(new_ids))
         if take > 0:
             drawn = new_ids if take == len(new_ids) else random.sample(new_ids, take)
-            new_cards = await fetch_cards(drawn)
+            new_cards = await fetch_dealt(drawn)
             n_reviews = len(cards)
             if n_reviews:
                 for i, c in enumerate(new_cards):
@@ -789,7 +867,7 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
             else:
                 cards += new_cards
 
-    due_remaining = len(await anki("findCards", {"query": "is:due -is:new"}) or [])
+    due_remaining = len(await anki("findCards", {"query": due_review_query()}) or [])
     new_total = len(await anki("findCards", {"query": new_card_query()}) or [])
     return cards, due_remaining, new_total
 
@@ -799,7 +877,7 @@ async def build_batch(review_count: int, allow_new: bool, new_count: int = 0):
 @app.get("/api/status")
 async def status():
     try:
-        due = await anki("findCards", {"query": "is:due -is:new"})
+        due = await anki("findCards", {"query": due_review_query()})
         new = await anki("findCards", {"query": new_card_query()})
         out = {
             "anki": "ok",
@@ -822,7 +900,8 @@ async def status():
             out["preview_pool"] = len(await preview_pool_ids() or [])
         if READING_MODE:
             try:
-                out.update(await _reading_extras())
+                async with _state_lock:
+                    out.update(await _reading_extras())
             except Exception:
                 pass  # fail-soft: status must never break on reading state
         return out
@@ -846,7 +925,7 @@ async def start_session(mode: str | None = None):
         return await _start_session_impl(synced, study_mode(mode))
 
 
-async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
+async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE, *, render=True):
     if PREVIEW_MODE:
         # next-day auto-release (2026-09-27): pool cards made on an earlier
         # day become gradeable new cards now, so this deal sees them.
@@ -856,7 +935,7 @@ async def _start_session_impl(synced: bool, mode: str = DEFAULT_MODE):
     # snapshot, captured on the day's FIRST review deal (snapshot=True)
     review_n = await _daily_review_size(snapshot=True)
     cards, due_remaining, new_total = await build_batch(
-        review_n, allow_new=True, new_count=m["new"]
+        review_n, allow_new=True, new_count=m["new"], render=render
     )
     if cards:
         await _write_new_round(
@@ -891,15 +970,35 @@ async def session_state():
         return await _session_state_impl()
 
 
-async def _session_state_impl():
+async def _session_state_impl(*, current_only=False, render_card=True, reading_state=None):
     """Page-load entry point: resume an unfinished round instead of auto-starting."""
+    if current_only:
+        # Answer responses carry live round/flow progress, not a repeated
+        # corpus census or global pool/statistics refresh on every grade.
+        rd = current_round()
+        if rd and rd.get('status') == 'active':
+            cards = await restore_round_cards(rd, current_only=True, render=render_card)
+        else:
+            cards = []
+        reading = {'reading_mode': READING_MODE}
+        _, rp = reading_state if reading_state is not None else _reading_current_round()
+        if rp and rp.get('status') == 'active':
+            reading['reading_round'] = rp
+        return {'state': rd.get('status', 'none') if rd else 'none',
+                'cards': cards, 'done': (rd or {}).get('done_count', 0),
+                'total': (rd or {}).get('total', 0),
+                'new_in_batch': (rd or {}).get('new_count'),
+                'mode': study_mode((rd or {}).get('mode')),
+                'can_undo': await _round_can_undo(rd) if rd else False,
+                'due_remaining': None, 'new_total': None,
+                'preview_mode': PREVIEW_MODE, **reading}
     if PREVIEW_MODE:
         # next-day auto-release (2026-09-27): pool cards made on an earlier
         # day become gradeable new cards now, so every count below reflects
         # today's true new-card pool
         await auto_release_pool()
     try:
-        due = await anki("findCards", {"query": "is:due -is:new"})
+        due = await anki("findCards", {"query": due_review_query()})
         due_left = len(due or [])
     except Exception:
         due_left = None
@@ -971,7 +1070,7 @@ async def _session_state_impl():
             **reading,
         }
 
-    cards = await restore_round_cards(rd)
+    cards = await restore_round_cards(rd, current_only=current_only)
     if rd.get("status") == "complete" or not cards:
         return {
             "state": "complete",
@@ -1080,7 +1179,7 @@ async def engine_status():
     if _pylib is None:
         return {"backend":"connect", "sync_deferred":False, "undo_available":False,
                 "capabilities":dict.fromkeys(["undo","intervals","memory_state","stats","backup","export"],False)}
-    return await anki("engineStatus")
+    return {**await anki("engineStatus"), "sync_policy": SYNC_POLICY}
 
 
 @app.get("/api/engine/stats")
@@ -1100,6 +1199,69 @@ async def engine_sync(request: Request, body: EngineSyncBody):
         async with _sync_lock:
             result = await anki("sync", {"commit_undo":body.commit_undo}, timeout=300)
         return result if isinstance(result, dict) else {"synced":True,"deferred":False}
+
+
+
+class LocalSyncBody(BaseModel):
+    # Confirmation is mandatory; full-sync direction is deliberately unsupported.
+    commit_undo: Literal[True]
+
+    model_config = {"extra": "forbid"}
+
+
+def _local_sync_authorize(request):
+    """Trust only direct same-origin browser requests on a loopback listener.
+
+    Never use forwarded headers as evidence of locality. A custom header and
+    JSON plus exact Origin validation prevent form/CSRF and wildcard CORS abuse.
+    Host validation prevents DNS rebinding to a loopback peer.
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    def loopback(host):
+        if host == "localhost":
+            return True
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+
+    host = request.headers.get("host", "")
+    origin = request.headers.get("origin", "")
+    try:
+        target = urlsplit(f"{request.url.scheme}://{host}")
+        source = urlsplit(origin)
+        valid_origin = (
+            source.scheme in ("http", "https") and source.netloc == host
+            and source.scheme == request.url.scheme and not source.path
+            and not source.query and not source.fragment and not source.username
+            and loopback(target.hostname) and target.port == source.port
+        )
+    except (ValueError, TypeError):
+        valid_origin = False
+    peer = request.client.host if request.client else ""
+    try:
+        local_peer = ipaddress.ip_address(peer).is_loopback
+    except ValueError:
+        local_peer = False
+    if (not local_peer or not valid_origin
+        or any(h.lower() == "forwarded" or h.lower().startswith("x-forwarded-") for h in request.headers)
+        or request.headers.get("sec-fetch-site", "same-origin") != "same-origin"
+        or request.headers.get("x-ir4anki-local-sync") != "confirm"
+        or request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json"):
+        raise HTTPException(status_code=403, detail="manual sync requires a direct same-origin loopback browser request")
+    if _pylib is None:
+        raise HTTPException(status_code=409, detail="native engine capability unavailable in connect mode")
+
+
+@app.post("/api/local/sync")
+async def local_sync(request: Request, body: LocalSyncBody):
+    _local_sync_authorize(request)
+    async with _state_lock:
+        async with _sync_lock:
+            result = await anki("sync", {"commit_undo": body.commit_undo}, timeout=300)
+        return result if isinstance(result, dict) else {"synced": True, "deferred": False}
 
 
 def _artifact_path(folder, handle):
@@ -1176,9 +1338,17 @@ async def _answer_impl(card_id: int, ease: int):
     if ease not in (1, 2, 3, 4):
         raise HTTPException(status_code=400, detail="ease must be 1-4")
 
-    if _flow_read():
-        wire = await _flow_state_impl(adopt=False)
-        if wire['flow']['phase'] != 'review' or not wire.get('cards') or wire['cards'][0]['cardId'] != card_id:
+    rd_guard = current_round()
+    if rd_guard and rd_guard.get('status') == 'active':
+        await restore_round_cards(rd_guard, render=False)
+    f = _flow_read()
+    if f:
+        r = (_reading_read().get('round') or {}) if READING_MODE else {}
+        _flow_reconcile(f, r.get('pending', []), (current_round() or {}).get('pending', []),
+                        answered_count=_answer_count(current_round()))
+        _flow_write(f)
+        pending = (current_round() or {}).get('pending', [])
+        if f['phase'] != 'review' or not pending or pending[0] != card_id:
             return {"answered":False,"reason":"stale","round":None}
 
     # Guard: only cards in the ACTIVE round may be answered. Refuse BEFORE
@@ -1197,7 +1367,7 @@ async def _answer_impl(card_id: int, ease: int):
     # Connect retains its legacy snapshot contract. Pylib journals the full
     # engine state and uses this snapshot only for the business undo token.
     snap = None
-    infos = await anki("cardsInfo", {"cards": [card_id]})
+    infos = await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": [card_id]})
     info = next((i for i in infos or [] if i.get("cardId")), None)
     if info is not None:
         snap = {k: info.get(k) for k in SNAPSHOT_FIELDS}
@@ -1209,7 +1379,7 @@ async def _answer_impl(card_id: int, ease: int):
         index = after["pending"].index(card_id)
         after["pending"].remove(card_id)
         after["done_count"] = after.get("done_count",0)+1
-        after["answered_count"] = after.get("answered_count",after["done_count"]-1)+1
+        after["answered_count"] = _answer_count(after)+1
         after["new_answered"] = after.get("new_answered",0)+int(info is not None and info.get("type")==0)
         after["last"] = {"cardId":card_id,"index":index,"ease":ease,"snap":copy.deepcopy(snap)}
         if not after["pending"]: after["status"]="complete"
@@ -1227,7 +1397,7 @@ async def _answer_impl(card_id: int, ease: int):
         idx_pos = rd["pending"].index(card_id)
         rd["pending"] = [c for c in rd["pending"] if c != card_id]
         rd["done_count"] = rd.get("done_count", 0) + 1
-        rd["answered_count"] = rd.get("answered_count",rd["done_count"]-1)+1
+        rd["answered_count"] = _answer_count(rd)+1
         rd["new_answered"] = rd.get("new_answered",0)+int(info is not None and info.get("type")==0)
         # single-level undo slot: where the card sat + how to restore it
         rd["last"] = (
@@ -1244,24 +1414,16 @@ async def _answer_impl(card_id: int, ease: int):
             "total": rd.get("total", rd["done_count"]),
             "mode": study_mode(rd.get("mode")),
         }
-        # round just finished: hand the UI fresh pool/quota numbers for the done page
-        if rd["status"] == "complete":
-            try:
-                due_ids = await anki("findCards", {"query": "is:due -is:new"})
-                round_info["due_remaining"] = len(due_ids or [])
-                new_ids = await anki("findCards", {"query": new_card_query()})
-                round_info["new_total"] = len(new_ids or [])
-            except Exception:
-                pass
-            round_info["new_per_round"] = STUDY_MODES[study_mode(rd.get("mode"))]["new"]
-
     # NOTE: the double-Again auto-return hook (2026-09-16) is GONE
     # (user spec 2026-09-27): grading a new card Again twice no longer
     # sends it back to the preview pool — the card stays in the learning
     # queue like any other lapse.
 
     fire_and_forget_sync()
-    return {"answered": True, "round": round_info}
+    state = await _flow_state_impl(adopt=False, current_only=True)
+    if round_info and round_info['state'] == 'complete':
+        round_info.update({k:state[k] for k in ('due_remaining','new_total','new_per_round') if k in state})
+    return {"answered": True, "round": round_info, "state": state}
 
 
 @app.post("/api/undo")
@@ -1317,8 +1479,8 @@ async def _undo_impl():
         else:
             undo_round["done_count"] = max(0, undo_round.get("done_count",0)-1)
         if undo_round["status"] == "complete": undo_round["status"]="active"
-        undo_round["answered_count"] = max(0,undo_round.get("answered_count",undo_round.get("done_count",0)+1)-1)
-        undo_round["new_answered"] = max(0,undo_round.get("new_answered",0)-int(snap.get("type")==0))
+        undo_round["answered_count"] = max(0,_answer_count(undo_round)-int(not last.get("from_prior_round")))
+        undo_round["new_answered"] = max(0,undo_round.get("new_answered",0)-int(snap.get("type")==0 and not last.get("from_prior_round")))
         undo_round.pop("last",None)
         res = await anki("nativeUndo", {"card": cid, "token": snap.get("native_token"), "round_undo":undo_round})
     else:
@@ -1345,13 +1507,17 @@ async def _undo_impl():
         rd["done_count"] = max(0, rd.get("done_count", 0) - 1)
     if rd.get("status") == "complete":
         rd["status"] = "active"
-    rd["answered_count"] = max(0,rd.get("answered_count",rd.get("done_count",0)+1)-1)
-    rd["new_answered"] = max(0,rd.get("new_answered",0)-int(snap.get("type")==0))
+    rd["answered_count"] = max(0,_answer_count(rd)-int(not last.get("from_prior_round")))
+    rd["new_answered"] = max(0,rd.get("new_answered",0)-int(snap.get("type")==0 and not last.get("from_prior_round")))
     rd.pop("last", None)
     _round_write(rd)
     if _pylib is not None:
         await anki("engineUndoAck")
 
+    if REVIEW_DECK and not await anki("findCards", {"query": review_scope_query(f"cid:{cid}")}):
+        await restore_round_cards(rd, render=False)
+        fire_and_forget_sync()
+        return {"restored": True, "card": None, "index": pos}
     cards = await fetch_cards([cid])
     if not cards:
         raise HTTPException(status_code=404, detail="card vanished after restore")
@@ -1482,7 +1648,7 @@ async def auto_release_pool() -> int:
         if legacy_ids:
             # tags come from notesInfo (cardsInfo does NOT return them)
             linfos = [
-                i for i in await anki("cardsInfo", {"cards": legacy_ids}) or []
+                i for i in await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": legacy_ids}) or []
                 if i.get("cardId") and i.get("type") == 0
             ]
             ntags: dict[int, list[str]] = {}
@@ -1504,7 +1670,7 @@ async def auto_release_pool() -> int:
         pool_ready: list[int] = []
         if pool_ids:
             pinfos = [
-                i for i in await anki("cardsInfo", {"cards": pool_ids}) or []
+                i for i in await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": pool_ids}) or []
                 if i.get("cardId") and i.get("type") == 0
             ]
             aged = [
@@ -1549,7 +1715,7 @@ async def _pending_release_today() -> int:
     if not pool_ids:
         return 0
     infos = [
-        i for i in await anki("cardsInfo", {"cards": pool_ids}) or []
+        i for i in await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": pool_ids}) or []
         if i.get("cardId") and i.get("type") == 0
     ]
     return sum(1 for i in infos if _note_created_anki_day(i.get("note") or 0) == today)
@@ -1634,7 +1800,7 @@ async def _round_remove_card(rd: dict | None, card_id: int) -> None:
         return
     import copy
     before = copy.deepcopy(rd)
-    rd.setdefault("answered_count", before.get("done_count",0))
+    rd.setdefault("answered_count", _answer_count(before))
     rd["pending"] = [c for c in rd["pending"] if c != card_id]
     rd["done_count"] = rd.get("done_count", 0) + 1
     if (rd.get("last") or {}).get("cardId") == card_id:
@@ -1726,9 +1892,10 @@ async def add_card(body: NoteAdd):
     # reading bookkeeping must never break card creation)
     if READING_MODE and body.reading_source:
         try:
-            _reading_record_card(body.reading_source, note_id)
+            async with _state_lock:
+                _reading_record_card(body.reading_source, note_id)
         except Exception:
-            pass
+            log.exception("reading provenance bookkeeping failed for note %s", note_id)
     fire_and_forget_sync()
     return {"noteId": note_id, "cardIds": card_ids, "pool": pool}
 
@@ -2228,6 +2395,7 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     return {
         **base,
         "missing": False,
+        "edit_revision": entry.get("file_sha", ""),
         "total_chunks": len(ordered),
         **counts,
         "frontier": frontier,
@@ -2275,6 +2443,7 @@ def _chunk_payload(ch: dict, key: str, st: dict, summary: dict,
         "status": st.get("status", "todo"),
         "cards_created": list(st.get("cards_created") or []),
         "ancestor_cards": ancestor_cards,
+        "edit_revision": summary.get("edit_revision", ""),
         "file_chunks": summary.get("total_chunks", 0),
         "file_done": summary.get("done", 0),
         "file_skipped": summary.get("skipped", 0),
@@ -2387,17 +2556,14 @@ def _store_entry(
 ) -> None:
     """Upsert one file entry (listed or archived) with its segments/cards/
     orphans. Caller runs inside a transaction (`with conn:`)."""
-    conn.execute(
-        "INSERT INTO rfiles(path, in_list, pos, added_at, file_sha, needs_resync) "
-        "VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(path) DO UPDATE SET in_list=excluded.in_list, "
-        "pos=excluded.pos, added_at=excluded.added_at, "
-        "file_sha=excluded.file_sha, needs_resync=excluded.needs_resync",
-        (path, in_list, pos, added_at, file_sha, 1 if needs_resync else 0),
-    )
-    conn.execute("DELETE FROM segments WHERE path = ?", (path,))
-    conn.execute("DELETE FROM rcards WHERE path = ?", (path,))
-    conn.execute("DELETE FROM rorphans WHERE path = ?", (path,))
+    file_row = (path, in_list, pos, added_at, file_sha, int(needs_resync))
+    old_file = conn.execute('SELECT path,in_list,pos,added_at,file_sha,needs_resync FROM rfiles WHERE path=?', (path,)).fetchone()
+    if old_file != file_row:
+        conn.execute('INSERT INTO rfiles(path,in_list,pos,added_at,file_sha,needs_resync) VALUES(?,?,?,?,?,?) '
+                     'ON CONFLICT(path) DO UPDATE SET in_list=excluded.in_list,pos=excluded.pos,added_at=excluded.added_at,file_sha=excluded.file_sha,needs_resync=excluded.needs_resync', file_row)
+    old_segments = {row[1]: row for row in conn.execute('SELECT path,seg_id,start_line,end_line,fingerprint,first_line,title,heading_path,status,parent_seg_id,updated_at FROM segments WHERE path=?', (path,))}
+    old_cards = list(conn.execute('SELECT path,seg_id,note_id FROM rcards WHERE path=? ORDER BY rowid', (path,)))
+    old_orphans = list(conn.execute('SELECT path,chunk_key,data FROM rorphans WHERE path=? ORDER BY rowid', (path,)))
     seg_rows = []
     card_rows = []
     for s in segments or []:
@@ -2417,24 +2583,26 @@ def _store_entry(
         ))
         for nid in s.get("cards_created") or []:
             card_rows.append((path, s.get("seg_id"), nid))
-    if seg_rows:
-        conn.executemany(
-            "INSERT OR REPLACE INTO segments(path, seg_id, start_line, end_line, "
-            "fingerprint, first_line, title, heading_path, status, parent_seg_id, "
-            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            seg_rows,
-        )
-    if card_rows:
-        conn.executemany(
-            "INSERT INTO rcards(path, seg_id, note_id) VALUES(?,?,?)",
-            card_rows,
-        )
+    new_ids = {row[1] for row in seg_rows}
+    for sid in old_segments.keys() - new_ids:
+        conn.execute('DELETE FROM segments WHERE path=? AND seg_id=?', (path, sid))
+    changed = [row for row in seg_rows if old_segments.get(row[1]) != row]
+    if changed:
+        conn.executemany('INSERT OR REPLACE INTO segments(path,seg_id,start_line,end_line,fingerprint,first_line,title,heading_path,status,parent_seg_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)', changed)
+    old_by_seg, new_by_seg = {}, {}
+    for row in old_cards: old_by_seg.setdefault(row[1], []).append(row)
+    for row in card_rows: new_by_seg.setdefault(row[1], []).append(row)
+    for sid in old_by_seg.keys() | new_by_seg.keys():
+        if old_by_seg.get(sid, []) != new_by_seg.get(sid, []):
+            conn.execute('DELETE FROM rcards WHERE path=? AND seg_id=?', (path, sid))
+            conn.executemany('INSERT INTO rcards(path,seg_id,note_id) VALUES(?,?,?)', new_by_seg.get(sid, []))
     orphan_rows = []
     for o in orphans or []:
         o = dict(o or {})
         key = o.pop("chunk_key", "")
         orphan_rows.append((path, key, json.dumps(o, ensure_ascii=False)))
-    if orphan_rows:
+    if old_orphans != orphan_rows:
+        conn.execute("DELETE FROM rorphans WHERE path=?", (path,))
         conn.executemany(
             "INSERT INTO rorphans(path, chunk_key, data) VALUES(?,?,?)",
             orphan_rows,
@@ -2495,7 +2663,7 @@ def _reading_migrate_json() -> None:
             if isinstance(rd, dict):
                 conn.execute(
                     "INSERT INTO rround(id, data) VALUES(1, ?) "
-                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data WHERE rround.data IS NOT excluded.data",
                     (json.dumps(rd, ensure_ascii=False),),
                 )
     finally:
@@ -2704,10 +2872,8 @@ def _reading_read(*, preserve_round=False) -> dict:
 def _reading_write(d: dict | None):
     """Persist the working state dict back to SQLite (one transaction).
 
-    Row-level upserts keep the store structured (queryable, indexable, no
-    single-blob rewrite); at reading-list scale (dozens of files, hundreds
-    of segments) a full sync per action is sub-millisecond and runs under
-    _state_lock, so dict → tables can never race itself.
+    Compare rows inside the transaction and write only deltas. No cross-request
+    snapshot cache: callers serialize read-modify-write with _state_lock.
     """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     conn = _reading_conn()
@@ -2720,11 +2886,10 @@ def _reading_write(d: dict | None):
             listed = d.get("list") or []
             archive = d.get("archive") or {}
             keep = [e.get("path", "") for e in listed] + list(archive.keys())
-            marks = ",".join("?" * len(keep)) if keep else "''"
-            for t in ("rfiles", "segments", "rcards", "rorphans"):
-                conn.execute(
-                    f"DELETE FROM {t} WHERE path NOT IN ({marks})", keep
-                )
+            removed = {row[0] for row in conn.execute('SELECT path FROM rfiles')} - set(keep)
+            for path in removed:
+                for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
+                    conn.execute(f'DELETE FROM {table} WHERE path=?', (path,))
             for i, e in enumerate(listed):
                 _store_entry(
                     conn, e.get("path", ""), 1, i,
@@ -2742,7 +2907,7 @@ def _reading_write(d: dict | None):
             if isinstance(rd, dict):
                 conn.execute(
                     "INSERT INTO rround(id, data) VALUES(1, ?) "
-                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                    "ON CONFLICT(id) DO UPDATE SET data = excluded.data WHERE rround.data IS NOT excluded.data",
                     (json.dumps(rd, ensure_ascii=False),),
                 )
             else:
@@ -2816,7 +2981,7 @@ async def _reading_gates(data: dict) -> set[tuple[str, str]]:
         if not card_ids:
             return set()
         cinfos = [
-            i for i in await anki("cardsInfo", {"cards": card_ids}) or []
+            i for i in await anki("cardsMetadata" if _pylib is not None else "cardsInfo", {"cards": card_ids}) or []
             if i.get("cardId")
         ]
     except Exception:
@@ -2899,6 +3064,19 @@ def _deal_reading(data: dict, gated: set | None = None) -> list[dict]:
     return payloads
 
 
+def _reading_current_round():
+    """Rehydrate only pending reading slots and durably reconcile their drift."""
+    if not READING_MODE:
+        return {}, None
+    import copy
+    data = _reading_read()
+    before = copy.deepcopy(data)
+    payload = _reading_round_payload(data)
+    if data != before:
+        _reading_write(data)
+    return data, payload
+
+
 def _reading_round_payload(data: dict) -> dict | None:
     """Wire shape of the stored round; None when there is none.
 
@@ -2973,6 +3151,7 @@ def _reading_record_card(src: dict | None, note_id: int) -> None:
     wire (the reading UI) or a legacy "line:heading" key (old callers) — the
     latter re-binds by exact seeded-key match when possible.
 
+    Caller must hold _state_lock for this synchronous read-modify-write seam.
     Fail-soft by contract (caller wraps in try): reading bookkeeping must
     never break card creation.
     """
@@ -3064,7 +3243,7 @@ async def _reading_extras() -> dict:
             out["reading_round"] = rp
         _reading_write(data)  # persist any drift migrations
     except Exception:
-        pass  # fail-soft: session/state must never break on reading state
+        log.exception("reading state bookkeeping failed")  # preserve fail-soft session status
     return out
 
 
@@ -3144,17 +3323,26 @@ async def files_list():
             dirs.append(str(rel))
     return {
         "files": [{
-            "path": p, "title": Path(p).stem} for p in _corpus_files()],
+            "path": p, "title": Path(p).stem, "revision": _files_revision(NOTES_DIR / p)} for p in _corpus_files()],
         "dirs": dirs,
     }
 
 
 @app.get("/api/files/raw")
 async def files_raw(path: str):
-    text = _read_note_text(path)
-    if text is None:
-        raise HTTPException(status_code=404, detail="note file not found")
-    return {"path": path, "text": text}
+    async with _state_lock:
+        source = _files_resolve(path)
+        for _ in range(2):
+            if not source.is_file():
+                raise HTTPException(status_code=404, detail="note file not found")
+            revision = _files_revision(source)
+            text = _read_note_text(path)
+            if text is None:
+                raise HTTPException(status_code=404, detail="note file not found")
+            if _files_revision(source) == revision:
+                return {"path": path, "text": text, "revision": revision}
+        raise HTTPException(status_code=409, detail="文件正在变化，请重试")
+
 
 
 # ---- file management (user spec 2026-10-06: 前端 = 语料唯一可信来源) --------
@@ -3169,6 +3357,132 @@ async def files_raw(path: str):
 # External (file-manager/Obsidian) changes are NOT reconciled automatically —
 # the existing missing/orphan/file_sha drift fuses remain the safety net.
 
+@app.middleware('http')
+async def recover_file_relocations(request, call_next):
+    if request.url.path.startswith('/api/'):
+        directory = STATE_DIR / 'file-relocations'
+        try:
+            pending = _files_relocator().needs_recovery()
+            if pending:
+                async with _state_lock:
+                    _files_relocator().recover()
+        except Exception:
+            from fastapi.responses import JSONResponse
+            return JSONResponse(status_code=503, content={'detail': '文件迁移恢复暂停：存在状态冲突，请保留迁移日志并检查'})
+    return await call_next(request)
+
+
+def _files_revision(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
+
+
+@app.get("/api/files/membership")
+async def files_membership():
+    # No schema initialization, gate checks, corpus reads or state writes.
+    if not READING_DB_FILE.exists():
+        return {"paths": []}
+    conn = sqlite3.connect(READING_DB_FILE.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        return {"paths": [r[0] for r in conn.execute("SELECT path FROM rfiles WHERE in_list=1")]}
+    except sqlite3.OperationalError:
+        return {"paths": []}
+    finally:
+        conn.close()
+
+
+def _files_relocation_preflight(old, new, is_dir):
+    from file_relocation import RelocationConflict
+    src, dst = _files_resolve(old), _files_resolve(new)
+    if not src.exists() or dst.exists():
+        raise RelocationConflict('源不存在或目标已存在')
+    if is_dir and (src == dst or src in dst.parents):
+        raise RelocationConflict('不能移动到自己或子目录')
+    _flow_read()  # fail before disk mutation on corrupt coordinator
+    conn = _reading_conn()
+    try:
+        for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
+            if conn.execute(f"SELECT 1 FROM {table} WHERE path=? OR path LIKE ? ESCAPE '\\' LIMIT 1", (new, _like_escape(new + '/') + '%')).fetchone():
+                raise RelocationConflict('目标存在阅读状态，不能覆盖')
+    finally:
+        conn.close()
+
+
+def _files_relocation_signature(path, is_dir):
+    def match(p):
+        return p == path or (is_dir and p.startswith(path + '/'))
+    conn = _reading_conn()
+    try:
+        rows = {t: sorted([list(r) for r in conn.execute(f'SELECT * FROM {t}') if match(r[0])], key=str)
+                for t in ('rfiles', 'segments', 'rcards', 'rorphans')}
+        round_row = conn.execute('SELECT data FROM rround WHERE id=1').fetchone()
+        rd = json.loads(round_row[0]) if round_row and round_row[0] else {}
+        rows['pending'] = [r for r in rd.get('pending', []) if match(r.get('path', ''))]
+        flow = _flow_read()
+        rows['flow'] = [[a for a in slot if match(a[0])] for slot in (flow or {}).get('slots', []) if any(match(a[0]) for a in slot)]
+        return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
+    finally:
+        conn.close()
+
+
+def _files_relocator():
+    from file_relocation import Relocator
+    return Relocator(_files_root(), STATE_DIR, _files_relocation_preflight,
+                     _reading_relocate, None, _files_relocation_signature)
+
+
+def _files_relocate_api(old, new, is_dir, request_id=None, request=None):
+    from file_relocation import RelocationConflict
+    try:
+        return _files_relocator().move(old, new, is_dir, request_id=request_id, request=request)
+    except RelocationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail='迁移待恢复，请刷新后重试') from exc
+
+
+class FilesUndoBody(BaseModel):
+    operationId: str
+    requestId: str | None = None
+
+
+def _files_request_result(request_id, request=None):
+    from file_relocation import RelocationConflict
+    try:
+        return _files_relocator().request_result(request_id, request)
+    except RelocationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail='迁移待恢复，请刷新后重试') from exc
+
+
+@app.get('/api/files/operation')
+async def files_operation(request_id: str):
+    async with _state_lock:
+        return _files_request_result(request_id)
+
+
+def _files_request_retry(request_id, request):
+    if request_id:
+        result = _files_request_result(request_id, request)
+        if result['status'] == 'complete':
+            return result
+        if result['status'] == 'cancelled':
+            raise HTTPException(status_code=409, detail='该请求已取消，请发起新的操作')
+
+
+@app.post('/api/files/undo')
+async def files_undo(body: FilesUndoBody):
+    from file_relocation import RelocationConflict
+    async with _state_lock:
+        try:
+            return _files_relocator().undo(body.operationId, body.requestId)
+        except RelocationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail='撤销待恢复，请刷新确认') from exc
+
+
 def _files_root() -> Path:
     return NOTES_DIR.resolve()
 
@@ -3180,7 +3494,10 @@ def _files_resolve(rel: str) -> Path:
     if not rel:
         raise HTTPException(status_code=400, detail="path 不能为空")
     root = _files_root()
-    p = (NOTES_DIR / rel).resolve()
+    lexical = NOTES_DIR / rel
+    if any(p.is_symlink() for p in [lexical, *lexical.parents] if p == NOTES_DIR or p.is_relative_to(NOTES_DIR)):
+        raise HTTPException(status_code=400, detail="不能操作符号链接路径")
+    p = lexical.resolve()
     if not p.is_relative_to(root) or p == root:
         raise HTTPException(status_code=400, detail="非法路径")
     if any(part in NOTES_SKIP_DIRS for part in p.relative_to(root).parts):
@@ -3207,7 +3524,7 @@ def _like_escape(s: str) -> str:
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool) -> None:
+def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool, operation_id: str | None = None, fault=lambda phase: None) -> None:
     """Migrate every reading-store reference from old_rel to new_rel.
 
     Single file: exact-path UPDATEs. Directory: every stored path under
@@ -3221,8 +3538,17 @@ def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool) -> None:
     mapping: dict[str, str] = {}
     conn = _reading_conn()
     try:
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute("CREATE TABLE IF NOT EXISTS file_relocations (id TEXT PRIMARY KEY)")
+        already = operation_id and conn.execute("SELECT 1 FROM file_relocations WHERE id=?", (operation_id,)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
         with conn:
-            for t in ("rfiles", "segments", "rcards", "rorphans"):
+            if operation_id and not already:
+                from file_relocation import RelocationConflict
+                for table in ('rfiles', 'segments', 'rcards', 'rorphans'):
+                    if conn.execute(f"SELECT 1 FROM {table} WHERE path=? OR path LIKE ? ESCAPE '\\' LIMIT 1", (new_rel, _like_escape(new_rel + '/') + '%')).fetchone():
+                        raise RelocationConflict('目标阅读状态已变化，迁移恢复暂停')
+            for t in (() if already else ("rfiles", "segments", "rcards", "rorphans")):
                 if is_dir:
                     rows = conn.execute(
                         f"SELECT DISTINCT path FROM {t} "
@@ -3257,16 +3583,31 @@ def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool) -> None:
                             "UPDATE rround SET data = ? WHERE id = 1",
                             (json.dumps(rd, ensure_ascii=False),),
                         )
-            flow = _flow_read()
-            if flow and flow.get('slots') and mapping:
-                for slot in flow['slots']:
-                    for path, key in list(slot):
-                        alias = [mapping.get(path, path), key]
-                        if alias not in slot:
-                            slot.append(alias)
-                # Keep old aliases across the SQLite/JSON boundary so a
-                # failed transaction cannot consume an unfinished slot.
+            if operation_id and not already:
+                conn.execute("INSERT INTO file_relocations(id) VALUES (?)", (operation_id,))
+            fault('db_before')
+        fault('db')
+        # FULL commits the WAL; also persist directory entries for a newly
+        # created database before the relocation journal can become complete.
+        for directory in (STATE_DIR, STATE_DIR.parent):
+            fd = os.open(directory, os.O_RDONLY)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        fault('db_durable')
+        flow = _flow_read()
+        if flow and flow.get('slots'):
+            touched = False
+            for slot in flow['slots']:
+                for path, key in list(slot):
+                    np = new_rel + path[len(old_rel):] if path == old_rel or (is_dir and path.startswith(old_p)) else path
+                    alias = [np, key]
+                    if alias not in slot:
+                        slot.append(alias)
+                        touched = True
+            fault('flow_before')
+            if touched:
                 _flow_write(flow)
+            fault('flow')
     finally:
         conn.close()
     for old in mapping:
@@ -3323,11 +3664,13 @@ def _reading_purge(rel: str, is_dir: bool) -> None:
 class FilesRenameBody(BaseModel):
     path: str
     new_name: str
+    requestId: str | None = None
 
 
 class FilesMoveBody(BaseModel):
     path: str
     new_dir: str  # corpus-relative; "" = corpus root
+    requestId: str | None = None
 
 
 class FilesDeleteBody(BaseModel):
@@ -3338,6 +3681,10 @@ class FilesDeleteBody(BaseModel):
 @app.post("/api/files/rename")
 async def files_rename(body: FilesRenameBody):
     async with _state_lock:
+        request = dict(action='rename', path=body.path, value=body.new_name)
+        replay = _files_request_retry(body.requestId, request)
+        if replay:
+            return replay
         src = _files_resolve(body.path)
         if not src.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
@@ -3360,14 +3707,16 @@ async def files_rename(body: FilesRenameBody):
             return {"ok": True, "path": old_rel, "unchanged": True}
         if dst.exists():
             raise HTTPException(status_code=409, detail="目标名称已存在")
-        os.rename(src, dst)
-        _reading_relocate(old_rel, _files_rel(dst), is_dir)
-        return {"ok": True, "path": _files_rel(dst), "old_path": old_rel}
+        return _files_relocate_api(old_rel, _files_rel(dst), is_dir, body.requestId, request)
 
 
 @app.post("/api/files/move")
 async def files_move(body: FilesMoveBody):
     async with _state_lock:
+        request = dict(action='move', path=body.path, value=body.new_dir)
+        replay = _files_request_retry(body.requestId, request)
+        if replay:
+            return replay
         src = _files_resolve(body.path)
         if not src.exists():
             raise HTTPException(status_code=404, detail="文件不存在")
@@ -3384,10 +3733,7 @@ async def files_move(body: FilesMoveBody):
             return {"ok": True, "path": old_rel, "unchanged": True}
         if dst.exists():
             raise HTTPException(status_code=409, detail="目标位置已有同名文件/文件夹")
-        dst_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(src), str(dst))
-        _reading_relocate(old_rel, _files_rel(dst), is_dir)
-        return {"ok": True, "path": _files_rel(dst), "old_path": old_rel}
+        return _files_relocate_api(old_rel, _files_rel(dst), is_dir, body.requestId, request)
 
 
 @app.post("/api/files/delete")
@@ -3412,19 +3758,121 @@ async def files_delete(body: FilesDeleteBody):
         return {"ok": True, "deleted": rel, "was_dir": is_dir}
 
 
-def _rewrite_image_refs(text: str, mapping: dict[str, str]) -> str:
-    """Point .md image references at renamed uploads (basename-collision
-    auto-prefixing). Covers markdown `](…name)` and html `src/href="…name"`
-    where the reference's LAST path segment is the old basename."""
-    for old, new in mapping.items():
-        esc = re.escape(old)
-        text = re.sub(
-            r"(\]\((?:[^()\s]*/)?)"+esc+r"(\))",
-            lambda m, n=new: m.group(1) + n + m.group(2), text)
-        text = re.sub(
-            r"((?:src|href)\s*=\s*[\"'](?:[^\"']*/)?)"+esc+r"([\"'])",
-            lambda m, n=new: m.group(1) + n + m.group(2), text)
-    return text
+def _rewrite_image_refs(text: str, mapping: dict[str, str], source: str, destination: str, *, max_bytes: int) -> str:
+    """Resolve references in the original upload tree, then map to final paths."""
+    import posixpath
+    from urllib.parse import urlsplit, unquote, quote
+    def rewrite(ref):
+        try:
+            parsed = urlsplit(re.sub(r'\\([\\() ])', r'\1', ref))
+        except ValueError:
+            return ref
+        if parsed.scheme or parsed.netloc or ref.startswith(('/', '#')):
+            return ref
+        identity = posixpath.normpath(posixpath.join(posixpath.dirname(source), unquote(parsed.path)))
+        if identity == '..' or identity.startswith('../') or identity not in mapping:
+            return ref
+        result = quote(posixpath.relpath(mapping[identity], posixpath.dirname(destination) or '.'), safe='/.-_')
+        return result + ('?' + parsed.query if parsed.query else '') + ('#' + parsed.fragment if parsed.fragment else '')
+    def visible_markdown(source_text):
+        # Parse blocks only: token maps include quote/list containers. Keep original
+        # offsets and bytes; the parser's normalized text is never written back.
+        from markdown_it import MarkdownIt
+        parser = MarkdownIt('commonmark', {'maxNesting': 100})
+        normalized = source_text.replace('\r\n', '\n').replace('\r', '\n')
+        tokens = []
+        parser.block.parse(normalized, parser, {}, tokens)
+        starts = [0] + [match.end() for match in re.finditer(r'\r\n|\r|\n', source_text)]
+        starts.append(len(source_text))
+        characters = list(source_text)
+        for token in tokens:
+            if token.type in ('code_block', 'fence') and token.map is not None:
+                start, stop = token.map
+                for position in range(starts[start], starts[stop]):
+                    if characters[position] not in '\r\n':
+                        characters[position] = ' '
+        visible = ''.join(characters)
+        runs = list(re.finditer(r'`+', visible))
+        next_same, last = {}, {}
+        for index in range(len(runs) - 1, -1, -1):
+            length = len(runs[index][0])
+            if length in last:
+                next_same[index] = last[length]
+            last[length] = index
+        characters, end = list(visible), 0
+        for index, run in enumerate(runs):
+            if run.start() < end or index not in next_same:
+                continue
+            # Backslash escapes apply to openers outside code, not closers inside.
+            backslashes, position = 0, run.start() - 1
+            while position >= 0 and visible[position] == '\\':
+                backslashes += 1; position -= 1
+            if backslashes % 2:
+                continue
+            end = runs[next_same[index]].end()
+            for position in range(run.start(), end):
+                if characters[position] != '\n':
+                    characters[position] = ' '
+        return ''.join(characters)
+
+    def bounded_sub(pattern, replace, source_text, flags=0):
+        parts, offset, size = [], 0, 0
+        def append(value):
+            nonlocal size
+            size += len(value.encode('utf-8'))
+            if size > max_bytes:
+                raise HTTPException(status_code=413, detail=f'图片引用改写后超出文件预算（{max_bytes} 字节）')
+            parts.append(value)
+        compiled = re.compile(pattern, flags)
+        for match in compiled.finditer(visible_markdown(source_text)):
+            original = compiled.match(source_text, match.start())
+            replacement = replace(original) if original and original.end() == match.end() else source_text[match.start():match.end()]
+            append(source_text[offset:match.start()]); append(replacement); offset = match.end()
+        append(source_text[offset:])
+        return ''.join(parts)
+    # Inline destinations can have balanced parentheses or escaped punctuation.
+    mask, parts, offset, size = visible_markdown(text), [], 0, 0
+    def append_inline(value):
+        nonlocal size
+        size += len(value.encode('utf-8'))
+        if size > max_bytes:
+            raise HTTPException(status_code=413, detail=f'图片引用改写后超出文件预算（{max_bytes} 字节）')
+        parts.append(value)
+    for match in re.finditer(r'!\[[^\]\n]*\]\(\s*', mask):
+        start = match.end()
+        if start < offset or start >= len(mask):
+            continue
+        if mask[start] == '<':
+            end = mask.find('>', start + 1)
+            if end < 0 or '\n' in mask[start:end]:
+                continue
+            start += 1
+        else:
+            end, depth = start, 0
+            while end < len(mask):
+                char = mask[end]
+                if char == '\\' and end + 1 < len(mask):
+                    end += 2; continue
+                if char == '(':
+                    depth += 1
+                elif char == ')':
+                    if depth == 0: break
+                    depth -= 1
+                elif char.isspace():
+                    break
+                end += 1
+            if depth or end == len(mask):
+                continue
+        append_inline(text[offset:start]); append_inline(rewrite(text[start:end])); offset = end
+    append_inline(text[offset:])
+    text = ''.join(parts)
+    labels = {re.sub(r'\s+', ' ', (m[2] or m[1])).strip().lower()
+              for m in re.finditer(r'!\[([^\]\n]+)\](?:\[([^\]\n]*)\])?(?!\()', visible_markdown(text))}
+    text = bounded_sub(r'(?m)^( {0,3}\[([^\]\n]+)\]:[ \t]*)(<[^>]+>|[^\s]+)([^\n]*)$',
+        lambda m: m[1] + (('<' + rewrite(m[3][1:-1]) + '>') if m[3].startswith('<') else rewrite(m[3])) + m[4]
+            if re.sub(r'\s+', ' ', m[2]).strip().lower() in labels else m[0], text)
+    return bounded_sub(r"((?:src|href)\s*=\s*[\"'])([^\"']+)([\"'])",
+                  lambda m: m[1] + rewrite(m[2]) + m[3], text, flags=re.I)
 
 
 @app.post("/api/files/upload")
@@ -3445,44 +3893,67 @@ async def files_upload(
     lesson) and the same batch's .md references are rewritten to match.
     Uploaded files do NOT auto-join the reading list (stays opt-in).
     """
+    if len(files) != len(rel_paths):
+        raise HTTPException(status_code=400, detail="files 与 rel_paths 数量不一致")
+    if not files:
+        raise HTTPException(status_code=400, detail="没有上传任何文件")
+    if on_conflict not in ("error", "overwrite", "rename", "skip"):
+        raise HTTPException(status_code=400, detail="on_conflict 非法")
+    tdir_rel = (target_dir or "").strip().replace("\\", "/").strip("/")
+    tdir = _files_root() if not tdir_rel else _files_resolve(tdir_rel)
+    if tdir.exists() and not tdir.is_dir():
+        raise HTTPException(status_code=400, detail="目标不是文件夹")
+
+    if len(files) > UPLOAD_MAX_FILES:
+        raise HTTPException(status_code=413, detail=f"上传文件过多（最多 {UPLOAD_MAX_FILES} 个）")
+    total_bytes = 0
+    # read + validate everything up front (all-or-nothing before writes)
+    items: list[dict] = []
+    original_paths = set()
+    for up, rel in zip(files, rel_paths):
+        rel = (rel or "").strip().replace("\\", "/")
+        if rel.startswith("/"):
+            raise HTTPException(status_code=400, detail="上传路径必须是相对路径")
+        import posixpath
+        rel = posixpath.normpath(rel) if rel else ""
+        if not rel:
+            raise HTTPException(status_code=400, detail="缺少相对路径")
+        dest = _files_resolve(
+            (tdir_rel + "/" if tdir_rel else "") + rel)
+        identity = _files_rel(dest)
+        if identity in original_paths:
+            raise HTTPException(status_code=409, detail=f"批内重复目标：{rel}")
+        original_paths.add(identity)
+        suffix = dest.suffix.lower()
+        if suffix == ".md":
+            kind = "md"
+        elif suffix in NOTE_IMAGE_EXTS:
+            kind = "img"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"仅支持 .md 笔记和图片：{rel}",
+            )
+        data = await _read_upload_bounded(up, min(UPLOAD_MAX_BYTES, UPLOAD_BATCH_MAX_BYTES - total_bytes), rel)
+        total_bytes += len(data)
+        if not data:
+            raise HTTPException(status_code=400, detail=f"空文件：{rel}")
+        if len(data) > UPLOAD_MAX_BYTES:
+            raise HTTPException(
+                status_code=413, detail=f"文件过大（最多 25 MB）：{rel}")
+        if kind == "md":
+            try:
+                data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail=f"不是有效的 UTF-8 文本：{rel}")
+        items.append({"rel": rel, "dest": dest, "kind": kind, "data": data})
+
     async with _state_lock:
-        if len(files) != len(rel_paths):
-            raise HTTPException(status_code=400, detail="files 与 rel_paths 数量不一致")
-        if not files:
-            raise HTTPException(status_code=400, detail="没有上传任何文件")
-        if on_conflict not in ("error", "overwrite", "rename", "skip"):
-            raise HTTPException(status_code=400, detail="on_conflict 非法")
-        tdir_rel = (target_dir or "").strip().replace("\\", "/").strip("/")
-        tdir = _files_root() if not tdir_rel else _files_resolve(tdir_rel)
+        # Revalidate after off-lock reads; mutations and name allocation remain serialized.
+        for it in items:
+            _files_resolve((tdir_rel + "/" if tdir_rel else "") + it["rel"])
         if tdir.exists() and not tdir.is_dir():
-            raise HTTPException(status_code=400, detail="目标不是文件夹")
-
-        # read + validate everything up front (all-or-nothing before writes)
-        items: list[dict] = []
-        for up, rel in zip(files, rel_paths):
-            rel = (rel or "").strip().replace("\\", "/").lstrip("/")
-            if not rel:
-                raise HTTPException(status_code=400, detail="缺少相对路径")
-            dest = _files_resolve(
-                (tdir_rel + "/" if tdir_rel else "") + rel)
-            suffix = dest.suffix.lower()
-            if suffix == ".md":
-                kind = "md"
-            elif suffix in NOTE_IMAGE_EXTS:
-                kind = "img"
-            else:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"仅支持 .md 笔记和图片：{rel}",
-                )
-            data = await up.read()
-            if not data:
-                raise HTTPException(status_code=400, detail=f"空文件：{rel}")
-            if len(data) > UPLOAD_MAX_BYTES:
-                raise HTTPException(
-                    status_code=413, detail=f"文件过大（最多 25 MB）：{rel}")
-            items.append({"rel": rel, "dest": dest, "kind": kind, "data": data})
-
+            raise HTTPException(status_code=409, detail="目标不是文件夹")
         # existing image basenames (media is served corpus-wide by basename)
         img_names: set[str] = set()
         for p in NOTES_DIR.rglob("*"):
@@ -3492,18 +3963,21 @@ async def files_upload(
             except OSError:
                 continue
 
+        reserved: set[Path] = {it["dest"] for it in items}
+        allocated: set[Path] = set()
+
         def _free_name(dirpath: Path, name: str) -> str:
             """First free `name`, else `stem (1).ext`, `stem (2).ext`, …"""
-            if not (dirpath / name).exists():
+            if not (dirpath / name).exists() and (dirpath / name) not in reserved and (dirpath / name) not in allocated:
                 return name
             stem, ext = Path(name).stem, Path(name).suffix
             i = 1
-            while (dirpath / f"{stem} ({i}){ext}").exists():
+            while ((dirpath / f"{stem} ({i}){ext}").exists() or (dirpath / f"{stem} ({i}){ext}") in reserved or (dirpath / f"{stem} ({i}){ext}") in allocated):
                 i += 1
             return f"{stem} ({i}){ext}"
 
         conflicts: list[str] = []
-        rename_map: dict[str, str] = {}   # old basename → final basename
+        rename_map: dict[str, str] = {}   # original relative image identity → final corpus path
         for it in items:
             dest: Path = it["dest"]
             if it["kind"] == "md":
@@ -3534,12 +4008,12 @@ async def files_upload(
                     while cand in img_names:
                         cand = f"{stem} ({i}){ext}"
                         i += 1
-                    rename_map[dest.name] = cand
                     it["dest"] = dest.parent / cand
                     it["action"] = "renamed"
                 else:
                     it["action"] = "written"
                 img_names.add(it["dest"].name)  # claim within the batch
+                rename_map[it["rel"]] = _files_rel(it["dest"])
 
         if conflicts:
             raise HTTPException(
@@ -3548,33 +4022,60 @@ async def files_upload(
                     {"conflicts": conflicts}, ensure_ascii=False),
             )
 
-        # write .md files (with image refs rewritten), then images
-        saved: list[dict] = []
+        existing_parent = _files_root()
+        while not existing_parent.exists():
+            existing_parent = existing_parent.parent
+        name_limit = os.pathconf(existing_parent, 'PC_NAME_MAX')
+        path_limit = os.pathconf(existing_parent, 'PC_PATH_MAX')
         for it in items:
-            if it["action"] == "skipped":
-                saved.append({"path": it["rel"], "action": "skipped"})
+            dest = it['dest']
+            if (any(len(part.encode('utf-8')) > name_limit for part in dest.parts)
+                or len(os.fsencode(dest)) >= path_limit):
+                raise HTTPException(status_code=400, detail=f"分配后的路径过长：{it['rel']}")
+
+        for it in items:
+            if it['action'] == 'skipped':
                 continue
-            dest: Path = it["dest"]
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if it["kind"] == "md":
-                try:
-                    text = it["data"].decode("utf-8")
-                except UnicodeDecodeError:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"不是有效的 UTF-8 文本：{it['rel']}",
-                    )
-                text = _rewrite_image_refs(text, rename_map)
-                dest.write_text(text, encoding="utf-8")
-            else:
-                dest.write_bytes(it["data"])
-            saved.append({"path": _files_rel(dest), "action": it["action"],
-                          "original": it["rel"]})
-        return {
-            "ok": True,
-            "saved": saved,
-            "images_renamed": rename_map,
-        }
+            dest = it['dest']
+            if dest in allocated or (dest.exists() and not dest.is_file()):
+                raise HTTPException(status_code=409, detail=f"目标冲突：{it['rel']}")
+            allocated.add(dest)
+            if any((parent.exists() and not parent.is_dir()) or parent in reserved for parent in dest.parents if parent != _files_root() and parent.is_relative_to(_files_root())):
+                raise HTTPException(status_code=409, detail=f"父路径冲突：{it['rel']}")
+            if it['kind'] == 'md':
+                it['data'] = _rewrite_image_refs(it['data'].decode('utf-8'), rename_map, it['rel'], _files_rel(dest), max_bytes=UPLOAD_MAX_BYTES).encode('utf-8')
+
+        if sum(len(it['data']) for it in items) > UPLOAD_BATCH_MAX_BYTES:
+            raise HTTPException(status_code=413, detail=f'改写后超出上传批次预算（{UPLOAD_BATCH_MAX_BYTES} 字节）')
+
+        # Each file is atomically replaced. A batch is NOT a filesystem transaction:
+        # true I/O failures report exactly what committed, allowing a conscious retry.
+        saved: list[dict] = []
+        for index, it in enumerate(items):
+            if it['action'] == 'skipped':
+                saved.append({'path': it['rel'], 'action': 'skipped'})
+                continue
+            dest = it['dest']
+            temp = dest.parent / ('.upload-' + uuid.uuid4().hex)
+            try:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with temp.open('xb') as stream:
+                    stream.write(it['data']); stream.flush(); os.fsync(stream.fileno())
+                temp.replace(dest)
+                saved.append({'path': _files_rel(dest), 'action': it['action'], 'original': it['rel']})
+                fd = os.open(dest.parent, os.O_RDONLY)
+                try: os.fsync(fd)
+                finally: os.close(fd)
+            except OSError as exc:
+                raise HTTPException(status_code=503, detail={'partial': bool(saved), 'saved': saved,
+                    'failed': it['rel'], 'remaining': [x['rel'] for x in items[index:]],
+                    'message': '上传 I/O 失败；请核对已保存文件后重试'}) from exc
+            finally:
+                with suppress(OSError):
+                    temp.unlink(missing_ok=True)
+        return {'ok': True, 'saved': saved, 'images_renamed': {rel: final for rel, final in rename_map.items()
+            if final != ((tdir_rel + '/') if tdir_rel else '') + rel}}
+
 
 
 class ReadingPathBody(BaseModel):
@@ -3921,7 +4422,7 @@ async def reading_finish():
 
 
 # ---- persisted whole-round coordinator (independent of both schedulers) ----
-from flow import create as _flow_create, reconcile as _flow_reconcile, replace_slot as _flow_replace_slot
+from flow import create as _flow_create, reconcile as _flow_reconcile, replace_slot as _flow_replace_slot, answer_count as _answer_count
 FLOW_FILE = STATE_DIR / 'flow.json'
 
 
@@ -3976,7 +4477,7 @@ async def _flow_initialize(mode, legacy=False):
     if not f.get('cards_ready'):
         existing = _round_read()
         if existing is None or (f.get('fresh') and existing == f.get('previous_cards')):
-            batch = await _start_session_impl(False, mode)
+            batch = await _start_session_impl(False, mode, render=False)
             if not batch['cards']:
                 await _write_new_round({'status':'complete','created':datetime.now().isoformat(timespec='seconds'),
                                         'total':0,'done_count':0,'pending':[],'new_count':0,'mode':mode})
@@ -3990,7 +4491,7 @@ async def _flow_initialize(mode, legacy=False):
     _flow_write(flow)
 
 
-async def _flow_state_impl(adopt=True):
+async def _flow_state_impl(adopt=True, *, current_only=False):
     f = _flow_read()
     if f and f.get('status') == 'exiting':
         await _flow_exit_impl()
@@ -4004,15 +4505,30 @@ async def _flow_state_impl(adopt=True):
         if r.get('status') == 'active' or c.get('status') == 'active':
             await _flow_initialize(study_mode(c.get('mode') or r.get('mode')), True)
             f = _flow_read()
-    d = await _session_state_impl()
+    # Validate both queues before choosing whether to render a recall card.
+    # A withdrawal can change reading -> review in this very response; using
+    # the persisted phase here otherwise returns REVIEW with no presented card.
+    reading_state = _reading_current_round() if current_only or f else None
+    if f:
+        r = (reading_state[0].get('round') or {}) if READING_MODE else {}
+        c = current_round() or {}
+        if c.get('pending'):
+            await restore_round_cards(c, current_only=True, render=False)
+        _flow_reconcile(f, r.get('pending', []), c.get('pending', []),
+                        answered_count=_answer_count(c))
+    # Refresh global counts once at the final landing screen, not per grade.
+    lightweight = (current_only or bool(f)) and (current_round() or {}).get('status') != 'complete'
+    d = await _session_state_impl(current_only=lightweight,
+                                  render_card=not f or f.get('phase') == 'review',
+                                  reading_state=reading_state)
     if not f:
         return {**d, 'flow':None}
     r = (_reading_read().get('round') or {}) if READING_MODE else {}
     c = _round_read() or {}
-    _flow_reconcile(f,r.get('pending',[]),c.get('pending',[]))
+    _flow_reconcile(f,r.get('pending',[]),c.get('pending',[]), answered_count=_answer_count(c))
     stats = r.get('stats') or f.get('reading_stats_base',{})
     f['stats'] = {'readingDone':stats.get('done',0),'readingSkipped':stats.get('skipped',0),
-                  'readingNext':stats.get('next',0),'reviewed':c.get('answered_count',c.get('done_count',0)),
+                  'readingNext':stats.get('next',0),'reviewed':_answer_count(c),
                   'newReviewed':c.get('new_answered',0)}
     _flow_write(f)
     return {**d, 'flow':f}
@@ -4341,6 +4857,8 @@ class ReadingEditBody(BaseModel):
     path: str
     seg_id: int
     new_text: str
+    expected_revision: str
+    expected_fingerprint: str
 
 
 @app.post("/api/reading/edit")
@@ -4382,6 +4900,10 @@ async def reading_edit(body: ReadingEditBody):
         text = _read_note_text(body.path)
         if text is None:
             raise HTTPException(status_code=404, detail="note file not found")
+        revision = hashlib.sha256(text.encode('utf-8')).hexdigest()
+        if (body.expected_revision != revision or entry.get('file_sha') != revision
+            or body.expected_fingerprint != seg.get('fingerprint')):
+            raise HTTPException(status_code=409, detail='内容已被其他编辑器或外部文件修改；草稿已保留，请重新打开后合并')
         lines = text.split("\n")
         st = max(1, min(int(seg["start_line"]), len(lines) or 1))
         en = max(st, min(int(seg["end_line"]), len(lines)))
@@ -4625,6 +5147,7 @@ async def reading_source(note_id: int):
                     "line_start": a,
                     "line_end": b,
                     "fingerprint": s.get("fingerprint", ""),
+                    "edit_revision": entry.get("file_sha", ""),
                     "text": "\n".join(lines[a - 1 : b]) if lines else "",
                     # every note id created from THIS segment (三栏左栏
                     # 「相关卡片」, 2026-09-21) — feed to /api/reading/cards
@@ -4708,7 +5231,7 @@ async def reading_media_upload(file: UploadFile = File(...)):
     references, served back at /api/reading/media/. Same clobber-proof
     naming as /api/media/upload (timestamp + random suffix)."""
     _reading_guard()
-    data = await file.read()
+    data = await _read_upload_bounded(file, UPLOAD_MAX_BYTES, file.filename or "image")
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
     if len(data) > UPLOAD_MAX_BYTES:
@@ -4783,7 +5306,29 @@ ALLOWED_MEDIA_EXT = {
     ".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp",
     ".mp3", ".wav", ".ogg", ".m4a", ".flac", ".mp4", ".webm",
 }
-UPLOAD_MAX_BYTES = 25 * 1024 * 1024  # 25 MB, generous for screenshots/photos
+def _positive_upload_limit(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise RuntimeError(f'{name} must be a positive integer') from exc
+    if value <= 0:
+        raise RuntimeError(f'{name} must be a positive integer')
+    return value
+
+UPLOAD_MAX_BYTES = _positive_upload_limit('ANKI_UPLOAD_MAX_BYTES', 25 * 1024 * 1024)
+UPLOAD_BATCH_MAX_BYTES = _positive_upload_limit('ANKI_UPLOAD_BATCH_MAX_BYTES', 100 * 1024 * 1024)
+UPLOAD_MAX_FILES = _positive_upload_limit('ANKI_UPLOAD_MAX_FILES', 100)
+
+async def _read_upload_bounded(upload, limit, label):
+    data = bytearray()
+    while True:
+        chunk = await upload.read(min(65536, limit - len(data) + 1))
+        if not chunk:
+            return bytes(data)
+        data.extend(chunk)
+        if len(data) > limit:
+            raise HTTPException(status_code=413, detail=f'上传预算超限（最多 {limit} 字节）：{label}')
+
 
 
 @app.post("/api/media/upload")
@@ -4793,7 +5338,7 @@ async def media_upload(file: UploadFile = File(...)):
     Returns the stored filename; the editor inserts it as <img src="name">
     (Anki media references are bare filenames, served back at /media/).
     """
-    data = await file.read()
+    data = await _read_upload_bounded(file, UPLOAD_MAX_BYTES, file.filename or "image")
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
     if len(data) > UPLOAD_MAX_BYTES:

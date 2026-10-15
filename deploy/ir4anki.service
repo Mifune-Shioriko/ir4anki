@@ -1,8 +1,6 @@
 [Unit]
 Description=ir4anki — reading/review app (official Anki engine)
 Documentation=https://github.com/Mifune-Shioriko/ir4anki
-After=network-online.target
-Wants=network-online.target
 
 [Service]
 Type=simple

@@ -109,3 +109,6 @@ export const IconArrowBack = (props: IconProps) => <Svg paths={P_ArrowBack} {...
 export const IconGrid = (props: IconProps) => <Svg paths={P_Grid} {...props} />
 export const IconDriveFileMove = (props: IconProps) => <Svg paths={P_DriveFileMove} {...props} />
 export const IconFolderOpen = (props: IconProps) => <Svg paths={P_FolderOpen} {...props} />
+
+// Material Symbols outlined sync, using the shared decorative SVG wrapper.
+export const IconSync = (props: IconProps) => <Svg paths={['M160-160v-80h110l-16-14q-52-52-73-109t-21-115q0-111 66.5-197.5T400-790v82q-72 26-116 88.5T240-478q0 45 17 87.5t53 78.5l10 10v-98h80v240H160Zm400-10v-82q72-26 116-88.5T720-482q0-45-17-87.5T650-648l-10-10v98h-80v-240h240v80H690l16 14q52 52 73 109t21 115q0 111-66.5 197.5T560-170Z']} {...props} />

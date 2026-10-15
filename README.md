@@ -1,270 +1,204 @@
-# ir4anki — Incremental Reading for Anki
+# ir4anki
 
-A self-hosted review web app that adds **incremental reading** (渐进制卡) and a
-**preview gate** (先看后考) on top of your existing Anki collection. FastAPI
-backend + SolidJS/Material Design 3 frontend. Choose the default
-[AnkiConnect](https://ankiweb.net/shared/info/2055492159) backend or embed the
-official headless Anki engine (`anki==25.2.7`, `ANKI_BACKEND=pylib`). No Anki fork
-or custom scheduler. See [native-engine migration](docs/pylib-migration.md).
+在本地 Markdown 阅读中手工制卡，用 Anki 原生调度复习。
+面向单一使用者，优先支持 Debian/Linux；安装后可离线阅读、制卡和复习。
+前端资源、公式渲染和媒体由本机提供，同步才需要连接配置的服务器。
 
-With AnkiConnect, desktop Anki remains running. With pylib, ir4anki owns the
-collection and desktop Anki must be closed; it is an optional emergency tool.
-Cards stay in Anki's collection format and use Anki's native synchronization.
-New releases are licensed under AGPL-3.0-or-later; see LICENSE and NOTICE.
+新安装脚本默认使用官方 **Anki pylib**，无需打开桌面 Anki。
+直接运行后端而未设置 `ANKI_BACKEND` 时仍走 `connect` 兼容路径；已有配置也不会被安装脚本覆盖。
+pylib 使用集合本身的调度配置，是否启用 FSRS 取决于集合设置，不能由后端类型推断。
 
-## What it adds
+## 日常使用
 
-### One daily flow (one button, one round a day)
-A single **开始** button deals both queues once, then alternates one reading
-segment with an evenly allocated review block across the whole round. The
-server persists the phase, cursor and summary for refresh and other devices;
-the summary appears only after both queues end. The design is **one round a day** (2026-10-09): the review
-batch clears the day's ENTIRE due pile plus the whole dealable new pool, so
-nothing carries over. The review size is dynamic: ⌈D / divisor⌉ where D is the
-day's due-card count, snapshotted at the first review deal of the Anki day
-(4 AM rollover); the divisor defaults to **1** (whole pile). New cards reach the
-review batch through the overnight release below (capped at 36/day). Stages
-with nothing to do are skipped automatically. Nothing is *hard*-locked to one
-round — you can run another if you want; the pacing simply assumes one. Every
-number is env-overridable — see [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
+- **学习**：点击「开始」，一次领取阅读片段和待复习卡，按数量均匀交错推进。
+- **文件**：浏览语料、上传文件或文件夹、重命名、移动和永久删除。
+- **阅读**：维护加入阅读的文件及进度；阅读独立于 Anki 卡片调度，没有 FSRS 到期日。
 
-### Reading mode (渐进制卡 — incremental reading)
-Point it at a folder of markdown notes (`ANKI_NOTES_DIR`). Each listed file is
-dealt as ONE whole-file segment; you consume it by recursive **bookmark
-splits** — read a bit, cut out what's worth carding, the unread tail stays
-queued. For each segment you write cards by hand (QA or cloze, one-click into
-Anki). Segment state (todo → active → done/skipped), the segment tree, and
-**exact card provenance** (which segment produced which cards) live in a local
-sqlite DB — the .md files stay pure text with zero markers. While reviewing any
-card later, the app can show the original source segment with full-file context.
+每个阅读文件起初是一整个片段，每轮最多领取两个可处理片段。
+选择行后分割只采用书签语义：选中内容形成子片段，值得保留的未读尾部留待后续轮次。
+分割不改写 Markdown 原文；子片段接替父片段在本轮中的位置，单纯分割不会提前开始下一组复习。
+复习卡可通过溯源返回制卡时的原文片段，关闭溯源后回到当前学习进度。
 
-The reading round is **list-driven**: every file in the 阅读清单 contributes UP
-TO TWO segments per round (2026-10-09, raised from one — 每篇文章推两次) — slot
-1 is its in-progress (正在制卡) segment if it has one, otherwise its frontier;
-slot 2 is the next dealable segment in line order. So a 6-file list deals up to
-12 segments. A freshly seeded whole-file entry has only one dealable segment
-and deals 1 until you bookmark-split it. There is no card-making quota
-anywhere. Reading advances consume slots; split children remain in their
-parent slot until advanced. **结束阅读** skips remaining reading slots and
-continues cards; **退出本轮** safely clears both queues. Card undo is available
-during reading and corrects the review block without undoing reading. See
-[the persisted flow policy](docs/interleaved-flow.md) for recovery and statistics.
+阅读时可手工添加问答卡或 Cloze，编辑器支持 Markdown、公式、图片和预览。
+已有 HTML 卡保持兼容。制卡来源保存在本地阅读状态中；原文或笔记已变化时，
+编辑器拒绝过期覆盖并保留草稿，重新打开后可手工合并。
+请使用集合中真实存在的问答/Cloze 笔记类型，字段和模板需匹配用途。
 
-- **Segment editor** — edit a segment's text in-app (CodeMirror 6 source +
-  live markdown preview). Saves atomically rewrite the .md and re-anchor every
-  other segment in the same transaction, so line shifts never corrupt the
-  segment tree or trip the drift fuse.
-- **Images in notes** — upload images from the editor; they're stored under
-  `NOTES_DIR/_assets` and referenced by bare filename, so the .md stays clean
-  and your notes folder stays relocatable (git-friendly).
-- **文件 browser = corpus file manager** — the app is the single source of
-  truth for the notes folder: a folder-tree view with rendered markdown/KaTeX,
-  plus **upload** (files or whole folders, .md + images), **rename**, **move**
-  and **delete**, all from the 文件 page. Rename/move migrate the file's
-  reading progress transactionally (path-keyed rows follow the file, content
-  untouched — so a rename never loses progress); delete is hard (disk +
-  reading progress, Anki cards kept) behind a type-the-filename confirmation.
-  Uploaded images keep their relative position; a basename clash auto-prefixes
-  and rewrites the note's reference. Separate from the 阅读清单, which still
-  controls what gets dealt and in what priority.
+「制卡完成」、跳过和继续会推进阅读位置，复习则使用原生评分结果。
+阅读和复习分别显示进度；缺失、挂起或离开复习范围的卡不冒充已作答。
+「结束阅读」保留未处理片段供以后阅读，继续本轮卡片；「退出本轮」清除本轮队列并提交当前撤销位置。
+这两个动作不会强制同步。
 
-### Preview pool (先看后考 — read before you're tested)
-New cards don't hit the scheduler immediately. They land **suspended** in a
-preview deck the moment you make them. The next day the backend
-**auto-releases** every pool card whose note was created on an earlier Anki day
-into your main deck unsuspended — so the first graded review happens after a
-night's sleep, letting FSRS seed from real recall instead of a recognition
-illusion. There is no manual approve/defer step: the overnight gap does the
-work. A daily release cap (`ANKI_RELEASE_DAILY_GOAL`, default 36) limits how
-many cards enter the queue per day — oldest first, overflow waits for the next
-day — so a heavy card-making day can't blow up your review burden. With one
-round a day, this cap IS your daily new-card budget.
+### 预览池与每日默认值
 
-### Segment-level gate (per-segment cooldown, 2026-09-29)
-A segment whose cards are still sitting in the preview pool is held overnight:
-it won't be re-dealt the same day (grading cards you just made is recognition,
-not recall). Crucially it holds **only itself** — the rest of its file keeps
-dealing normally, so one half-finished chunk never blocks your reading
-frontier. Segments without cards are never gated.
+安装脚本生成的配置开启阅读和预览池。直接运行后端时，这两个功能需要显式开启。
+预览池是新卡隔夜放行门槛，并非逐卡人工审批：新制卡先挂起在 `预览池`，
+到了下一个 Anki 日后，在进入学习等入口按额度自动放入目标牌组 `2026`。
 
-### Friendly to desktop Anki
-Every AnkiConnect call is serialized through one queue, and the background
-sync that follows each answer is throttled (at most one sync per
-`ANKI_SYNC_MIN_INTERVAL` seconds, default 120) — so ir4anki answering never
-stutters your open Anki window. Slow calls are logged
-(`journalctl --user -u ir4anki`).
+| 配置 | 当前默认行为 |
+| --- | --- |
+| `ANKI_RELEASE_DAILY_GOAL=36` | 每日最多自动放行 36 张；更早的卡优先 |
+| `ANKI_DAILY_NEW=0` | 每轮领取全部可领取新卡；0 表示不另加数量上限 |
+| `ANKI_REVIEW_DUE_DIVISOR=1` | 本日首次领取时记录到期量，默认覆盖整批到期卡 |
+| `ANKI_ROLLOVER_HOUR=4` | 本地时间凌晨 4 点换日，应与集合设置一致 |
+| `ANKI_REVIEW_DECK=` | 空值覆盖全部牌组；指定牌组时包含其子牌组 |
 
-## Requirements
+36 是自动放行预算，不是总复习量或阅读制卡配额。
+阅读量由加入的文件和片段状态决定。详见[交错学习](docs/interleaved-flow.md)、
+[书签分割](docs/bookmark-reading.md)和[复习牌组范围](docs/review-deck-scope.md)。
 
-- Linux (systemd user services) — the app itself is plain FastAPI/uvicorn and
-  runs anywhere Python 3.10+ does, but `deploy/install.sh` assumes systemd
-- Python ≥ 3.10, Node ≥ 18 (+ npm)
-- Default `connect`: desktop **Anki running** with **AnkiConnect** (code
-  `2055492159`) on `127.0.0.1:8765`, with its own sync target configured.
-- Optional `pylib`: an existing `collection.anki2`, desktop Anki closed, a
-  matching emergency desktop version, and explicit native sync credentials.
-  Normal collection and media sync are supported; full sync is never selected
-  automatically. Only one uvicorn worker may own a collection.
+### 文件操作
 
-## Install
+上传先检查路径、编码、冲突和大小：默认最多 100 个文件、单文件 25 MiB、整批 100 MiB，
+改写后的 Markdown 也受限。同批图片按相对路径关联；I/O 故障仍可能部分完成，
+请核对完成回执后再重试。
+
+移动与重命名会协调阅读索引和溯源位置；冲突、路径越界及不安全的符号链接会被拒绝。
+永久删除要求确认文件名，已加入阅读的文件会额外提醒进度影响。
+删除语料不等于删除已生成的 Anki 卡片；重要原文请另做备份。
+
+## 安装
+
+需要 Python ≥3.10、可用的 Python venv/pip、Git、npm，以及 **Node 20.19+（20 系列）或 22.12+**。
+当前锁定的 Vite 8 不支持旧 Node 18；安装脚本只检查主版本 ≥18，不能代替此要求。
+Debian 可先安装 `python3-venv` 等系统依赖，并自行准备符合要求的 Node。
+
+后端固定使用 `anki==25.2.7` 和 `markdown-it-py==4.0.0`；全部运行依赖见
+[requirements.txt](backend/requirements.txt)。不要只更新前端或漏装解析器依赖。
+
+先在兼容版本的桌面 Anki 中准备好现有集合、笔记类型和媒体，再完全关闭桌面 Anki。
+pylib 不会替你创建空集合；同一集合只能交给一个进程、一个 worker 持有。
+不要让桌面 Anki 与服务同时打开集合，也不要让测试实例指向真实集合。
 
 ```bash
 git clone https://github.com/Mifune-Shioriko/ir4anki.git
 cd ir4anki
-bash deploy/install.sh
+bash deploy/install.sh --collection /absolute/profile/collection.anki2
 ```
 
-The installer will:
+安装脚本会安装后端依赖、询问路径、构建前端，并安装、启用及重启 systemd 用户服务。
+新配置写到 `~/.config/ir4anki.env`，权限为 600；已有文件原样保留，
+`--backend` 和 `--collection` 不会改写已有文件里的选择。
+默认访问地址为 `http://127.0.0.1:8901`。
 
-1. create `backend/.venv` and install Python deps (prefers `uv` if present)
-2. `npm ci && npm run build` the frontend into `frontend/dist`
-3. generate `~/.config/ir4anki.env` (prompts for your Anki profile's
-   `collection.media` path, state dir, notes dir — all with defaults; never
-   overwrites an existing file)
-4. install + start the `ir4anki` systemd **user** service on `127.0.0.1:8901`
-5. health-check the backend and probe AnkiConnect
-
-Then open <http://127.0.0.1:8901>.
-
-### First-run checklist
-
-Before the daily flow works end to end, confirm:
-
-1. **Default connect backend: desktop Anki is RUNNING** with the AnkiConnect add-on installed
-   (`2055492159`) — ir4anki drives your collection through it. If Anki is
-   closed the app shows an Anki-connection error on every action.
-2. **`ANKI_PREVIEW_RELEASE_DECK` (default `2026`) exists in YOUR collection**
-   — that's where released new cards land. Rename it in
-   `~/.config/ir4anki.env` if your main deck is called something else.
-3. **`ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` note types exist** (defaults
-   `问答题` / `填空题`) — the add-card dialogs create notes with them.
-   Either create matching note types or point the env keys at yours.
-4. **`ANKI_MEDIA_DIR` points at your profile's `collection.media`** — only
-   needed for card images; the installer prompts for it.
-5. **`ANKI_ROLLOVER_HOUR` matches Anki's own "next day starts at"** setting
-   (Preferences → Scheduling), or daily budgets reset at the wrong moment.
-6. Reading mode only: put markdown notes in `ANKI_NOTES_DIR` and add files
-   via the 阅读清单 section; without them the chain skips straight to review.
-
-Useful flags: `--non-interactive` (accept defaults), `--no-service` (build +
-config only, run uvicorn yourself).
-
-### Desktop-first UI
-
-The layout is designed for desktop widths (works from 1180px up): card in the
-center column, related cards / source note in a side column. On small panels
-(e.g. 1280×800) run the browser full-screen (F11) or kiosk-style
-(`chromium --kiosk http://127.0.0.1:8901`) to give the layout the whole
-screen; the action bar stays pinned at the bottom. Keyboard first: `Space`
-reveal, `1`–`4` rate (Again/Hard/Good/Easy), `Ctrl+Z` undo; reading stage adds
-`A` add card, `C` cloze, `S` skip, `N` next.
-
-### Manual run (no systemd)
+其他安装参数：
 
 ```bash
-cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-.venv/bin/uvicorn --app-dir . app:app --host 127.0.0.1 --port 8901
-# env vars from ~/.config/ir4anki.env are read by the service; export them
-# yourself when running bare, or rely on the built-in defaults
+bash deploy/install.sh --help
+# 仅安装和构建，不操作服务；仍会创建配置、安装依赖
+bash deploy/install.sh --no-service --non-interactive --collection /absolute/profile/collection.anki2
+# 可选桌面兼容路径
+bash deploy/install.sh --backend connect
 ```
 
-### Keep it running after logout
+`--non-interactive` 采用默认值，首次原生安装仍需有效的集合路径。
+Connect 模式要求桌面 Anki 正在运行并安装 AnkiConnect，默认地址 `http://127.0.0.1:8765`；
+其同步由桌面 Anki 管理，原生备份、持久撤销和管理能力不可直接照搬。
 
-systemd user services stop on logout unless lingering is enabled:
+### 配置与网络边界
+
+按[配置示例](deploy/ir4anki.env.example)编辑本机配置，不要把口令提交到仓库。
+示例仍以 `connect` 开头；原生安装应明确设置 `ANKI_BACKEND=pylib`。
+下面仅展示关键项，路径必须为绝对路径，不能用 `~`：
+
+```ini
+IR4ANKI_HOST=127.0.0.1
+IR4ANKI_PORT=8901
+ANKI_BACKEND=pylib
+ANKI_COLLECTION_PATH=/absolute/profile/collection.anki2
+ANKI_MEDIA_DIR=/absolute/profile/collection.media
+ANKI_STATE_DIR=/absolute/ir4anki-state
+ANKI_NOTES_DIR=/absolute/markdown-corpus
+ANKI_BACKUP_DIR=/absolute/ir4anki-backups
+ANKI_ADD_MODEL=问答题
+ANKI_ADD_CLOZE_MODEL=填空题
+ANKI_READING_MODE=1
+ANKI_PREVIEW_MODE=1
+```
+
+用户服务从配置文件加载环境，使用单 worker。检查配置：
 
 ```bash
-sudo loginctl enable-linger $USER
+backend/.venv/bin/python deploy/native.py check --env "$HOME/.config/ir4anki.env" --require-offline
+systemctl --user status ir4anki
+journalctl --user -u ir4anki -n 40
 ```
 
-## Update
+桌面浏览器使用 localhost/回环 IP 时无需额外 Host 配置。手机、局域网或 Tailscale 访问时，
+需设置监听地址（例如 `IR4ANKI_HOST=0.0.0.0`），并明确配置
+`ANKI_TRUSTED_HOSTS=review.example.ts.net,100.100.1.2` 为实际访问的服务器主机名/IP，
+不带协议、端口或通配符。监听所有接口会扩大可达范围，应同时限制网络访问。
+页面与 API 必须同源，反向代理也需保持正确的 Host/Origin。
+Host 白名单、同源和 Fetch-Metadata 检查防止一类浏览器跨站请求，**不是非浏览器多用户认证**。
+服务应限制在可信本机、私网或受控 VPN 边界内，不应直接暴露给公网多人使用。
+
+## 撤销与同步
+
+原生模式保留最近一次评分的持久撤销位置，重启后仍可撤销；下一次评分会结束上一次撤销位置。
+撤销只恢复该次评分和相关队列计数，不回滚阅读、已编辑字段或新制卡。
+检测到不相容的集合/调度外部变化时会拒绝不安全恢复。
+
+默认 `ANKI_SYNC_POLICY=manual`：启动、评分、制卡和阶段切换不自动联网同步。
+明确确认手动同步会先结束当前撤销位置，即使随后联网失败也不应期待该位置仍可撤销。
+有未决撤销时，保留的后台同步兼容策略会推迟同步。
+
+界面的手动同步只允许**直接访问 loopback、同源浏览器请求**，同时核验连接来源、Host、Origin 和确认头。
+经反向代理、局域网或 VPN 访问页面不自动获得该权限，转发头也不能证明本机身份。
+管理用原生统计、备份、导出和 `/api/engine/sync` 则使用本地配置的
+`ANKI_ENGINE_API_TOKEN` bearer；不要把管理令牌嵌入公开页面或分享给其他使用者。
+
+原生同步必须显式配置自己的服务器 `ANKI_SYNC_ENDPOINT`，并在本机设置
+`ANKI_SYNC_HKEY`，或 `ANKI_SYNC_USERNAME` / `ANKI_SYNC_PASSWORD`。
+只使用自己的账户，不会隐式回退到 AnkiWeb。
+遇到需要全量同步时，应用拒绝自行决定上传/下载方向；先备份，再用兼容的桌面 Anki 人工处理。
+切换桌面前须停止原生服务，详见[迁移与应急处理](docs/pylib-migration.md)。
+
+## 备份与升级
+
+集合与 `collection.media` 保存卡片和媒体；`ANKI_STATE_DIR` 保存阅读进度、溯源、轮次和额度，
+`ANKI_NOTES_DIR` 保存 Markdown 语料。Anki 同步不等于阅读状态与语料同步。
+跨机器迁移需整体处理这些数据，不能仅复制集合后假设阅读进度仍在。
+
+原生集合有启动及周期备份（默认间隔 1800 秒）；它不能替代媒体、语料和阅读状态的完整备份。
+升级前先决定撤销或明确提交最后一次答案；不要删除答案 journal 来绕过检查。
+关闭桌面 Anki，停止服务后使用完整离线快照，输出目录必须在源数据目录之外：
+
+```bash
+systemctl --user stop ir4anki
+backend/.venv/bin/python deploy/native.py backup \
+  --env "$HOME/.config/ir4anki.env" \
+  --output /absolute/separate-backups --offline-confirmed
+```
+
+备份脚本会拒绝活动服务、桌面进程或未决答案日志，并复制集合、媒体、状态、语料和私有配置。
+快照包含凭据，必须私下保管，不要上传 GitHub。另留一份旧源码、依赖版本及可恢复的前端构建。
+
+推荐在独立干净检出中先审阅更新和安装依赖、构建、验收。
+实际升级前确认运行实例已经停止、备份可用，且当前仓库没有未处理修改：
 
 ```bash
 bash deploy/update.sh
 ```
 
-Pulls the latest `main`, reinstalls backend deps only if `requirements.txt`
-changed, rebuilds the frontend only if `frontend/` changed, then restarts the
-service (~1s downtime). Your state (`~/.local/state/ir4anki`) and config
-(`~/.config/ir4anki.env`) are never touched. Hard-refresh the browser tab
-afterwards (Ctrl+Shift+R) to pick up a new frontend bundle.
-
-## Configuration
-
-Everything lives in `~/.config/ir4anki.env` (one KEY=VALUE per line). Full documentation
-of every knob — ports, paths, deck names, note-type names, pacing sizes,
-feature flags — is in [`deploy/ir4anki.env.example`](deploy/ir4anki.env.example).
-After editing: `systemctl --user restart ir4anki`.
-
-Defaults that most people will want to change:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `ANKI_MEDIA_DIR` | *(prompted)* | profile's `collection.media` — needed for card images |
-| `ANKI_NOTES_DIR` | `~/anki-notes` | markdown corpus for reading mode |
-| `ANKI_PREVIEW_DECK` | `预览池` | where suspended preview cards live |
-| `ANKI_PREVIEW_RELEASE_DECK` | `2026` | where released cards land |
-| `ANKI_ADD_MODEL` / `ANKI_ADD_CLOZE_MODEL` | `问答题` / `填空题` | note types used by the add-card dialogs — must exist in your collection |
-| `ANKI_ROLLOVER_HOUR` | `4` | must match Anki's own "next day starts at" |
-| `ANKI_RELEASE_DAILY_GOAL` | `36` | max auto-released cards per day = your daily new-card budget |
-| `ANKI_DAILY_NEW` | `0` | new cards per round; 0 = unlimited (whole dealable pool) |
-| `ANKI_REVIEW_DUE_DIVISOR` | `1` | due pile is split by this; 1 = clear it all in one round |
-
-## Multiple machines
-
-Cards sync through Anki itself, so any number of machines can run ir4anki
-against the same collection — **but the app state (round, quota, reading
-progress) is machine-local by design** (`ANKI_STATE_DIR`). Running two
-instances at once means two independent daily budgets and two reading
-frontiers, which double-releases cards and splits progress. Pick ONE machine
-as your ir4anki instance; on the others, just use desktop Anki.
-
-## Layout
-
-```
-backend/    FastAPI app (app.py) + vendored chunker (legacy migrations only)
-frontend/   SolidJS 1.9 + @material/web (MD3) SPA, built to frontend/dist
-deploy/     install.sh + update.sh + systemd unit template + env example
-scripts/    API/E2E/UI tests (some need playwright + a live AnkiConnect)
-docs/       design documents (reading mode, round-4 segment identity)
-```
-
-## Tests
+默认脚本拒绝脏仓库，执行 `git pull --ff-only`、安装依赖、构建、保留旧 dist 并重启服务。
+如果远端没有新提交，它会直接退出；若代码已提前拉取，应使用 `--local` 构建当前快照。
+它不会改写本机配置，也没有完整数据回滚事务。
 
 ```bash
-# pure-API tests (need backend deps; some need live AnkiConnect)
-backend/.venv/bin/python scripts/reading_test.py
-backend/.venv/bin/python scripts/auto_release_test.py
-backend/.venv/bin/python scripts/reading_edit_test.py
-backend/.venv/bin/python scripts/gate_segment_level_test.py
-backend/.venv/bin/python scripts/list_dealing_test.py
-backend/.venv/bin/python scripts/file_mgmt_test.py
-backend/.venv/bin/python scripts/modes_e2e.py
-backend/.venv/bin/python scripts/sync_throttle_test.py
-# UI tests additionally need: pip install playwright && playwright install chromium
-backend/.venv/bin/python scripts/modes_ui_test.py
-backend/.venv/bin/python scripts/reading_ui_test.py
-backend/.venv/bin/python scripts/file_mgmt_ui_test.py
+# 准备当前代码：依赖需事先在隔离环境装好，不拉取、不部署、不重启
+bash deploy/update.sh --local --no-restart
 ```
 
-Migrated behavioral/UI tests spawn throwaway backends on allocated loopback
-ports with isolated real Anki collections, state and corpus. Targeted connect
-fault/protocol tests remain separate. They never answer or synchronize the live
-collection. See [regression runner](scripts/REGRESSION.md).
+`--no-restart` 只生成临时前端构建，不更新运行中的依赖或页面。
+依赖须按 `backend/requirements.txt` 在停机或独立环境完整安装。
+前后端必须配套部署：严格编辑版本字段会让旧客户端返回 422；部署后硬刷新所有页面。
+回滚时先停止服务，恢复配套的旧源码、依赖及前端；若需要恢复数据，使用完整离线快照。
+保留旧 dist 不能回滚集合、状态迁移或已发生的同步，也不能撤回已同步到其他设备的数据。
 
-New QA/cloze fields retain raw Markdown and share CM6 editing; legacy HTML is
-rendered without bulk conversion. Native mode offers interval/memory previews,
-official statistics, authenticated backups/export and explicit sync confirmation.
-Single-slot undo survives restart through a guarded journal; background sync
-defers until the slot is ended rather than imposing a short undo timeout.
+更多说明见[离线使用](docs/offline-use.md)、[原生能力验证](docs/pylib-verification.md)。
 
-## Acknowledgements
+## 许可
 
-Chunking logic adapted from a private notes-RAG experiment; the rest grew out
-of a self-hosted Anki stack (sync server + headless Anki). The design docs in
-`docs/` record the reasoning behind segment identity, the preview gate, and
-the overnight-release policy.
-
-## License
-
-AGPL-3.0 — see [LICENSE](LICENSE). Earlier MIT notices/grants are retained in
-[NOTICE](NOTICE).
+当前版本采用 [GNU AGPL v3 或更新版本](LICENSE)，包含官方 Anki pylib 的相应许可义务。
+向网络使用者提供修改后的服务时，应依 AGPL 第 13 条提供对应源码。
+历史 MIT 授权仍然有效，原版权及第三方声明见 [NOTICE](NOTICE)。

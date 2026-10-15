@@ -176,10 +176,10 @@ def run(state):
         # ---- 1. nav rail (round 3): three destinations, old top bar gone ----
         page.wait_for_selector(".nav-rail", timeout=30000)
         items = page.locator(".nav-rail__item")
-        check("native nav rail renders study/files/reading plus engine", items.count() == 4, items.count())
+        check("nav rail renders three destinations plus manual sync", items.count() == 4, items.count())
         rail_text = page.locator(".nav-rail").inner_text()
-        check("rail labels 学习/文件/阅读清单",
-              "学习" in rail_text and "文件" in rail_text and "阅读清单" in rail_text,
+        check("rail labels 学习/文件/阅读/手动同步",
+              [t.split(" (")[0] for t in items.all_inner_texts()] == ["学习", "文件", "阅读", "手动同步"],
               rail_text)
         check("old Anki top bar is gone", page.locator(".top-bar").count() == 0)
         check("学习 destination starts active",
@@ -196,13 +196,17 @@ def run(state):
         # ---- 2. 文件 section: tree + read-only viewer ----
         items.nth(1).click()  # 文件
         page.wait_for_selector(".files-tree", timeout=15000)
+        # Folder expansion is explicit in the current file manager.
+        page.get_by_role('treeitem', name='2026', exact=True).click()
+        page.get_by_role('treeitem', name='2026/解剖', exact=True).click()
+        page.get_by_role('treeitem', name=a_path, exact=True).wait_for()
         fdirs = page.locator(".files-tree-dir")
         ffiles = page.locator(".files-tree-file")
         check("files tree renders folders", fdirs.count() >= 2, fdirs.count())
         check("files tree renders 2 notes", ffiles.count() == 2, ffiles.count())
         check("viewer starts empty (no file selected)",
               page.locator(".files-viewer-empty").count() == 1)
-        page.locator(".files-tree-file", has_text="颈部").click()
+        page.get_by_role('treeitem', name=a_path, exact=True).click()
         page.wait_for_selector(".files-viewer-body", timeout=15000)
         # The body mounts before the async markdown renderer finishes. Waiting
         # for the container alone races the content (screenshot later is fine).
@@ -217,7 +221,9 @@ def run(state):
         check("viewer markdown → headings rendered",
               page.locator(".files-viewer-body h2").count() >= 2)
         check("viewer crumb shows the path",
-              "颈部" in page.locator(".files-viewer-crumb").inner_text())
+              page.locator('.files-preview-heading h2').get_attribute('title') == a_path
+              and "2026" in page.get_by_role('navigation', name='文件路径').inner_text()
+              and "解剖" in page.get_by_role('navigation', name='文件路径').inner_text())
         check("文件 destination now active",
               "nav-rail__item--active" in items.nth(1).get_attribute("class"))
         page.screenshot(path=str(Path(os.environ.get("TMPDIR", "/tmp")) / "reading-ui-files.png"))
@@ -253,20 +259,20 @@ def run(state):
               page.locator(".reading-tree-file").count() == 2)
         # already-added files show 已加入 — add BOTH via their row buttons
         # (dialog stays open across adds for batch adding)
-        page.locator(".reading-tree-file", has_text="颈部").locator(
-            "md-text-button", has_text="加入清单").click()
+        page.locator(".reading-picker-dialog .reading-tree-file", has_text="颈部").get_by_role(
+            "button", name="加入清单", exact=True).click()
         page.wait_for_timeout(700)
         added = page.locator(".reading-tree-file", has_text="颈部").inner_text()
         check("added file row shows 已加入", "已加入" in added, added)
-        page.locator(".reading-tree-file", has_text="上肢").locator(
-            "md-text-button", has_text="加入清单").click()
+        page.locator(".reading-picker-dialog .reading-tree-file", has_text="上肢").get_by_role(
+            "button", name="加入清单", exact=True).click()
         page.wait_for_timeout(700)
         page.locator("md-text-button", has_text="关闭").click()
         page.wait_for_timeout(400)
         rows = page.locator(".reading-list-item")
         check("both files in list", rows.count() == 2, rows.count())
         # rail badge shows the list size (round 3)
-        check("rail 阅读清单 badge shows (2)",
+        check("rail 阅读 badge shows (2)",
               "(2)" in page.locator(".nav-rail").inner_text(),
               page.locator(".nav-rail").inner_text())
         # row progress by name (add order = 颈部 then 上肢). Whole-file
@@ -317,14 +323,15 @@ def run(state):
         # 上肢 first (置顶 priority). preview mode off → the chain after
         # reading goes straight to the review stage.
         page.locator("md-filled-button", has_text="开始").click()
-        page.wait_for_selector(".reading-crumb", timeout=20000)
-        crumb = page.locator(".reading-crumb").inner_text()
+        page.wait_for_selector(".stage-reading .study-source", timeout=20000)
+        crumb = page.locator(".stage-reading .study-source").inner_text()
         check("crumb = 上肢 first (置顶 priority)", "上肢" in crumb, crumb)
         body = page.locator(".reading-chunk-body").inner_text()
         check("chunk = WHOLE file (both sections in one card)",
               "腋动脉" in body and "臂前区" in body, body[:120])
-        check("status chip 未读", page.locator(".reading-status-chip",
-                                              has_text="未读").count() >= 1)
+        check("reading shell has no status chips; actual current segment is todo",
+              page.locator(".stage-reading .reading-status-chip").count() == 0
+              and api('/api/reading/state')['round']['chunks'][0]['status'] == 'todo')
         # header icon actions (添加卡片 / 添加挖空) — aria-label hoists to
         # data-aria-label after element upgrade
         check("header: 添加卡片 icon button", page.locator(
@@ -362,10 +369,34 @@ def run(state):
               page.locator(".progress-ring--reading .progress-ring__text").inner_text(),
               page.locator(".progress-ring--reading .progress-ring__text").inner_text())
         check("round strip is gone", page.locator(".round-strip").count() == 0)
-        # Progress is pinned at viewport bottom-right, with separate labels.
+        # Both progress rings sit at the bottom of the left navigation rail.
         ring_box = page.get_by_role('progressbar', name='阅读', exact=True).bounding_box()
+        review_box = page.get_by_role('progressbar', name='复习', exact=True).bounding_box()
+        rail_box = page.locator('.nav-rail').bounding_box()
+        footer_box = page.locator('.nav-rail__footer').bounding_box()
         viewport = page.viewport_size
-        check("reading ring near viewport bottom-right", ring_box['x'] >= viewport['width']-220 and ring_box['y'] >= viewport['height']-140, ring_box)
+
+        def contains(outer, inner):
+            return (inner['width'] > 0 and inner['height'] > 0
+                    and inner['x'] >= outer['x'] - 1
+                    and inner['y'] >= outer['y'] - 1
+                    and inner['x'] + inner['width'] <= outer['x'] + outer['width'] + 1
+                    and inner['y'] + inner['height'] <= outer['y'] + outer['height'] + 1)
+
+        check("both rings contained in nav rail/footer",
+              all(contains(box, ring) for box in (rail_box, footer_box)
+                  for ring in (ring_box, review_box)),
+              {'rail': rail_box, 'footer': footer_box, 'reading': ring_box, 'review': review_box})
+        check("reading ring above review ring",
+              ring_box['y'] + ring_box['height'] <= review_box['y'],
+              {'reading': ring_box, 'review': review_box})
+        viewport_box = {'x': 0, 'y': 0, **viewport}
+        check("both rings in viewport", all(contains(viewport_box, ring)
+              for ring in (ring_box, review_box)), viewport)
+        check("left nav footer anchored near viewport bottom",
+              abs(rail_box['x']) <= 1 and footer_box['y'] >= viewport['height'] / 2
+              and 0 <= viewport['height'] - footer_box['y'] - footer_box['height'] <= 32,
+              {'rail': rail_box, 'footer': footer_box, 'viewport': viewport})
         check("review ring independently labelled", page.get_by_role('progressbar',name='复习',exact=True).count()==1)
         # top-edge alignment: card box and the right column's topmost box
         # share the same top (2026-09-27: the right column in the
@@ -382,7 +413,7 @@ def run(state):
         # ---- 5. 制卡完成 straight from 未读 (no active gate) ----
         page.locator("md-filled-button", has_text="制卡完成").click()
         page.wait_for_timeout(1200)
-        crumb2 = page.locator(".reading-crumb").inner_text()
+        crumb2 = page.locator(".stage-reading .study-source").inner_text()
         check("complete from todo advances to 颈部 一", "颈部" in crumb2, crumb2)
         check("progress ring shows 1/2",
               "1/2" in page.locator(".progress-ring--reading .progress-ring__text").inner_text(),
@@ -390,10 +421,10 @@ def run(state):
 
         # ---- 6. refresh resumes the round on the pending chunk ----
         page.reload(wait_until="networkidle")
-        page.wait_for_selector(".reading-crumb", timeout=30000)
+        page.wait_for_selector(".stage-reading .study-source", timeout=30000)
         check("reload resumes reading round",
-              "颈部" in page.locator(".reading-crumb").inner_text(),
-              page.locator(".reading-crumb").inner_text())
+              "颈部" in page.locator(".stage-reading .study-source").inner_text(),
+              page.locator(".stage-reading .study-source").inner_text())
         check("reload keeps progress 1/2",
               "1/2" in page.locator(".progress-ring--reading .progress-ring__text").inner_text())
 
@@ -425,7 +456,7 @@ def run(state):
         check("cloze dialog closes", page.locator(".cloze-dialog").count() == 0)
         page.unroute("**/api/card/add/info*")
         check("still on the same chunk after closing dialog",
-              "颈部" in page.locator(".reading-crumb").inner_text())
+              "颈部" in page.locator(".stage-reading .study-source").inner_text())
 
         # ---- 8. narrow viewport: no right column while reading ----
         page.set_viewport_size({"width": 414, "height": 900})

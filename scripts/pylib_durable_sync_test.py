@@ -65,12 +65,12 @@ def test_pending_answer_never_reaches_independent_client_and_commit_flushes(tmp_
                 assert two.db.scalar('select count(*) from revlog')==0
                 assert two.get_card(ids[0]).reps==0
                 await one.call('answerCards',{'answers':[{'cardId':ids[0],'ease':3}]})
-                # The next grade must export prior answer BEFORE grading new card.
+                # The next grade retires undo locally; neither answer is exported yet.
                 await one.call('answerCards',{'answers':[{'cardId':ids[1],'ease':3}]})
                 two.sync_collection(auth2,sync_media=False)
-                assert two.get_card(ids[0]).reps==1
+                assert two.get_card(ids[0]).reps==0
                 assert two.get_card(ids[1]).reps==0
-                assert two.db.scalar('select count(*) from revlog')==1
+                assert two.db.scalar('select count(*) from revlog')==0
                 await one.call('sync',{'commit_undo':True})
                 two.sync_collection(auth2,sync_media=False)
                 assert two.get_card(ids[1]).reps==1

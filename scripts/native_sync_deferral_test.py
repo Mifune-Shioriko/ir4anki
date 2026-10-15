@@ -11,6 +11,7 @@ from pathlib import Path
 from native_fixture import configure, run_closed
 configure()
 os.environ['ANKI_SYNC_MIN_INTERVAL'] = '0.15'
+os.environ['ANKI_SYNC_POLICY'] = 'legacy' # explicit opt-in exercises retained throttler
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'backend'))
 import app as backend
 PASS = FAIL = 0

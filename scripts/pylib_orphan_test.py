@@ -51,11 +51,13 @@ def test_orphan_card_batch_and_flow(tmp_path, monkeypatch):
             response = await client.post('/api/flow/start')
             assert response.status_code == 200, response.text
             wire = response.json()
-            assert {c['cardId'] for c in wire['cards']} == {102, 104}
+            assert [c['cardId'] for c in wire['cards']] == [app._round_read()['pending'][0]]
+            assert set(app._round_read()['pending']) == {102, 104}
             assert wire['flow']['card_count'] == 2
             state = await client.get('/api/flow/state')
             assert state.status_code == 200, state.text
-            assert {c['cardId'] for c in state.json()['cards']} == {102, 104}
+            assert [c['cardId'] for c in state.json()['cards']] == [app._round_read()['pending'][0]]
+            assert set(app._round_read()['pending']) == {102, 104}
         assert seed.native(snapshot) == before, 'tolerating orphans must not repair/delete collection data'
         # Unrelated integrity errors must propagate rather than become empty rows.
         def broken_note(self, reload=False):

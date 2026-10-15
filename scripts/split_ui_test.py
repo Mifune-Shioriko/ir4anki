@@ -225,6 +225,9 @@ def run(notes: Path):
         js_errors = []
         page.on("pageerror", lambda e: js_errors.append(str(e)))
         page.add_init_script("localStorage.setItem('anki-reading-gap-policy', 'extract')")
+        split_requests = []
+        page.on("request", lambda req: split_requests.append(req.post_data_json)
+                if req.url.endswith('/api/reading/split') else None)
         page.goto(BASE + "/", wait_until="networkidle")
         page.wait_for_selector(".reading-chunk-body .line-handle", timeout=30000)
         check("reading card rendered WITH line handles", True)
@@ -364,6 +367,8 @@ def run(notes: Path):
         assert split_response.status == 200, split_response.text()
         split = split_response.json()
         assert_split_protocol(split_response.request.post_data_json, chunk, "ordinary")
+        check("old extract storage ignored; split request omits policy",
+              bool(split_requests) and 'gap_policy' not in split_requests[-1], split_requests)
         assert_deferred_tail(split, A_REL)
         st = api("/api/reading/state")
         round_segs = st.get("round", {}).get("chunks", [])

@@ -1,11 +1,14 @@
-import { Component, For, Show, createSignal, onMount } from 'solid-js'
-import { api, UploadConflictError } from '../api'
-import { FileViewer } from './FileViewer'
+import { Component, For, Show, createSignal, createMemo, createEffect, onCleanup, onMount } from 'solid-js'
+import { api, UploadConflictError, UploadPartialError } from '../api'
+import { FilesMenu } from './FilesMenu'
+import { remapPath, validMove, filterTree } from '../lib/files-state'
+import { FileOperations } from '../lib/fileOperations'
+import { FileViewer, invalidateFileCache } from './FileViewer'
 import { buildTree, allDirPaths } from '../lib/tree'
 import type { TreeNode, TreeFile } from '../lib/tree'
 import {
   IconChevronRight, IconDelete, IconDescription, IconDriveFileMove, IconEdit,
-  IconFolder, IconFolderOpen, IconRestartAlt,
+  IconFolder, IconFolderOpen, IconRestartAlt, IconArrowBack,
 } from './icons'
 import { Snackbar } from './Snackbar'
 import { applyDialogGuard } from '../lib/dialog-guard'
@@ -13,10 +16,10 @@ import { applyDialogGuard } from '../lib/dialog-guard'
 // 文件 section (user spec 2026-09-19 round 3; MANAGEMENT since 2026-10-06):
 // the app is the SINGLE SOURCE OF TRUTH for the ~/anki-notes corpus — no
 // more side-channel file-manager edits. Left = folder tree with a CURRENT
-// DIRECTORY (upload target), right = FileViewer + rename/move/delete for
-// the selected file. Uploads accept .md + images (folders keep their
+// DIRECTORY (upload target), right = FileViewer. Management commands belong
+// to the single row menu. Uploads accept .md + images (folders keep their
 // subtree via webkitRelativePath); rename/move migrate reading progress
-// transactionally on the backend (path-keyed rows follow the file);
+// through a recoverable backend journal (path-keyed rows follow the file);
 // delete is HARD (disk + reading progress) behind a type-the-name 防呆.
 // The list endpoint is NOT reading-gated, so browsing works with the
 // reading feature flag off too.
@@ -28,16 +31,38 @@ interface Props {
 
 type PendingUpload = { file: File; rel: string }[]
 
-export const FilesScreen: Component<Props> = (props) => {
+export const FilesScreen: Component<Props> = (_props) => {
   const [files, setFiles] = createSignal<TreeFile[]>([])
   const [dirs, setDirs] = createSignal<string[]>([])
   const [loading, setLoading] = createSignal(true)
   const [loadError, setLoadError] = createSignal('')
   const [selected, setSelected] = createSignal<string | null>(null)
-  const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
+  const readSaved = <T,>(key: string, fallback: T): T => {
+    try { return JSON.parse((key === 'width' ? localStorage : sessionStorage).getItem('files-' + key) ?? 'null') ?? fallback } catch { return fallback }
+  }
+  const [expanded, setExpanded] = createSignal<Set<string>>(new Set(readSaved<string[]>('expanded', [])))
+  const [focused, setFocused] = createSignal('')
+  const [query, setQuery] = createSignal('')
+  const [preview, setPreview] = createSignal(false)
+  const [membership, setMembership] = createSignal(new Set<string>())
+  const [undoId, setUndoId] = createSignal<string | null>(readSaved<string | null>('undo-operation', null))
+  createEffect(() => sessionStorage.setItem('files-undo-operation', JSON.stringify(undoId())))
+  const [undoBusy, setUndoBusy] = createSignal(false)
+  const [viewerVersion, setViewerVersion] = createSignal(0)
+  const [treeWidth, setTreeWidth] = createSignal(Math.max(260, Math.min(600, readSaved<number>('width', 380))))
+  const scrollPositions = new Map<string, number>()
+  let previewReadyPath: string | null = null
+  let previewBody: HTMLDivElement | undefined
+  createEffect(() => {
+    sessionStorage.setItem('files-expanded', JSON.stringify([...expanded()]))
+    localStorage.setItem('files-width', JSON.stringify(treeWidth()))
+  })
+  let refreshGeneration = 0
+  let alive = true
   // current directory = the upload target (user ruling 2026-10-06:
   // 先选中当前文件夹作为落点). '' = corpus root.
-  const [currentDir, setCurrentDir] = createSignal('')
+  const [currentDir, setCurrentDir] = createSignal(readSaved<string>('directory', ''))
+  createEffect(() => sessionStorage.setItem('files-directory', JSON.stringify(currentDir())))
   const [snack, setSnack] = createSignal('')
   let snackTimer: ReturnType<typeof setTimeout> | null = null
   const showSnack = (msg: string) => {
@@ -47,23 +72,37 @@ export const FilesScreen: Component<Props> = (props) => {
   }
 
   const reload = async () => {
+    const hadTreeFocus = !!document.activeElement?.closest('.files-tree')
+    const generation = ++refreshGeneration
     setLoading(true)
     setLoadError('')
     try {
-      const d = await api.filesList()
+      const confirmed = await operations.reconcile()
+      if (confirmed && alive) showSnack('已确认文件迁移，可撤销')
+      if (!alive || generation !== refreshGeneration) return
+      const [d, members] = await Promise.all([api.filesList(), api.filesMembership()])
+      if (!alive || generation !== refreshGeneration) return
+      setMembership(new Set(members.paths))
       setFiles(d.files)
       setDirs(d.dirs ?? [])
-      // corpus is small — pre-expand every folder (same UX as the picker)
-      setExpanded(allDirPaths(buildTree(d.files)))
+      const available = allDirPaths(buildTree(d.files, d.dirs))
+      setExpanded(prev => new Set([...prev].filter(p => available.has(p))))
+      if (currentDir() && !available.has(currentDir())) setCurrentDir('')
+      if (selected() && !d.files.some(f => f.path === selected())) setSelected(null)
+      if (focused() && !available.has(focused()) && !d.files.some(f => f.path === focused())) setFocused('')
+      if (hadTreeFocus) requestAnimationFrame(() => focusRow(focused()))
     } catch (e) {
-      setLoadError((e as Error).message || '加载失败')
+      if (alive && generation === refreshGeneration) setLoadError((e as Error).message || '加载失败')
     } finally {
-      setLoading(false)
+      if (alive && generation === refreshGeneration) setLoading(false)
     }
   }
   onMount(reload)
+  onCleanup(() => { alive = false; refreshGeneration++; if (snackTimer) clearTimeout(snackTimer) })
 
-  const tree = () => buildTree(files())
+  const fullTree = createMemo(() => buildTree(files(), dirs()))
+  const tree = createMemo(() => filterTree(fullTree(), query()))
+  const fileIndex = createMemo(() => new Map(files().map(file => [file.path, file])))
 
   // Directory tree for the MOVE dialog, built from the backend's real dir
   // list (includes empty dirs the file-tree can't show). Returns nested
@@ -97,8 +136,7 @@ export const FilesScreen: Component<Props> = (props) => {
       return next
     })
   const toggleDir = (path: string) => setDirOpen(path, !isOpen(path))
-  const isListed = (path: string) => props.listedPaths?.().has(path) ?? false
-  const crumb = () => (selected() ?? '').replace(/\.md$/, '')
+  const isListed = (path: string) => membership().has(path)
   const dirLabel = () => currentDir() || '语料库根目录'
 
   // ---- upload -------------------------------------------------------------
@@ -128,10 +166,13 @@ export const FilesScreen: Component<Props> = (props) => {
     dir: string,
     policy: 'error' | 'overwrite' | 'rename' | 'skip',
   ) => {
-    if (!entries.length) return
+    if (!entries.length || uploading()) return
+    if (operations.isBusy()) { showSnack('请先刷新确认待处理的文件操作，再重新上传'); return }
     setUploading(true)
     try {
       const d = await api.filesUpload(entries, dir, policy)
+      d.saved.filter(s => s.action !== 'skipped').forEach(s => invalidateFileCache(s.path))
+      setViewerVersion(n => n + 1)
       const n = d.saved.filter(s => s.action !== 'skipped').length
       const skipped = d.saved.filter(s => s.action === 'skipped').length
       const renamedImgs = Object.keys(d.images_renamed ?? {}).length
@@ -143,6 +184,11 @@ export const FilesScreen: Component<Props> = (props) => {
     } catch (e) {
       if (e instanceof UploadConflictError) {
         setConflict({ entries, dir, names: e.conflicts })
+      } else if (e instanceof UploadPartialError) {
+        e.saved.filter(s => s.action !== 'skipped').forEach(s => invalidateFileCache(s.path))
+        setViewerVersion(n => n + 1)
+        showSnack(e.message)
+        await reload()
       } else {
         showSnack('上传失败：' + ((e as Error).message || e))
       }
@@ -185,21 +231,22 @@ export const FilesScreen: Component<Props> = (props) => {
     setRenameValue(isDir ? name : name.replace(/\.md$/, ''))
     setRenameTarget({ path, isDir })
   }
-  const closeRename = () => setRenameTarget(null)
+  const closeRename = () => { if (!renameBusy()) setRenameTarget(null) }
   const submitRename = async () => {
     const t = renameTarget()
-    if (!t) return
+    if (!t || renameBusy()) return
     const name = renameValue().trim()
     if (!name) return
     setRenameBusy(true)
     try {
-      const d = await api.filesRename(t.path, name)
-      closeRename()
+      const d = await operations.run('rename', t.path, name)
+      if (!d) return
+      setRenameTarget(null)
       showSnack(d.unchanged ? '名称未变化' : `已重命名为 ${d.path.split('/').pop()}`)
-      if (selected() === t.path) setSelected(d.path)
       await reload()
+      requestAnimationFrame(() => focusRow(focused()))
     } catch (e) {
-      showSnack('重命名失败：' + ((e as Error).message || e))
+      showSnack((operations.hasPending() ? '' : '无法重命名：') + ((e as Error).message || e))
     } finally {
       setRenameBusy(false)
     }
@@ -213,7 +260,7 @@ export const FilesScreen: Component<Props> = (props) => {
     setMoveDest(null)
     setMoveTarget({ path, isDir })
   }
-  const closeMove = () => setMoveTarget(null)
+  const closeMove = () => { if (!moveBusy()) setMoveTarget(null) }
   // a directory can't move into itself or its own subtree
   const moveForbidden = (dirPath: string): boolean => {
     const t = moveTarget()
@@ -226,23 +273,26 @@ export const FilesScreen: Component<Props> = (props) => {
     const i = t.path.lastIndexOf('/')
     return i < 0 ? '' : t.path.slice(0, i)
   }
-  const submitMove = async () => {
-    const t = moveTarget()
-    const dest = moveDest()
-    if (!t || dest === null) return
+  const executeMove = async (t: { path: string; isDir: boolean }, dest: string) => {
+    if (moveBusy() || !validMove(t.path, t.isDir, dest)) return
     setMoveBusy(true)
     try {
-      const d = await api.filesMove(t.path, dest)
-      closeMove()
+      const d = await operations.run('move', t.path, dest)
+      if (!d) return
+      setMoveTarget(null)
       showSnack(d.unchanged ? '位置未变化' : `已移动到 ${d.path}`)
-      if (selected() === t.path) setSelected(d.path)
-      if (currentDir() === t.path) setCurrentDir(dest ? dest + '/' + (t.path.split('/').pop() ?? '') : (t.path.split('/').pop() ?? ''))
       await reload()
+      requestAnimationFrame(() => focusRow(focused()))
     } catch (e) {
-      showSnack('移动失败：' + ((e as Error).message || e))
+      showSnack((operations.hasPending() ? '' : '无法移动：') + ((e as Error).message || e))
     } finally {
       setMoveBusy(false)
     }
+  }
+
+  const submitMove = () => {
+    const target = moveTarget(), dest = moveDest()
+    if (target && dest !== null) return executeMove(target, dest)
   }
 
   const MoveDirRows: Component<{ nodes: DirNode[]; depth: number }> = (tp) => (
@@ -250,12 +300,12 @@ export const FilesScreen: Component<Props> = (props) => {
       {node => (
         <>
           <div
-            class="files-move-dir"
+            class="files-move-dir" role="button" tabIndex={moveForbidden(node.path) ? -1 : 0} aria-disabled={moveForbidden(node.path)} onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && !moveForbidden(node.path)) { e.preventDefault(); setMoveDest(node.path) } }}
             classList={{
               'files-move-dir--pick': moveDest() === node.path,
               'files-move-dir--disabled': moveForbidden(node.path),
             }}
-            style={{ 'padding-left': `${tp.depth * 16 + 8}px` }}
+            style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 8}px` }}
             onClick={() => {
               if (!moveForbidden(node.path)) setMoveDest(node.path)
             }}
@@ -279,7 +329,7 @@ export const FilesScreen: Component<Props> = (props) => {
     setDeleteConfirm('')
     setDeleteTarget({ path, isDir })
   }
-  const closeDelete = () => setDeleteTarget(null)
+  const closeDelete = () => { if (!deleteBusy()) setDeleteTarget(null) }
   const deleteBasename = () => {
     const t = deleteTarget()
     if (!t) return ''
@@ -289,7 +339,7 @@ export const FilesScreen: Component<Props> = (props) => {
   const deleteListedCount = () => {
     const t = deleteTarget()
     if (!t) return 0
-    const listed = props.listedPaths?.() ?? new Set<string>()
+    const listed = membership()
     if (t.isDir) {
       return Array.from(listed).filter(p =>
         p === t.path || p.startsWith(t.path + '/')).length
@@ -300,11 +350,15 @@ export const FilesScreen: Component<Props> = (props) => {
   const submitDelete = async () => {
     const t = deleteTarget()
     if (!t || !deleteCanSubmit()) return
+    if (operations.isBusy()) { showSnack('请先刷新确认待处理的文件操作，再重新删除'); return }
     setDeleteBusy(true)
     try {
       await api.filesDelete(t.path, deleteConfirm().trim())
-      closeDelete()
-      showSnack(`已删除 ${deleteBasename()}`)
+      setDeleteTarget(null)
+      showSnack(`已删除 ${t.path.split('/').pop()}`)
+      window.dispatchEvent(new CustomEvent('files-deleted', { detail: { path: t.path } }))
+      invalidateFileCache(t.path)
+      setUndoId(null)
       if (selected() === t.path || (t.isDir && (selected() ?? '').startsWith(t.path + '/'))) {
         setSelected(null)
       }
@@ -312,6 +366,7 @@ export const FilesScreen: Component<Props> = (props) => {
         setCurrentDir('')
       }
       await reload()
+      requestAnimationFrame(() => focusRow(focused()))
     } catch (e) {
       showSnack('删除失败：' + ((e as Error).message || e))
     } finally {
@@ -319,32 +374,214 @@ export const FilesScreen: Component<Props> = (props) => {
     }
   }
 
-  // hover row actions (rename / move / delete) — one small icon-button trio
-  const RowActions: Component<{ path: string; isDir: boolean }> = (ap) => (
-    <span class="files-row-actions" onClick={e => e.stopPropagation()}>
-      <md-icon-button
-        class="files-row-action"
-        aria-label="重命名"
-        onClick={() => openRename(ap.path, ap.isDir)}
-      >
-        <md-icon><IconEdit size={16} /></md-icon>
-      </md-icon-button>
-      <md-icon-button
-        class="files-row-action"
-        aria-label="移动到"
-        onClick={() => openMove(ap.path, ap.isDir)}
-      >
-        <md-icon><IconDriveFileMove size={16} /></md-icon>
-      </md-icon-button>
-      <md-icon-button
-        class="files-row-action files-row-action--danger"
-        aria-label="删除"
-        onClick={() => openDelete(ap.path, ap.isDir)}
-      >
-        <md-icon><IconDelete size={16} /></md-icon>
-      </md-icon-button>
-    </span>
-  )
+  type Target = { path: string; isDir: boolean }
+  const [operationVersion, setOperationVersion] = createSignal(0)
+  const busy = () => { operationVersion(); return operations.isBusy() || renameBusy() || moveBusy() || deleteBusy() || uploading() || undoBusy() }
+  const copyPath = async (path: string) => {
+    try {
+      if (!navigator.clipboard?.writeText) {
+        showSnack(`此浏览器无法自动复制，请手动复制路径：${path}`)
+        return
+      }
+      await navigator.clipboard.writeText(path)
+      showSnack('路径已复制')
+    } catch { showSnack(`无法复制路径，请手动复制：${path}`) }
+  }
+  const command = (target: Target, action: 'rename' | 'move' | 'delete' | 'copy') => {
+    if (busy() || !target.path) return
+    if (action === 'rename') openRename(target.path, target.isDir)
+    if (action === 'move') openMove(target.path, target.isDir)
+    if (action === 'delete') openDelete(target.path, target.isDir)
+    if (action === 'copy') void copyPath(target.path)
+  }
+  const applyRelocation = (old: string, next: string) => {
+    if (old === next) return
+    // Invalidate before reactive path updates can mount any reading consumer.
+    invalidateFileCache(old); invalidateFileCache(next)
+    setSelected(p => remapPath(p, old, next))
+    setCurrentDir(p => remapPath(p, old, next))
+    setFocused(p => remapPath(p, old, next))
+    setExpanded(prev => new Set([...prev].map(p => remapPath(p, old, next))))
+    setMembership(prev => new Set([...prev].map(p => remapPath(p, old, next))))
+    for (const [p, top] of [...scrollPositions]) {
+      const mapped = remapPath(p, old, next)
+      if (p !== mapped) { scrollPositions.delete(p); scrollPositions.set(mapped, top) }
+    }
+    window.dispatchEvent(new CustomEvent('files-relocated', { detail: { oldPath: old, newPath: next } }))
+    previewReadyPath = null
+    setViewerVersion(n => n + 1)
+  }
+  const operations = new FileOperations(api, sessionStorage, (result, old, request) => {
+    applyRelocation(old, result.path)
+    if (request.action === 'undo') { if (undoId() === request.value) setUndoId(null) }
+    else if (result.operationId) setUndoId(result.operationId)
+  }, () => setOperationVersion(v => v + 1))
+  const undoMove = async () => {
+    const id = undoId()
+    if (!id || busy()) return
+    setUndoBusy(true)
+    try {
+      const result = await operations.run('undo', selected() ?? '', id)
+      if (!result) return
+      showSnack('已撤销文件迁移'); await reload()
+    } catch (e) { showSnack('无法撤销：' + (e as Error).message) }
+    finally { setUndoBusy(false) }
+  }
+  const selectFile = (path: string) => {
+    if (selected() && previewReadyPath === selected() && previewBody) scrollPositions.set(selected()!, previewBody.scrollTop)
+    previewReadyPath = null
+    setSelected(path); setFocused(path)
+    setCurrentDir(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')
+    setPreview(true)
+
+  }
+  const focusRow = (path: string) => {
+    const row = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [data-path]')).find(el => el.dataset.path === path)
+    if (row?.getClientRects().length) row.focus()
+  }
+  const locate = () => {
+    const path = selected()
+    if (!path) return
+    setQuery(''); setPreview(false); setFocused(path)
+    const parts = path.split('/')
+    setExpanded(prev => new Set([...prev, ...parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'))]))
+    requestAnimationFrame(() => {
+      const row = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [data-path]')).find(el => el.dataset.path === path)
+      row?.focus(); row?.scrollIntoView({ block: 'nearest' })
+    })
+  }
+  const rowKey = (e: KeyboardEvent, target: Target) => {
+    if (e.composedPath().some(p => p instanceof HTMLElement && p.matches('md-icon-button, md-menu, md-menu-item'))) return
+    const row = e.currentTarget as HTMLElement
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [role="treeitem"]'))
+    const index = rows.indexOf(row)
+    let next: HTMLElement | undefined
+    if (e.key === 'ArrowDown') next = rows[index + 1]
+    if (e.key === 'ArrowUp') next = rows[index - 1]
+    if (e.key === 'Home') next = rows[0]
+    if (e.key === 'End') next = rows.at(-1)
+    if (next) { e.preventDefault(); next.focus(); return }
+    if (e.key === 'ArrowRight' && target.isDir) { e.preventDefault(); setDirOpen(target.path, true) }
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault()
+      if (target.isDir && isOpen(target.path)) setDirOpen(target.path, false)
+      else rows.find(r => r.dataset.path === target.path.slice(0, Math.max(0, target.path.lastIndexOf('/'))))?.focus()
+    }
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (target.isDir) { setCurrentDir(target.path); setDirOpen(target.path, true) } else selectFile(target.path) }
+    if (e.key === 'F2') { e.preventDefault(); command(target, 'rename') }
+    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); (row.querySelector('md-icon-button') as HTMLElement)?.click() }
+  }
+  const RowActions: Component<Target> = ap => <FilesMenu label={`更多操作：${ap.path}`} disabled={busy()} actions={[
+    { label: '重命名', icon: () => <IconEdit />, run: () => command(ap, 'rename') },
+    { label: '移动到…', icon: () => <IconDriveFileMove />, run: () => command(ap, 'move') },
+    { label: '复制路径', run: () => command(ap, 'copy') },
+    { label: '永久删除', icon: () => <IconDelete />, run: () => command(ap, 'delete') },
+  ]} />
+  // Pointer threshold keeps ordinary clicks distinct from a single-item move.
+  const [drag, setDrag] = createSignal<Target | null>(null)
+  const [externalDrop, setExternalDrop] = createSignal<string | null>(null)
+  const [drop, setDrop] = createSignal<string | null>(null)
+  let candidate: { target: Target; x: number; y: number; pointer: number; owner: HTMLElement } | null = null
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined
+  let scrollFrame = 0, pointerY = 0, pointerX = 0, suppressClick = false
+  let treeElement: HTMLDivElement | undefined
+  // No timer: a native click may arrive in a later task after capture release.
+  // Consume that pointer click once; keyboard activation remains independent.
+  const consumeDragClick = (e: MouseEvent) => {
+    if (!suppressClick || e.detail === 0) return
+    suppressClick = false
+    e.preventDefault(); e.stopImmediatePropagation()
+  }
+  const freshPointerDown = (e: PointerEvent) => { if (e.isPrimary !== false) suppressClick = false }
+  const clearDrag = () => {
+    const previous = candidate
+    candidate = null; setDrag(null); setDrop(null)
+    if (previous?.owner.hasPointerCapture(previous.pointer)) previous.owner.releasePointerCapture(previous.pointer)
+    clearTimeout(hoverTimer); cancelAnimationFrame(scrollFrame); scrollFrame = 0
+  }
+  const updateDestination = (x: number, y: number) => {
+    const folder = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-folder]')
+    const dest = folder?.dataset.folder ?? null
+    if (dest !== drop()) {
+      clearTimeout(hoverTimer); setDrop(dest)
+      if (dest && drag() && validMove(drag()!.path, drag()!.isDir, dest)) hoverTimer = setTimeout(() => setDirOpen(dest, true), 650)
+    }
+  }
+  const autoScroll = () => {
+    if (!drag() || !treeElement) return
+    const rect = treeElement.getBoundingClientRect()
+    const delta = pointerX < rect.left || pointerX > rect.right ? 0 : pointerY < rect.top + 36 ? -12 : pointerY > rect.bottom - 36 ? 12 : 0
+    if (delta) treeElement.scrollTop += delta
+    // Re-hit-test after scrolling/expansion: never commit to a stale folder.
+    updateDestination(pointerX, pointerY)
+    scrollFrame = requestAnimationFrame(autoScroll)
+  }
+  const pointerMove = (e: PointerEvent) => {
+    if (!candidate || e.pointerId !== candidate.pointer) return
+    if (!(e.buttons & 1)) { clearDrag(); return }
+    if (!drag() && Math.hypot(e.clientX - candidate.x, e.clientY - candidate.y) < 7) return
+    if (!drag()) {
+      // Capture only once this is a drag; ordinary controls and row clicks
+      // must retain their native pointerup/click targets.
+      try { candidate.owner.setPointerCapture(candidate.pointer) }
+      catch { clearDrag(); return }
+      setDrag(candidate.target); suppressClick = true; scrollFrame = requestAnimationFrame(autoScroll)
+    }
+    e.preventDefault(); pointerY = e.clientY; pointerX = e.clientX
+    updateDestination(pointerX, pointerY)
+  }
+
+  const performMove = async (target: Target, dest: string) => {
+    if (busy() || !validMove(target.path, target.isDir, dest)) return
+    await executeMove(target, dest)
+  }
+  const pointerUp = (e: PointerEvent) => {
+    if (!candidate || candidate.pointer !== e.pointerId) return
+    if (e.button !== 0) { clearDrag(); return }
+    updateDestination(e.clientX, e.clientY)
+    const source = drag(), dest = drop()
+    clearDrag()
+    if (source && dest !== null) void performMove(source, dest)
+  }
+  const cancelKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && candidate) { clearDrag(); showSnack('已取消移动') } }
+  const hidden = () => { if (document.hidden) clearDrag() }
+  onMount(() => {
+    window.addEventListener('pointerdown', freshPointerDown, true)
+    window.addEventListener('click', consumeDragClick, true)
+    window.addEventListener('pointermove', pointerMove, { passive: false })
+    window.addEventListener('pointerup', pointerUp)
+    window.addEventListener('pointercancel', clearDrag)
+    window.addEventListener('keydown', cancelKey)
+    window.addEventListener('blur', clearDrag)
+    window.addEventListener('lostpointercapture', clearDrag)
+    document.addEventListener('visibilitychange', hidden)
+  })
+  onCleanup(() => {
+    clearDrag(); window.removeEventListener('pointerdown', freshPointerDown, true); window.removeEventListener('click', consumeDragClick, true); window.removeEventListener('pointermove', pointerMove); window.removeEventListener('pointerup', pointerUp)
+    window.removeEventListener('pointercancel', clearDrag); window.removeEventListener('keydown', cancelKey)
+    window.removeEventListener('blur', clearDrag); window.removeEventListener('lostpointercapture', clearDrag)
+    document.removeEventListener('visibilitychange', hidden)
+  })
+  const pointerDown = (e: PointerEvent, target: Target) => {
+    freshPointerDown(e)
+    const interactive = 'md-menu, md-menu-item, md-icon-button, button, a, input, textarea, select, summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="menuitem"], [role="link"], [role="checkbox"], [role="radio"], [role="switch"], [role="textbox"], [role="combobox"], .files-tree-chevron'
+    // closest(target) cannot cross a Material shadow/slot boundary. The real
+    // composed path includes both the internal control and its custom host.
+    if (e.composedPath().some(node => node instanceof Element && node.matches(interactive))) { clearDrag(); return }
+    if (e.button || e.pointerType === 'touch' || busy() || !target.path) return
+    clearDrag()
+    const owner = e.currentTarget as HTMLElement
+    candidate = { target, x: e.clientX, y: e.clientY, pointer: e.pointerId, owner }
+  }
+  const contextMenu = (e: MouseEvent) => { e.preventDefault(); ((e.currentTarget as HTMLElement).querySelector('md-icon-button') as HTMLElement)?.click() }
+  const resize = (e: PointerEvent) => {
+    e.preventDefault()
+    const start = e.clientX, width = treeWidth(), handle = e.currentTarget as HTMLElement
+    handle.setPointerCapture(e.pointerId)
+    const move = (ev: PointerEvent) => setTreeWidth(Math.max(260, Math.min(600, width + ev.clientX - start)))
+    const finish = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', finish); handle.removeEventListener('pointercancel', finish) }
+    handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', finish); handle.addEventListener('pointercancel', finish)
+  }
 
   const TreeRows: Component<{ nodes: TreeNode[]; depth: number }> = (tp) => (
     <For each={tp.nodes}>
@@ -352,9 +589,13 @@ export const FilesScreen: Component<Props> = (props) => {
         node.kind === 'dir' ? (
           <>
             <div
-              class="files-tree-dir"
-              classList={{ 'files-tree-dir--current': currentDir() === node.path }}
-              style={{ 'padding-left': `${tp.depth * 16 + 8}px` }}
+              class="files-tree-dir" role="treeitem" data-path={node.path} data-folder={node.path}
+              title={node.path} aria-label={node.path} aria-expanded={!!query() || isOpen(node.path)} aria-selected={currentDir() === node.path}
+              tabIndex={focused() === node.path ? 0 : -1} onFocus={() => setFocused(node.path)}
+              onKeyDown={e => rowKey(e, { path: node.path, isDir: true })} onContextMenu={contextMenu}
+              onPointerDown={e => pointerDown(e, { path: node.path, isDir: true })}
+              classList={{ 'files-tree-dir--current': currentDir() === node.path, 'files-drop-valid': drop() === node.path && !!drag() && validMove(drag()!.path, drag()!.isDir, node.path), 'files-drop-invalid': drop() === node.path && !!drag() && !validMove(drag()!.path, drag()!.isDir, node.path) }}
+              style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 8}px` }}
               onClick={() => {
                 // row click = make this the CURRENT DIRECTORY (upload
                 // target) and open it; the chevron alone collapses
@@ -376,17 +617,20 @@ export const FilesScreen: Component<Props> = (props) => {
               <span class="md-typescale-label-large files-tree-dir__name">{node.name}</span>
               <RowActions path={node.path} isDir={true} />
             </div>
-            <Show when={isOpen(node.path)}>
+            <Show when={!!query() || isOpen(node.path)}>
               <TreeRows nodes={node.dirs} depth={tp.depth + 1} />
               <TreeRows nodes={node.files} depth={tp.depth + 1} />
             </Show>
           </>
         ) : (
           <div
-            class="files-tree-file"
+            class="files-tree-file" role="treeitem" data-path={node.path} title={node.path} aria-label={node.path}
+            aria-selected={selected() === node.path} tabIndex={focused() === node.path ? 0 : -1}
+            onFocus={() => setFocused(node.path)} onKeyDown={e => rowKey(e, { path: node.path, isDir: false })}
+            onContextMenu={contextMenu} onPointerDown={e => pointerDown(e, { path: node.path, isDir: false })}
             classList={{ 'files-tree-file--selected': selected() === node.path }}
-            style={{ 'padding-left': `${tp.depth * 16 + 30}px` }}
-            onClick={() => setSelected(node.path)}
+            style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 30}px` }}
+            onClick={() => selectFile(node.path)}
           >
             <md-icon class="files-tree-icon"><IconDescription /></md-icon>
             <span class="files-tree-file__name md-typescale-body-medium">
@@ -403,7 +647,7 @@ export const FilesScreen: Component<Props> = (props) => {
   )
 
   return (
-    <div class="files-screen">
+    <div class="files-screen" classList={{ 'files-screen--preview': preview(), 'files-screen--dragging': !!drag() }} style={{ '--files-tree-width': `${treeWidth()}px` }}>
       {/* hidden upload inputs (webkitdirectory is a non-standard attr —
           set it via ref so TSX doesn't reject it) */}
       <input
@@ -433,20 +677,10 @@ export const FilesScreen: Component<Props> = (props) => {
           <div class="files-tree-head">
             <span class="md-typescale-title-small">笔记</span>
             <span class="files-tree-head-actions">
-              <md-text-button
-                class="files-upload-btn files-upload-file"
-                disabled={uploading()}
-                onClick={() => fileInputRef?.click()}
-              >
-                上传文件
-              </md-text-button>
-              <md-text-button
-                class="files-upload-btn files-upload-dir"
-                disabled={uploading()}
-                onClick={() => dirInputRef?.click()}
-              >
-                上传文件夹
-              </md-text-button>
+              <FilesMenu label={`上传至 ${dirLabel()}`} text="上传" disabled={uploading()} actions={[
+                { label: `上传文件至 ${dirLabel()}`, run: () => fileInputRef?.click() },
+                { label: `上传文件夹至 ${dirLabel()}`, run: () => dirInputRef?.click() },
+              ]} />
               <md-icon-button aria-label="刷新" onClick={reload}>
                 <md-icon>
                   <IconRestartAlt size={18} />
@@ -469,6 +703,8 @@ export const FilesScreen: Component<Props> = (props) => {
               </md-text-button>
             </Show>
           </div>
+          <input class="files-search" type="search" aria-label="搜索文件名或路径" placeholder="搜索文件名或路径" value={query()} onInput={e => setQuery(e.currentTarget.value)} />
+          <div class="files-scope">Markdown 笔记与文件夹；附件随文件夹移动</div>
           <Show when={uploading()}>
             <md-linear-progress indeterminate />
           </Show>
@@ -491,10 +727,24 @@ export const FilesScreen: Component<Props> = (props) => {
               语料库里没有 .md 文件。用上方按钮上传笔记开始。
             </div>
           </Show>
-          <div class="files-tree">
+          <div class="files-tree" ref={treeElement} role="tree" aria-label="笔记文件" aria-busy={loading()}
+            onDragOver={e => { if (e.dataTransfer?.types.includes('Files')) {
+              e.preventDefault()
+              setExternalDrop((e.target as Element).closest<HTMLElement>('[data-folder]')?.dataset.folder ?? currentDir())
+            } }}
+            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setExternalDrop(null) }}
+            onDrop={e => {
+              if (!e.dataTransfer?.types.includes('Files') || busy()) return
+              e.preventDefault()
+              setExternalDrop(null)
+              const target = (e.target as Element).closest<HTMLElement>('[data-folder]')?.dataset.folder ?? currentDir()
+              const entries = Array.from(e.dataTransfer.files).map(file => ({ file, rel: file.name }))
+              void doUpload(entries, target, 'error')
+            }}>
             <div
-              class="files-tree-dir files-tree-dir--root"
-              classList={{ 'files-tree-dir--current': currentDir() === '' }}
+              class="files-tree-dir files-tree-dir--root" role="treeitem" data-path="" data-folder="" tabIndex={focused() === '' ? 0 : -1}
+              title="语料库根目录" aria-label="语料库根目录" onFocus={() => setFocused('')} onKeyDown={e => rowKey(e, { path: '', isDir: true })}
+              classList={{ 'files-tree-dir--current': currentDir() === '', 'files-drop-valid': drop() === '' && !!drag() && validMove(drag()!.path, drag()!.isDir, ''), 'files-drop-invalid': drop() === '' && !!drag() && !validMove(drag()!.path, drag()!.isDir, '') }}
               onClick={() => setCurrentDir('')}
             >
               <md-icon class="files-tree-icon">
@@ -507,6 +757,8 @@ export const FilesScreen: Component<Props> = (props) => {
         </div>
       </md-elevated-card>
 
+      <div class="files-resizer" role="separator" aria-label="调整文件树宽度" aria-orientation="vertical" aria-valuemin={260} aria-valuemax={600} aria-valuenow={treeWidth()} tabIndex={0}
+        onPointerDown={resize} onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); setTreeWidth(w => Math.max(260, Math.min(600, w + (e.key === 'ArrowRight' ? 20 : -20)))) } }} />
       <md-elevated-card class="files-viewer-card">
         <div class="files-viewer-inner">
           <Show
@@ -514,33 +766,37 @@ export const FilesScreen: Component<Props> = (props) => {
             fallback={
               <div class="files-viewer-empty md-typescale-body-medium">
                 从左边选择一个文件查看内容。点击文件夹可将其设为上传落点；
-                悬停行尾按钮可重命名 / 移动 / 删除。
+                行尾更多菜单可重命名、移动或永久删除。
               </div>
             }
           >
-            <div class="files-viewer-crumb md-typescale-label-small">
-              {crumb()}
-              <span class="files-viewer-actions">
-                <md-text-button onClick={() => openRename(selected()!, false)}>
-                  重命名
-                </md-text-button>
-                <md-text-button onClick={() => openMove(selected()!, false)}>
-                  移动到…
-                </md-text-button>
-                <md-text-button
-                  class="danger-text-button"
-                  onClick={() => openDelete(selected()!, false)}
-                >
-                  删除
-                </md-text-button>
-              </span>
+            <div class="files-preview-heading">
+              <md-text-button class="files-back" onClick={() => setPreview(false)}><md-icon slot="icon"><IconArrowBack /></md-icon>返回文件列表</md-text-button>
+              <nav aria-label="文件路径" class="files-breadcrumbs">
+                <md-text-button onClick={() => { setCurrentDir(''); setPreview(false) }}>根目录</md-text-button>
+                <For each={selected()!.split('/').slice(0, -1)}>{(part, index) => <><span aria-hidden="true">/</span><md-text-button onClick={() => {
+                  const path = selected()!.split('/').slice(0, index() + 1).join('/')
+                  setCurrentDir(path); setDirOpen(path, true); setPreview(false)
+                }}>{part}</md-text-button></>}</For>
+              </nav>
+              <h2 class="md-typescale-title-large" title={selected()!}>{selected()!.split('/').pop()}</h2>
+              <md-text-button onClick={locate}>在文件树中定位</md-text-button>
             </div>
+            <div class="files-preview-scroll" ref={previewBody} onScroll={() => { if (selected() && previewReadyPath === selected()) scrollPositions.set(selected()!, previewBody!.scrollTop) }}>
             <FileViewer
               path={selected()}
               anchorLine={null}
               fetchFile={api.filesRaw}
+              revision={fileIndex().get(selected()!)?.revision}
+              onReady={path => {
+                if (path !== selected() || !previewBody) return
+                previewReadyPath = path
+                previewBody.scrollTop = scrollPositions.get(path) ?? 0
+              }}
+              reloadToken={viewerVersion()}
               class="note-body md-typescale-body-medium files-viewer-body"
             />
+            </div>
           </Show>
         </div>
       </md-elevated-card>
@@ -565,8 +821,8 @@ export const FilesScreen: Component<Props> = (props) => {
               value={renameValue()}
               onInput={(e: Event) =>
                 setRenameValue((e.target as HTMLInputElement).value)}
-              onKeyDown={(e: KeyboardEvent) => {
-                if (e.key === 'Enter') void submitRename()
+              on:keydown={(e: KeyboardEvent) => {
+                if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); void submitRename() }
               }}
             />
             <Show when={isListed(renameTarget()!.path)}>
@@ -606,7 +862,7 @@ export const FilesScreen: Component<Props> = (props) => {
             <div class="files-move-hint md-typescale-label-small">选择目标文件夹：</div>
             <div class="files-move-list">
               <div
-                class="files-move-dir"
+                class="files-move-dir" role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMoveDest('') } }}
                 classList={{
                   'files-move-dir--pick': moveDest() === '',
                   'files-move-dir--disabled': moveTarget()!.isDir && moveForbidden(''),
@@ -639,7 +895,7 @@ export const FilesScreen: Component<Props> = (props) => {
             </md-text-button>
             <md-filled-button
               onClick={submitMove}
-              disabled={moveBusy() || moveDest() === null}
+              disabled={moveBusy() || moveDest() === null || !validMove(moveTarget()!.path, moveTarget()!.isDir, moveDest()!)}
             >
               移动
             </md-filled-button>
@@ -739,6 +995,11 @@ export const FilesScreen: Component<Props> = (props) => {
         </md-dialog>
       </Show>
 
+      <div class="files-feedback" role="status" aria-live="polite">
+        <Show when={externalDrop() !== null}>外部文件：上传至 {externalDrop() || '根目录'}</Show>
+        <Show when={drag()}>{drop() === null ? '拖到文件夹或根目录以移动；Esc 取消' : validMove(drag()!.path, drag()!.isDir, drop()!) ? `移动至 ${drop() || '根目录'}` : '不能移动到此位置'}</Show>
+        <Show when={undoId()}><md-text-button disabled={busy()} onClick={undoMove}>撤销上次文件迁移</md-text-button></Show>
+      </div>
       <Snackbar open={!!snack()} label={snack()} />
     </div>
   )

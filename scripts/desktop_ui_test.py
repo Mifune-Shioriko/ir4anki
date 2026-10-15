@@ -80,7 +80,7 @@ def run():
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".nav-rail", timeout=30000)
         page.locator("md-filled-button", has_text="开始").first.click()
-        page.wait_for_selector(".reading-crumb", timeout=30000)
+        page.wait_for_selector(".stage-reading .reading-chunk-body h1", timeout=30000)
         page.wait_for_timeout(800)
 
         # --- right column: SidePanelTabs — 统一双栏 at EVERY width ---
@@ -96,10 +96,11 @@ def run():
               page.locator(".note-column .side-panel-body").first.is_visible())
 
         # --- chip semantics: info spans, no disabled assist-chips ---
-        check("card header uses info-chip spans",
-              page.locator(".card-chips .info-chip").count()>=1)
+        check("reading source is a text span in the shared study shell",
+              page.locator(".stage-reading .study-source-row .study-source").count()==1
+              and "颈部" in page.locator(".stage-reading .study-source").inner_text())
         check("no md-assist-chip left in card headers",
-              page.locator(".card-header md-assist-chip").count()==0)
+              page.locator(".study-header md-assist-chip").count()==0)
 
         # --- start screen: shortcut hint row gone ---
         # (navigate back mid-round isn't possible; the modes test covers the

@@ -320,7 +320,8 @@ def run(notes: Path):
                 "gap_policy": "bookmark"})
             check("split ok", r.get("ok") is True, r)
             r2 = api("/api/reading/edit", "POST", {
-                "path": A_REL, "seg_id": sid, "new_text": "x"})
+                "path": A_REL, "seg_id": sid, "new_text": "x",
+                "expected_revision": chunks[0]["edit_revision"], "expected_fingerprint": chunks[0]["fingerprint"]})
             check("container edit → 409 (backend guard)",
                   r2.get("_status") == 409, r2)
 

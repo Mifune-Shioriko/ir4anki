@@ -29,10 +29,22 @@ async function parse<T>(r: Response): Promise<T> {
   } catch {
     /* non-JSON body (SPA fallback HTML, gateway error page…) */
   }
-  if (!r.ok) throw new Error(data?.detail || `HTTP ${r.status}`)
+  if (!r.ok) throw new ApiError(data?.detail || `HTTP ${r.status}`, r.status)
   if (data === null) throw new Error('后端响应异常（页面刷新或重启服务后再试）')
   return data as T
 }
+
+export class ApiError extends Error {
+  constructor(message: string, public status: number) { super(message) }
+}
+
+export interface FileOperationResult {
+  path: string
+  old_path?: string
+  operationId?: string
+  unchanged?: boolean
+}
+export type FileOperationStatus = (FileOperationResult & { status: 'complete'; old_path: string; operationId: string }) | { status: 'not_found' | 'cancelled' }
 
 /** /api/files/upload rejected with 409: .md name conflicts. The detail is
  *  a JSON list of clashing relative paths — the UI offers 覆盖/改名/跳过
@@ -51,14 +63,22 @@ export class UploadConflictError extends Error {
   }
 }
 
+export class UploadPartialError extends ApiError {
+  constructor(public saved: { path: string; action: string }[], public failed: string,
+              public remaining: string[], message: string) {
+    super(`${message}。已保存：${saved.filter(s => s.action !== 'skipped').map(s => s.path).join('、') || '无'}；失败：${failed}`, 503)
+    this.name = 'UploadPartialError'
+  }
+}
+
 export interface FilesUploadResponse {
   ok: boolean
   saved: { path: string; action: string; original?: string }[]
   images_renamed: Record<string, string>
 }
 
-function get<T>(url: string): Promise<T> {
-  return fetch(url).then(r => parse<T>(r))
+function get<T>(url: string, signal?: AbortSignal): Promise<T> {
+  return fetch(url, { signal }).then(r => parse<T>(r))
 }
 
 function post<T>(url: string, body?: unknown): Promise<T> {
@@ -87,7 +107,11 @@ export const api = {
   engineStatus: () => engineRequest<import('./types').EngineStatus>('/api/engine/status'),
   engineBackup: () => engineRequest<{ handle?: unknown; [key: string]: unknown }>('/api/engine/backup', {}),
   engineExport: () => engineRequest<{ download_url: string }>('/api/engine/export', {}),
-  engineSync: () => engineRequest<Record<string, unknown>>('/api/engine/sync', { commit_undo: true }),
+  engineSync: () => fetch('/api/local/sync', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-IR4Anki-Local-Sync': 'confirm' },
+    body: JSON.stringify({ commit_undo: true }),
+  }).then(r => parse<Record<string, unknown>>(r)),
   engineDownload: async (path: string): Promise<Blob> => {
     const safe = engineDownloadPath(path, location.origin)
     const headers: Record<string,string> = engineToken ? {Authorization: `Bearer ${engineToken}`} : {}
@@ -141,9 +165,10 @@ export const api = {
     )
   },
   // ---- file browser (文件 section, user spec 2026-09-19 round 3) ----
-  filesList: () => get<{ files: { path: string; title: string }[]; dirs?: string[] }>('/api/files/list'),
-  filesRaw: (path: string) =>
-    get<{ path: string; text: string }>(`/api/files/raw?path=${encodeURIComponent(path)}`),
+  filesList: () => get<{ files: { path: string; title: string; revision?: string }[]; dirs?: string[] }>('/api/files/list'),
+  filesMembership: () => get<{ paths: string[] }>('/api/files/membership'),
+  filesRaw: (path: string, signal?: AbortSignal) =>
+    get<{ path: string; text: string; revision?: string }>(`/api/files/raw?path=${encodeURIComponent(path)}`, signal),
   // ---- file management (user spec 2026-10-06: 前端 = 语料唯一可信来源) ----
   /** Upload .md notes + images. `entries` carry a File and its relative
    *  path (webkitRelativePath for folder uploads, file.name for singles);
@@ -165,21 +190,26 @@ export const api = {
     fd.append('on_conflict', onConflict)
     return fetch('/api/files/upload', { method: 'POST', body: fd }).then(async r => {
       if (r.status === 409) {
-        let detail = ''
-        try {
-          detail = String((JSON.parse(await r.text()) as { detail?: string }).detail ?? '')
-        } catch { /* non-JSON detail */ }
-        throw new UploadConflictError(detail)
+        const detail = String((await r.json() as { detail?: string }).detail ?? '')
+        const conflict = new UploadConflictError(detail)
+        if (conflict.conflicts.length) throw conflict
+        throw new ApiError(detail || '上传目标冲突', 409)
+      }
+      if (r.status === 503) {
+        const data = await r.clone().json() as { detail?: { saved?: { path: string; action: string }[]; failed?: string; remaining?: string[]; message?: string } }
+        if (Array.isArray(data.detail?.saved) && data.detail?.failed) {
+          throw new UploadPartialError(data.detail.saved, data.detail.failed, data.detail.remaining ?? [], data.detail.message ?? '上传部分失败')
+        }
       }
       return parse<FilesUploadResponse>(r)
     })
   },
-  filesRename: (path: string, newName: string) =>
-    post<{ ok: boolean; path: string; old_path?: string; unchanged?: boolean }>(
-      '/api/files/rename', { path, new_name: newName }),
-  filesMove: (path: string, newDir: string) =>
-    post<{ ok: boolean; path: string; old_path?: string; unchanged?: boolean }>(
-      '/api/files/move', { path, new_dir: newDir }),
+  filesRename: (path: string, newName: string, requestId?: string) =>
+    post<FileOperationResult>('/api/files/rename', { path, new_name: newName, requestId }),
+  filesMove: (path: string, newDir: string, requestId?: string) =>
+    post<FileOperationResult>('/api/files/move', { path, new_dir: newDir, requestId }),
+  filesOperation: (requestId: string) => get<FileOperationStatus>(`/api/files/operation?request_id=${encodeURIComponent(requestId)}`),
+  filesUndo: (operationId: string, requestId?: string) => post<FileOperationResult>('/api/files/undo', { operationId, requestId }),
   filesDelete: (path: string, confirm: string) =>
     post<{ ok: boolean; deleted: string; was_dir: boolean }>(
       '/api/files/delete', { path, confirm }),
@@ -187,8 +217,8 @@ export const api = {
   readingStatus: () => get<ReadingStatusResponse>('/api/reading/status'),
   readingState: () => get<ReadingStateResponse>('/api/reading/state'),
   readingCorpus: () => get<{ files: ReadingCorpusFile[] }>('/api/reading/corpus'),
-  readingFile: (path: string) =>
-    get<{ path: string; text: string }>(`/api/reading/file?path=${encodeURIComponent(path)}`),
+  readingFile: (path: string, signal?: AbortSignal) =>
+    get<{ path: string; text: string }>(`/api/reading/file?path=${encodeURIComponent(path)}`, signal),
   readingStart: (mode?: string) =>
     post<ReadingStartResponse>(mode ? `/api/reading/start?mode=${mode}` : '/api/reading/start'),
   readingAct: (path: string, chunkKey: string, action: string) =>
@@ -224,9 +254,9 @@ export const api = {
    *  line range in the .md; backend re-anchors all segments in the same
    *  transaction (app = only writer, no drift fuse). Returns the fresh
    *  chunk payload for in-place UI replacement. */
-  readingEdit: (path: string, segId: number, newText: string) =>
+  readingEdit: (path: string, segId: number, newText: string, revision: string, fingerprint: string) =>
     post<ReadingEditResponse>('/api/reading/edit', {
-      path, seg_id: segId, new_text: newText,
+      path, seg_id: segId, new_text: newText, expected_revision: revision, expected_fingerprint: fingerprint,
     }),
   /** Reading-mode note image upload (P5): stores in NOTES_DIR/_assets,
    *  returns the bare filename to embed as `![](filename)`. */

@@ -28,7 +28,7 @@ from typing import Any
 
 from playwright.sync_api import sync_playwright
 
-BASE = "http://127.0.0.1:8907"
+BASE = ""  # allocated disposable server only
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PASS = 0
 FAIL = 0
@@ -101,10 +101,20 @@ PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
            "nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
 
 
+def open_row_command(page, row, label):
+    row.locator('.files-menu md-icon-button').click()
+    page.locator('md-menu[open] md-menu-item').filter(has_text=label).click()
+
+
+def open_upload(page, folder=False):
+    page.locator('.files-tree-head .files-menu md-icon-button').click()
+    page.locator('md-menu[open] md-menu-item').filter(has_text='上传文件夹至' if folder else '上传文件至').click()
+
+
 def run(notes: Path, uploads: Path):
     js_errors = []
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(chromium_sandbox=True)
         page = browser.new_page(viewport={"width": 1440, "height": 900})
         page.on("pageerror", lambda e: js_errors.append(str(e)))
 
@@ -114,13 +124,17 @@ def run(notes: Path, uploads: Path):
         page.wait_for_selector(".files-screen", timeout=15000)
         check("files screen rendered",
               page.locator(".files-tree-card").count() == 1)
-        check("upload file button present",
-              page.locator(".files-upload-file").count() == 1)
-        check("upload folder button present",
-              page.locator(".files-upload-dir").count() == 1)
+        check("single upload entry present", page.locator('.files-tree-head .files-menu md-icon-button').count() == 1)
+        page.locator('.files-tree-head .files-menu md-icon-button').click()
+        check("upload file command present", page.locator('md-menu[open] md-menu-item').filter(has_text='上传文件至').count() == 1)
+        check("upload folder command present", page.locator('md-menu[open] md-menu-item').filter(has_text='上传文件夹至').count() == 1)
+        page.keyboard.press('Escape')
         check("current-dir strip shows root by default",
               "语料库根目录" in page.locator(".files-current-dir").inner_text(),
               page.locator(".files-current-dir").inner_text())
+        page.locator('.files-tree-dir', has_text='2026').first.click()
+        page.locator('.files-tree-dir', has_text='解剖').first.click()
+        page.locator('.files-current-dir__root').click()
         check("both seeded notes in the tree",
               page.locator(".files-tree-file", has_text="颈部").count() == 1
               and page.locator(".files-tree-file", has_text="上肢").count() == 1)
@@ -143,7 +157,7 @@ def run(notes: Path, uploads: Path):
         page.locator(".files-tree-dir", has_text="解剖").first.click()
         page.wait_for_timeout(200)
         with page.expect_file_chooser() as fc:
-            page.locator(".files-upload-file").click()
+            open_upload(page)
         fc.value.set_files(str(uploads / "盆腔.md"))
         page.wait_for_selector(".snackbar", timeout=15000)
         snack = page.locator(".snackbar").inner_text()
@@ -158,10 +172,10 @@ def run(notes: Path, uploads: Path):
         neck = page.locator(".files-tree-file", has_text="颈部").first
         neck.hover()
         page.wait_for_timeout(300)
-        check("hover reveals 3 row actions",
-              neck.locator(".files-row-action").count() == 3,
+        check("one compact row menu",
+              neck.locator(".files-row-action").count() == 1,
               neck.locator(".files-row-action").count())
-        neck.locator('md-icon-button[data-aria-label="重命名"]').click()
+        open_row_command(page, neck, '重命名')
         page.wait_for_selector(".files-dialog", timeout=10000)
         check("rename dialog open with the path shown",
               "颈部.md" in page.locator(".files-dialog-path").first.inner_text(),
@@ -181,8 +195,7 @@ def run(notes: Path, uploads: Path):
 
         print("== 5. rename dialog scrim-guarded (no accidental close) ==")
         page.locator(".files-tree-file", has_text="颈前区").first.hover()
-        page.locator(".files-tree-file", has_text="颈前区").first.locator(
-            'md-icon-button[data-aria-label="重命名"]').click()
+        open_row_command(page, page.locator(".files-tree-file", has_text="颈前区").first, '重命名')
         page.wait_for_selector(".files-dialog", timeout=10000)
         # click the scrim (far corner of the viewport) → dialog must survive
         page.mouse.click(10, 10)
@@ -196,8 +209,7 @@ def run(notes: Path, uploads: Path):
 
         print("== 6. move dialog: folder picker + move ==")
         page.locator(".files-tree-file", has_text="颈前区").first.hover()
-        page.locator(".files-tree-file", has_text="颈前区").first.locator(
-            'md-icon-button[data-aria-label="移动到"]').click()
+        open_row_command(page, page.locator(".files-tree-file", has_text="颈前区").first, '移动到')
         page.wait_for_selector(".files-dialog", timeout=10000)
         check("move dialog lists 根目录 + folders",
               page.locator(".files-move-dir", has_text="根目录").count() == 1
@@ -219,8 +231,7 @@ def run(notes: Path, uploads: Path):
 
         print("== 7. delete dialog: typed-name 防呆 ==")
         page.locator(".files-tree-file", has_text="上肢").first.hover()
-        page.locator(".files-tree-file", has_text="上肢").first.locator(
-            'md-icon-button[data-aria-label="删除"]').click()
+        open_row_command(page, page.locator(".files-tree-file", has_text="上肢").first, '永久删除')
         page.wait_for_selector(".files-dialog", timeout=10000)
         check("delete dialog shows the permanent-delete warning",
               "永久删除" in page.locator(".files-delete-warn").first.inner_text(),
@@ -253,7 +264,7 @@ def run(notes: Path, uploads: Path):
               page.locator(".files-tree-badge", has_text="清单").count() >= 1)
         pel = page.locator(".files-tree-file", has_text="盆腔").first
         pel.hover()
-        pel.locator('md-icon-button[data-aria-label="删除"]').click()
+        open_row_command(page, pel, '永久删除')
         page.wait_for_selector(".files-dialog", timeout=10000)
         warn = page.locator(".files-delete-warn--listed")
         check("listed-file delete warns about reading progress",
@@ -270,7 +281,7 @@ def run(notes: Path, uploads: Path):
         page.locator(".files-tree-dir", has_text="解剖").first.click()
         page.wait_for_timeout(200)
         with page.expect_file_chooser() as fc:
-            page.locator(".files-upload-file").click()
+            open_upload(page)
         fc.value.set_files(str(uploads / "dup.md"))
         page.wait_for_selector(".files-dialog", timeout=15000)
         check("conflict dialog headline 文件名冲突",
@@ -297,6 +308,9 @@ from native_fixture import configure, tempdir, run_closed, NativeData, reserve_l
 
 @cleanup_after
 def main():
+    scratch_dist = Path(os.environ['REGRESSION_DIST']).resolve()
+    scratch_root = Path('/home/shioriko/.hermes/cache/scratch').resolve()
+    assert scratch_dist.is_relative_to(scratch_root) and (scratch_dist/'index.html').is_file(), 'scratch build required'
     state = tempdir(prefix="filemgmt-ui-state-")
     notes = Path(tempdir(prefix="filemgmt-ui-notes-"))
     uploads = Path(tempdir(prefix="filemgmt-ui-uploads-"))
@@ -314,14 +328,14 @@ def main():
     (uploads / "dup.md").write_text(
         "# 新上传的重名笔记\n\n新的内容新的内容。\n", encoding="utf-8")
 
-    env = dict(os.environ)
+    env = {k:v for k,v in os.environ.items() if not k.startswith('ANKI_')}
     env.update({
         "ANKI_STATE_DIR": state,
         "ANKI_NOTES_DIR": str(notes),
         "ANKI_READING_MODE": "1",
         "ANKI_PREVIEW_MODE": "0",
 
-        "REVIEW_DIST_DIR": os.environ.get("REGRESSION_DIST", str(REPO_ROOT / "frontend" / "dist")),
+        "REVIEW_DIST_DIR": str(scratch_dist),
     })
     py = Path(sys.executable)  # use the test venv, never install into live venv
     configure(env)

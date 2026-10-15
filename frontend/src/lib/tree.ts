@@ -5,6 +5,7 @@
 export interface TreeFile {
   path: string
   title: string
+  revision?: string
   /** reading-list membership (picker only; the file browser omits it) */
   in_list?: boolean
   /** previously removed with parked progress — picker offers 重新播种
@@ -23,25 +24,29 @@ export interface TreeNode {
   files: TreeNode[]
 }
 
-export function buildTree(files: TreeFile[]): TreeNode[] {
+export function buildTree(files: TreeFile[], directories: string[] = []): TreeNode[] {
   const roots: TreeNode[] = []
   const dirIndex = new Map<string, TreeNode>()
-  for (const f of files) {
-    const parts = f.path.split('/')
+  const ensureDir = (path: string) => {
     let container = roots
     let prefix = ''
-    for (let i = 0; i < parts.length - 1; i++) {
-      prefix = prefix ? `${prefix}/${parts[i]}` : parts[i]
+    for (const part of path.split('/').filter(Boolean)) {
+      prefix = prefix ? `${prefix}/${part}` : part
       let dir = dirIndex.get(prefix)
       if (!dir) {
-        dir = { name: parts[i], path: prefix, kind: 'dir', dirs: [], files: [] }
+        dir = { name: part, path: prefix, kind: 'dir', dirs: [], files: [] }
         dirIndex.set(prefix, dir)
         container.push(dir)
       }
       container = dir.dirs
     }
+  }
+  directories.forEach(ensureDir)
+  for (const f of files) {
+    const parts = f.path.split('/')
+    ensureDir(parts.slice(0, -1).join('/'))
     const fileNode: TreeNode = {
-      name: parts[parts.length - 1].replace(/\.md$/, ''),
+      name: parts[parts.length - 1].replace(/\.md$/i, ''),
       path: f.path,
       kind: 'file',
       file: f,
@@ -70,10 +75,6 @@ export function buildTree(files: TreeFile[]): TreeNode[] {
     })
   }
   sortRec(roots)
-  dirIndex.forEach(d => {
-    sortRec(d.dirs)
-    sortRec(d.files)
-  })
   return roots
 }
 

@@ -45,7 +45,9 @@ class AnswerJournal:
 
     @staticmethod
     def scheduling_config(rows):
-        return [r for r in rows if r[0] not in ('nextPos', 'curModel')
+        # Daily unbury bookkeeping is independent of a grade. Preserve it
+        # across overnight restart/undo; card changes still have full guards.
+        return [r for r in rows if r[0] not in ('nextPos', 'curModel', 'lastUnburied')
                 and not (r[0].startswith('_deck_') and r[0].endswith('_lastNotetype'))
                 and not (r[0].startswith('_nt_') and r[0].endswith('_lastDeck'))]
 
@@ -60,16 +62,18 @@ class AnswerJournal:
         d=self.data
         return bool(d and d['phase']=='committed' and self.snapshot(d['cid'])==d['after'])
 
-    def restore(self):
+    def restore(self, *, round_undo=None):
         d=self.data
-        if d['phase'] not in ('committed','restoring') or self.snapshot(d['cid']) != d['after']:
-            raise RuntimeError('undo journal scheduling guard mismatch or incomplete answer')
-        # Entire card row, including FSRS data and original-deck/due state;
-        # only this unexported answer's revlog and scheduler deck counters.
-        self.save(dict(d, phase='restoring'))
+        if round_undo is not None:
+            d=dict(d, round_undo=round_undo)
+        # One full guard, under the same write transaction as restoration.
+        # Never reuse a snapshot from an earlier request or guess a DB version.
         db=self.col.db
         db.execute('begin immediate')
         try:
+            if d['phase'] not in ('committed','restoring') or self.snapshot(d['cid']) != d['after']:
+                raise RuntimeError('undo journal scheduling guard mismatch or incomplete answer')
+            self.save(dict(d, phase='restoring'))
             columns=[r[1] for r in db.all('pragma table_info(cards)')]
             db.execute('update cards set '+','.join(f'{c}=?' for c in columns)+' where id=?',*d['before']['card'],d['cid'])
             old_ids = {r[0] for r in d['before']['revlog']}

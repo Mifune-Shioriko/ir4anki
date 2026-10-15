@@ -65,8 +65,8 @@ already opened by Anki. These are not a license to run concurrent desktop writer
 Normal collection sync and media sync are implemented. A full-sync-required
 response is a hard stop, never an automatic upload/download decision. Stop
 ir4anki, open the matching desktop client, explicitly resolve the full sync,
-close desktop, then restart ir4anki. Missing credentials fail visibly in logs
-and through the existing `synced: false` response; local use is still possible.
+close desktop, then restart ir4anki. Missing credentials fail at explicit sync;
+local use remains possible and never requires authentication to the sync server.
 
 Pylib keeps a durable single-answer journal beside the collection
 (`collection.anki2.ir4anki-answer.json`). It binds to collection path, inode,
@@ -74,14 +74,15 @@ creation time and engine version. Native undo is preferred; after restart,
 guarded restoration includes the complete card row (FSRS data), new revlog
 entries and changed deck counters. Mismatched snapshots fail closed.
 
-Background sync is deferred while the latest answer remains undoable; there is
-no timed undo window. Grading the next card ends the previous slot, attempts
-sync, then creates a new undo slot. A failed prior sync does not block local
-grading: local native changes remain pending, while the old undo authority is
-discarded because a failed network response may already have exported data.
-Explicit sync with `commit_undo=true` also ends undo and requires UI confirmation.
-Thus restart/reload/background sync requests preserve undo, but actual export of
-the answer to the server does not. This is not cross-sync multi-level undo.
+Sync policy defaults to `ANKI_SYNC_POLICY=manual`, even with credentials configured.
+Startup, answers, reading, authoring, undo and ordinary round transitions do not
+attempt remote sync. Grading the next card retires the prior undo slot locally,
+leaving all native SQLite changes pending; it never exports that prior answer.
+`legacy` explicitly opts into the retained automatic hooks and undo deferral.
+Explicit protected sync with `commit_undo=true` ends undo and requires UI confirmation.
+A failed explicit sync may already have exported changes: the old undo cannot be
+revived, but further local work remains available. See [offline use](offline-use.md)
+for Debian preparation, media limits and the manual synchronization window.
 
 Keep the journal with the collection during backup/rollback. Do not delete it
 to bypass recovery guards. Desktop emergency use must first resolve or explicitly
@@ -90,7 +91,7 @@ retains its historical snapshot behavior.
 
 Engine management endpoints require `ANKI_ENGINE_API_TOKEN` as a bearer token
 (except non-sensitive engine status). Set it locally and enter it in the engine
-panel; it is held only in page memory. Downloads use authenticated fetch, not
+manual sync dialog; it is held only in page memory. Downloads use authenticated fetch, not
 tokens in URLs. Empty token configuration disables protected operations.
 
 Backups are created before serving pylib requests and every 30 minutes (interval

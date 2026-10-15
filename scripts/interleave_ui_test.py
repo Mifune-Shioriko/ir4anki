@@ -2,7 +2,7 @@
 Sequence/ratios, refresh in both phases, cross-phase undo, trace return,
 split/removal, interrupted/legacy adoption, end-reading, exit and summary.
 """
-import importlib,os,subprocess,sys
+import importlib,os,subprocess,sys,json,time,traceback
 from pathlib import Path
 from playwright.sync_api import sync_playwright
 from native_fixture import configure,NativeData,cleanup,reserve_loopback_port,verify_server
@@ -18,7 +18,7 @@ def prepare(s,c,kind):
     # case owns a fresh collection AND fresh state/corpus paths. Never inherit
     # ANKI settings from a live installation or another disposable case.
     original_env = dict(os.environ)
-    case_env = {key:value for key,value in original_env.items() if not key.startswith('ANKI_')}
+    case_env = {key:value for key,value in original_env.items() if not key.startswith('ANKI_') and key!='ANKICONNECT_URL'}
     case_env.update(ANKI_READING_MODE='1',ANKI_PREVIEW_MODE='1',REVIEW_DIST_DIR=str(DIST))
     configure(case_env)
     try:
@@ -33,7 +33,13 @@ def prepare(s,c,kind):
                 for i in range(c):native.add_card(500+i,deck='2026',note=5000+i)
                 for i in range(s):
                     name=f'read-{i}.md'
-                    (Path(os.environ['ANKI_NOTES_DIR'])/name).write_text('# Topic\n\nFirst paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n')
+                    content = '# Topic\n\nFirst paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n'
+                    if kind == 'offline':
+                        import base64
+                        b.NOTES_ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+                        (b.NOTES_ASSETS_DIR/'offline.png').write_bytes(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF1sAAAAASUVORK5CYII='))
+                        content = content.replace('First paragraph.', 'First paragraph $x^2$ ![](offline.png).')
+                    (Path(os.environ['ANKI_NOTES_DIR'])/name).write_text(content)
                     await b.reading_list_add(b.ReadingPathBody(path=name))
                 if s and c:
                     data=b._reading_read();key=str(data['list'][0]['segments'][0]['seg_id'])
@@ -52,15 +58,51 @@ def prepare(s,c,kind):
         os.environ.update(original_env)
 
 
+def capture_failure(page, name, *, errors, console, network, states, failure):
+    """Inspect the disposable page before teardown; never issue extra requests."""
+    capture_errors=[]
+    def save(suffix, action):
+        try:action(RUN/f'{name}.{suffix}')
+        except Exception as exc:capture_errors.append({'artifact':suffix,'error':str(exc)})
+    save('html',lambda path:path.write_text(page.content()))
+    save('png',lambda path:page.screenshot(path=str(path),full_page=True,timeout=5000))
+    save('controls.json',lambda path:path.write_text(json.dumps(page.locator(
+        'md-icon-button, md-text-button, md-filled-button, md-filled-tonal-button'
+    ).evaluate_all("""elements => elements.map(e => ({html:e.outerHTML,
+        text:e.textContent,disabled:e.disabled,shadow:e.shadowRoot?.innerHTML}))"""),ensure_ascii=False,indent=2)))
+    (RUN/f'{name}.json').write_text(json.dumps({'url':page.url,'failure':failure,
+        'page_errors':errors,'console':console,'network':network,'observed_states':states,
+        'capture_errors':capture_errors},ensure_ascii=False,indent=2))
+
+
+def write_results(results):
+    target=RUN/'interleave-results.json'
+    pending=target.with_suffix('.tmp')
+    pending.write_text(json.dumps(results,ensure_ascii=False,indent=2))
+    pending.replace(target)
+
+
 def run_case(browser,s,c,kind,case_env):
     port=reserve_loopback_port();base=f'http://127.0.0.1:{port}'
     logfile=(RUN/f'ui-server-{s}-{c}-{kind}.log').open('w')
     proc=None
     page=None
+    errors=[];console=[];network=[];states=[]
     try:
         proc=subprocess.Popen([sys.executable,'-m','uvicorn','app:app','--host','127.0.0.1','--port',str(port)],cwd=ROOT/'backend',env=dict(case_env),stdout=logfile,stderr=subprocess.STDOUT)
-        verify_server(proc,base);page=browser.new_page(viewport={'width':1400,'height':950});errors=[]
+        verify_server(proc,base);page=browser.new_page(viewport={'width':1400,'height':950})
         page.on('pageerror',lambda error:errors.append(str(error)))
+        page.on('console',lambda message:console.append({'type':message.type,'text':message.text}))
+        page.on('requestfailed',lambda request:network.append({'event':'requestfailed','url':request.url,'method':request.method,'failure':request.failure}))
+        def response_seen(response):
+            network.append({'event':'response','url':response.url,'method':response.request.method,'status':response.status})
+            if any(path in response.url for path in ('/api/flow/state','/api/flow/start','/api/answer','/api/undo')):
+                try:
+                    data=response.json();wire=data.get('state') if isinstance(data.get('state'),dict) else data
+                    states.append({'flow':wire.get('flow'),'cards':[c.get('cardId') for c in wire.get('cards',[])],
+                                   'can_undo':wire.get('can_undo'),'url':response.url})
+                except Exception as exc:states.append({'capture_error':str(exc),'url':response.url})
+        page.on('response',response_seen)
         def get():return page.request.get(base+'/api/flow/state').json()
         def post(path,body=None):
             r=page.request.post(base+path,data=body);assert r.ok,r.text();return r.json()
@@ -70,20 +112,23 @@ def run_case(browser,s,c,kind,case_env):
             page.wait_for_selector(selector)
             assert get()['flow']['phase']==phase
         def act(selector):
-            with page.expect_response(lambda r:'/api/flow/state' in r.url and r.request.method=='GET') as response:
-                page.locator(selector).click()
-            return response.value.json()
+            is_answer = selector == 'md-filled-button.ease-good'
+            endpoint = '/api/answer' if is_answer else '/api/flow/state'
+            with page.expect_response(lambda r:endpoint in r.url) as response:
+                (page.locator(selector) if isinstance(selector,str) else selector).click()
+            result = response.value.json()
+            return result['state'] if is_answer else result
         page.goto(base,wait_until='networkidle')
         if kind not in ('legacy','interrupted'):
             page.wait_for_selector('.screen-title')
             d=act('md-filled-button:has-text("开始")')
         else:d=get();assert d['flow']['legacy']==(kind=='legacy')
         if kind=='exit':
-            act('md-text-button:has-text("退出本轮")')
+            act(page.get_by_role('toolbar',name='阅读操作',exact=True).get_by_role('button',name='退出本轮',exact=True))
             assert get()['flow'] is None
             page.wait_for_selector('.screen-title')
             assert post('/api/flow/start')['flow']['phase']=='reading'
-            return
+            return {'flow_exited':True,'fresh_restart_phase':'reading'}
         if kind=='end':
             d=act('md-text-button:has-text("结束阅读")')
             assert d['flow']['phase']=='review' and d['flow']['stats']['readingSkipped']==s
@@ -116,7 +161,7 @@ def run_case(browser,s,c,kind,case_env):
                 d=act('md-filled-button.ease-good')
                 if d['flow']['phase']=='reading' and not did_undo:
                     reading_count=d['flow']['reading_consumed'];new_count=d['flow']['stats']['newReviewed']
-                    d=act('md-text-button:has-text("撤销上次评分")')
+                    d=act(page.get_by_role('toolbar',name='阅读操作',exact=True).get_by_role('button',name='撤销上次评分',exact=True))
                     assert d['flow']['phase']=='review' and d['flow']['reading_consumed']==reading_count
                     assert d['flow']['stats']['newReviewed']==new_count-1
                     refresh('review');page.locator('md-filled-tonal-button:has-text("显示答案")').click()
@@ -138,6 +183,13 @@ def run_case(browser,s,c,kind,case_env):
         # Explicit exit clears both queues; end-reading continues cards in another flow.
         post('/api/flow/exit');assert get()['flow'] is None
         print(f'UI passed: {s} readings/{c} cards {kind}',flush=True)
+        return {'sequence':seq,'did_undo':did_undo,'did_trace':did_trace,'did_split':did_split,
+                'final_stats':d['flow']['stats'],'phase':'complete','exit_cleared':True}
+    except Exception as exc:
+        if page:
+            capture_failure(page,f'ui-{s}-{c}-{kind}-failure',errors=errors,console=console,
+                            network=network,states=states,failure=repr(exc))
+        raise
     finally:
         try:
             if page:page.close()
@@ -153,15 +205,27 @@ def run_case(browser,s,c,kind,case_env):
 def main():
     # Fail at the normal loopback operation if sandbox disallows it; no bypass.
     reserve_loopback_port()
-    for s,c,kind in [(3,8,'normal'),(7,1,'normal'),(0,3,'normal'),(3,0,'normal'),(0,0,'normal'),(1,1,'normal'),(2,4,'edges'),(2,4,'legacy'),(2,4,'interrupted'),(3,4,'end'),(2,4,'exit')]:
+    cases=[(3,8,'normal'),(7,1,'normal'),(0,3,'normal'),(3,0,'normal'),(0,0,'normal'),(1,1,'normal'),(2,4,'edges'),(2,4,'legacy'),(2,4,'interrupted'),(3,4,'end'),(2,4,'exit')]
+    results=[{'readings':s,'cards':c,'kind':kind,'status':'pending'} for s,c,kind in cases]
+    write_results(results)
+    for entry,(s,c,kind) in zip(results,cases):
+        started=time.monotonic();entry['status']='running';write_results(results)
         try:
-            case_env=prepare(s,c,kind)
-            with sync_playwright() as p:
-                browser=p.chromium.launch()
-                try:run_case(browser,s,c,kind,case_env)
-                finally:browser.close()
-        finally:
-            # Only after uvicorn stops and Playwright's event loop exits.
-            # Also covers failed setup, browser launch or server creation.
-            cleanup()
+            try:
+                case_env=prepare(s,c,kind)
+                with sync_playwright() as p:
+                    browser=p.chromium.launch()
+                    try:evidence=run_case(browser,s,c,kind,case_env)
+                    finally:browser.close()
+            finally:
+                # Only after uvicorn stops and Playwright's event loop exits.
+                # Includes failed setup, browser launch and server creation.
+                cleanup()
+        except BaseException as exc:
+            entry.update(status='failed',seconds=round(time.monotonic()-started,3),
+                         failure=repr(exc),traceback=traceback.format_exc())
+            write_results(results)
+            raise
+        entry.update(status='passed',seconds=round(time.monotonic()-started,3),evidence=evidence)
+        write_results(results)
 if __name__=='__main__':main()

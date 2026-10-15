@@ -139,10 +139,14 @@ export const SegEditDialog: Component<Props> = (props) => {
       setError('该片段没有 seg_id（旧数据），无法保存')
       return
     }
+    if (!props.chunk.edit_revision || !props.chunk.fingerprint) {
+      setError("缺少内容版本，请重新打开编辑器；草稿已保留")
+      return
+    }
     setSaving(true)
     setError('')
     try {
-      const res = await api.readingEdit(props.chunk.path, props.chunk.seg_id, text)
+      const res = await api.readingEdit(props.chunk.path, props.chunk.seg_id, text, props.chunk.edit_revision, props.chunk.fingerprint)
       props.onSaved(res.chunk)
     } catch (e) {
       setError('保存失败：' + (e as Error).message)

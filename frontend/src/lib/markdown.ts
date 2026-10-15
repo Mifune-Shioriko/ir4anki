@@ -4,12 +4,15 @@ import MarkdownIt from 'markdown-it'
 // (verified against the bash-heavy Helium note), so `$MOUNT` in shell
 // snippets survives.
 import katexPlugin from '@traptitech/markdown-it-katex'
+import katex from 'katex'
 
 const md = new MarkdownIt({
   html: false, // notes are trusted-ish, but rendering raw HTML buys nothing
   linkify: true,
   breaks: false,
-}).use(katexPlugin, { throwOnError: false })
+// Use the renderer matching the installed CSS and review auto-renderer.
+// The plugin's bundled KaTeX uses older base/strut/sizing class names.
+}).use(katexPlugin, { throwOnError: false, katex })
 
 // Tag EVERY block-level element with its SOURCE line range (markdown-it
 // tokens carry `map = [startLine, endLine]`, 0-based, endLine EXCLUSIVE).
@@ -86,8 +89,15 @@ md.renderer.rules.image = (tokens, idx, options, env, self) => {
   if (srcIdx >= 0) {
     const src = String(token.attrs![srcIdx][1] ?? '')
     if (!/^(?:[a-z][a-z0-9+.-]*:|\/)/i.test(src)) {
-      const base = src.split('/').pop() || src
-      token.attrs![srcIdx][1] = '/api/reading/media/' + encodeURIComponent(base)
+      // Split URL syntax before decoding so encoded ?/# remain filename bytes.
+      const [, path, query = '', fragment = ''] = src.match(/^([^?#]*)(\?[^#]*)?(#.*)?$/)!
+      const encodedBase = path.split('/').pop() || ''
+      let base: string
+      try { base = decodeURIComponent(encodedBase) }
+      catch { base = encodedBase } // malformed escapes are literal, never traversal
+      if (base && base !== '.' && base !== '..' && !/[\/\\]/.test(base)) {
+        token.attrs![srcIdx][1] = '/api/reading/media/' + encodeURIComponent(base) + query + fragment
+      }
     }
   }
   return baseImageRule

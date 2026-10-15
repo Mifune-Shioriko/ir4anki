@@ -32,6 +32,8 @@ def configure(env=None):
     for key in list(env):
         if key.startswith('ANKI_SYNC_'):
             env.pop(key)
+    # Explicit ASGI fixture Hosts, never an application wildcard/default bypass.
+    env['ANKI_TRUSTED_HOSTS'] = 'localhost,127.0.0.1,::1,test,testserver,t,fixture,temporary,synthetic.fixture'
     env.update(ANKI_BACKEND='pylib', ANKI_COLLECTION_PATH=str(path),
                ANKI_MEDIA_DIR=str(path.with_suffix('.media')), ANKI_BACKUP_DIR=str(root/'backups'),
                ANKI_SYNC_ENDPOINT='', ANKI_SYNC_USERNAME='', ANKI_SYNC_PASSWORD='', ANKI_SYNC_HKEY='')

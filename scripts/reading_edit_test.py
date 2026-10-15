@@ -97,6 +97,16 @@ PNG_B64 = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4"
 PNG_BYTES = base64.b64decode(PNG_B64)
 
 
+def edit_guard(path, sid):
+    # Each existing single-editor request explicitly obtains its open version.
+    # Concurrency/missing-contract cases live in audit_fixes_test.py.
+    entry = _find_edit_entry(path)
+    seg = next((s for s in entry.get('segments', []) if s.get('seg_id') == sid), {})
+    return {'expected_revision': entry.get('file_sha', ''), 'expected_fingerprint': seg.get('fingerprint', '')}
+
+def _find_edit_entry(path):
+    return next((e for e in backend._reading_read()['list'] if e['path'] == path), {})
+
 def _entry(path: str) -> dict:
     data = backend._reading_read()
     return backend._find_entry(data, path)
@@ -171,7 +181,7 @@ async def main():
         print("== 2. basic edit: replace s1 with +2 lines ==")
         new_text = ("## 一、浅层结构（改）\n\n皮肤薄，移动性大。\n\n浅筋膜内有颈阔肌，由面神经支配。\n\n"
                     "新增一行内容。\n\n再增一行内容。")
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, s1["seg_id"]), 
             "path": A_PATH, "seg_id": s1["seg_id"], "new_text": new_text})
         check("edit 200", r.status_code == 200, r.text[:200])
         d = r.json()
@@ -241,7 +251,7 @@ async def main():
         # 2 lines vs the section's 3 (heading+blank+body after the trailing-
         # blank trim) → genuinely negative delta
         short = "## 二、颈筋膜\n浅、中、深三层。"
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, s2["seg_id"]), 
             "path": A_PATH, "seg_id": s2["seg_id"], "new_text": short})
         d2 = r.json()
         exp_d2 = len(short.split("\n")) - (cs2["end_line"] - cs2["start_line"] + 1)
@@ -274,7 +284,7 @@ async def main():
         kids = [x for x in r.json().get("children", []) if not x.get("tail")]
         check("split produced a non-tail child", len(kids) >= 1, r.json().get("children"))
         kid = kids[0]
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, s3["seg_id"]), 
             "path": A_PATH, "seg_id": s3["seg_id"], "new_text": "x"})
         check("container edit → 409", r.status_code == 409, r.status_code)
 
@@ -285,7 +295,7 @@ async def main():
             (NOTES / A_PATH).read_text(encoding="utf-8").split("\n")
             [before_kid["start_line"] - 1 : before_kid["end_line"]]
         ) + "\n" + add_lines
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, kid["seg_id"]), 
             "path": A_PATH, "seg_id": kid["seg_id"], "new_text": kid_text})
         check("child edit 200", r.status_code == 200, r.text[:200])
         after_parent = next(s for s in _segs(A_PATH) if s["seg_id"] == s3["seg_id"])
@@ -308,16 +318,16 @@ async def main():
         check("status clean after split+edit", not a_sum["needs_resync"], a_sum)
 
         print("== 6. validation paths ==")
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, kid["seg_id"]), 
             "path": A_PATH, "seg_id": kid["seg_id"], "new_text": "   \n  "})
         check("empty text → 400", r.status_code == 400, r.status_code)
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard("2026/不存在.md", 1), 
             "path": "2026/不存在.md", "seg_id": 1, "new_text": "x"})
         check("unknown file → 404", r.status_code == 404, r.status_code)
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, 99999), 
             "path": A_PATH, "seg_id": 99999, "new_text": "x"})
         check("unknown seg → 404", r.status_code == 404, r.status_code)
-        r = await c.post("/api/reading/edit", json={
+        r = await c.post("/api/reading/edit", json={**edit_guard("../outside.md", 1), 
             "path": "../outside.md", "seg_id": 1, "new_text": "x"})
         check("traversal file → 404", r.status_code == 404, r.status_code)
 
@@ -367,7 +377,7 @@ def gate_off_check():
 
     async def run():
         async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
-            r = await c.post("/api/reading/edit", json={
+            r = await c.post("/api/reading/edit", json={**edit_guard(A_PATH, 1), 
                 "path": A_PATH, "seg_id": 1, "new_text": "x"})
             check("gate off: edit 404", r.status_code == 404, r.status_code)
             r = await c.get("/api/reading/media/x.png")

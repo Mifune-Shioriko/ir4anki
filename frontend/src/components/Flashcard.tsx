@@ -1,3 +1,5 @@
+import { StudyCardShell, StudyToolbar } from './StudyCardShell'
+import type { JSX } from 'solid-js'
 import { Component, createEffect, createSignal } from 'solid-js'
 import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
@@ -27,6 +29,7 @@ import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconUndo } from './icons
 // 溯源: jump to the card's source segment as a temporary reading detour
 // (disabled for orphan cards — 404 on /api/reading/source).
 interface Props {
+  dock?: JSX.Element
   nativeEngine?: boolean
   card: Card
   revealed: boolean
@@ -40,6 +43,22 @@ interface Props {
   undoBusy: boolean
   onAdd: () => void
   onDelete: () => void
+}
+
+// The sanitizer intentionally rejects arbitrary layout CSS. Restore generated
+// KaTeX to its plain source first, then auto-render trusted KaTeX after cleaning.
+// Keeping partially sanitized vlist markup loses superscript/fraction geometry.
+const cleanStudyHtml = (html: string) => {
+  const template = document.createElement('template')
+  template.innerHTML = html
+  template.content.querySelectorAll('.katex').forEach(math => {
+    const tex = math.querySelector('annotation[encoding="application/x-tex"]')?.textContent
+    if (tex == null) return
+    const display = math.closest('.katex-display')
+    const source = display ? `\\[${tex}\\]` : `\\(${tex}\\)`
+    ;(display ?? math).replaceWith(document.createTextNode(source))
+  })
+  return cleanCardHtml(template.innerHTML)
 }
 
 export const Flashcard: Component<Props> = (props) => {
@@ -67,9 +86,9 @@ export const Flashcard: Component<Props> = (props) => {
       // ordinal needs an explicit metadata response before revealing.
       const ord = props.card.ord ?? rawNote()?.ord
       const ordinal = typeof ord === 'number' && Number.isInteger(ord) && ord >= 0 ? ord + 1 : undefined
-      return cleanCardHtml(renderClozeField(values[0] ?? '',mode,note.tags,ordinal) + (mode === 'a' ? renderField(values[1] ?? '',note.tags) : ''))
+      return cleanStudyHtml(renderClozeField(values[0] ?? '',mode,note.tags,ordinal) + (mode === 'a' ? renderField(values[1] ?? '',note.tags) : ''))
     }
-    return cleanCardHtml(renderField(values[mode === 'q' ? 0 : 1] ?? '',note.tags))
+    return cleanStudyHtml(renderField(values[mode === 'q' ? 0 : 1] ?? '',note.tags))
   }
   let questionRef: HTMLDivElement | undefined
   let answerRef: HTMLDivElement | undefined
@@ -83,9 +102,9 @@ export const Flashcard: Component<Props> = (props) => {
     props.card.answer
     props.revealed
     requestAnimationFrame(() => {
-      if (questionRef) renderMathInElement(questionRef, KATEX_OPTS)
+      if (questionRef) renderMathInElement(questionRef, { ...KATEX_OPTS, ignoredClasses: ['katex'] })
       if (props.revealed && answerRef) {
-        renderMathInElement(answerRef, KATEX_OPTS)
+        renderMathInElement(answerRef, { ...KATEX_OPTS, ignoredClasses: ['katex'] })
         answerRef.querySelectorAll('audio').forEach(a => a.play().catch(() => {}))
       }
     })
@@ -95,29 +114,19 @@ export const Flashcard: Component<Props> = (props) => {
   const answerHtml = () => {
     const md = markdownHtml('a'); if(md !== null) return md
     const parts = props.card.answer.split(/<hr id="?answer"?>?/i)
-    return cleanCardHtml(parts.length > 1 ? parts.slice(1).join('') : parts[0])
+    return cleanStudyHtml(parts.length > 1 ? parts.slice(1).join('') : parts[0])
   }
-  const questionHtml = () => markdownHtml('q') ?? cleanCardHtml(props.card.question)
+  const questionHtml = () => markdownHtml('q') ?? cleanStudyHtml(props.card.question)
 
   return (
-    <div class="flashcard-wrapper stage-review">
-      <md-elevated-card class="card-container">
-        <div class="card-inner">
-          <div class="card-header">
-            <div class="card-chips" aria-label="卡片信息">
-              <span class="info-chip md-typescale-label-small">{props.card.deckName}</span>
-              {props.card.isNew && <span class="info-chip info-chip--new md-typescale-label-small">新卡</span>}
-            </div>
-            <div class="card-header-actions">
+    <StudyCardShell stage="review" source={props.card.deckName} badge={props.card.isNew} dock={props.dock} toolbar={
+      <StudyToolbar label="复习操作">
               <md-icon-button
-                aria-label="撤销上次作答"
+                aria-label="撤销上次作答" title="撤销上次作答"
                 disabled={!props.undoEnabled || props.undoBusy}
                 onClick={() => props.onUndo()}
               >
                 <md-icon><IconUndo /></md-icon>
-              </md-icon-button>
-              <md-icon-button aria-label="编辑卡片" onClick={() => props.onEdit()}>
-                <md-icon><IconEdit /></md-icon>
               </md-icon-button>
               <md-icon-button
                 aria-label="溯源：回到制卡时的原文片段"
@@ -127,19 +136,22 @@ export const Flashcard: Component<Props> = (props) => {
               >
                 <md-icon><IconFindInPage /></md-icon>
               </md-icon-button>
-              <div class="header-actions-sep" aria-hidden="true" />
-              <md-icon-button aria-label="添加卡片" onClick={() => props.onAdd()}>
+              <md-icon-button aria-label="添加卡片" title="添加卡片" onClick={() => props.onAdd()}>
                 <md-icon><IconAdd /></md-icon>
               </md-icon-button>
-              <md-icon-button aria-label="删除卡片" onClick={() => props.onDelete()}>
+              <md-icon-button aria-label="删除卡片" title="删除卡片" onClick={() => props.onDelete()}>
                 <md-icon><IconDelete /></md-icon>
               </md-icon-button>
-            </div>
-          </div>
+              <md-icon-button aria-label="编辑卡片" title="编辑卡片" onClick={() => props.onEdit()}>
+                <md-icon><IconEdit /></md-icon>
+              </md-icon-button>
+      </StudyToolbar>
+    }>
+
 
           {/* question — always visible */}
           <div
-            class="card-content card-question"
+            class="card-content study-content card-question"
             ref={questionRef}
             innerHTML={questionHtml()}
           />
@@ -148,15 +160,13 @@ export const Flashcard: Component<Props> = (props) => {
           {props.revealed && (
             <>
               <md-divider class="card-divider" />
-              <div class="card-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
+              <div class="card-content study-content card-answer" ref={answerRef} innerHTML={answerHtml()} />
             </>
           )}
 
           <div class="card-meta md-typescale-body-small">
-            {props.card.deckName} · {props.card.modelName}
+            {props.card.modelName}
           </div>
-        </div>
-      </md-elevated-card>
-    </div>
+    </StudyCardShell>
   )
 }

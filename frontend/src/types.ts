@@ -67,7 +67,12 @@ export interface FlowState {
   policy: 'even-floor-v1'
   phase: 'reading' | 'review' | 'complete'
   reading_consumed: number
+  /** Original positions removed from the pending queue; includes withdrawals. */
   card_handled: number
+  /** Actual round answers, including Again; never withdrawals. */
+  card_answered: number
+  /** Actual answers plus eligible remaining queue. */
+  effective_card_count: number
   reading_slots: number
   card_count: number
   blocks: number[]
@@ -100,6 +105,7 @@ export interface MoreResponse {
 }
 
 export interface AnswerResponse {
+  state?: SessionStateResponse
   answered: boolean
   round: RoundInfo | null
   /** present when answered=false: 'stale' = card no longer in this round */
@@ -148,6 +154,7 @@ export interface ReadingSource {
   line_end: number
   /** stale-coordinate guard (2026-09-30) — echoed to /api/reading/split */
   fingerprint?: string
+  edit_revision?: string
   text: string
   /** every note id created from this exact segment (左栏「相关卡片」) */
   cards_created: number[]
@@ -219,6 +226,7 @@ export interface ReadingChunk {
   /** stale-coordinate guard (2026-09-30): echoed back to /api/reading/split;
    *  mismatch → 409 stale (the segment moved since the card was dealt) */
   fingerprint?: string
+  edit_revision?: string
   status: ReadingChunkStatus
   cards_created: number[]
   /** note ids created from ANCESTOR segments before a split (a container

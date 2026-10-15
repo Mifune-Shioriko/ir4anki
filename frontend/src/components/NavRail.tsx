@@ -1,5 +1,5 @@
 import { Component, Show } from 'solid-js'
-import { IconSchool, IconFolder, IconMenuBook } from './icons'
+import { IconSchool, IconFolder, IconMenuBook, IconSync } from './icons'
 import type { IconProps } from './icons'
 import { ProgressRing } from './ProgressRing'
 
@@ -18,6 +18,7 @@ import { ProgressRing } from './ProgressRing'
 export type Section = 'study' | 'files' | 'readingList'
 
 interface Props {
+  onManualSync?: () => void
   section: Section
   onNavigate: (s: Section) => void
   /** badge count on the 阅读清单 destination (files in the list) */
@@ -29,7 +30,7 @@ interface Props {
 const ITEMS: { key: Section; label: string; icon: Component<IconProps> }[] = [
   { key: 'study', label: '学习', icon: IconSchool },
   { key: 'files', label: '文件', icon: IconFolder },
-  { key: 'readingList', label: '阅读清单', icon: IconMenuBook },
+  { key: 'readingList', label: '阅读', icon: IconMenuBook },
 ]
 
 export const NavRail: Component<Props> = (props) => {
@@ -59,6 +60,13 @@ export const NavRail: Component<Props> = (props) => {
         )
       })}
 
+      <Show when={props.onManualSync}>
+        <button type="button" class="nav-rail__item" onClick={props.onManualSync}
+          aria-haspopup="dialog" title="手动同步">
+          <span class="nav-rail__indicator" aria-hidden="true"><IconSync size={24} /></span>
+          <span class="nav-rail__label md-typescale-label-small">手动同步</span>
+        </button>
+      </Show>
       <Show when={props.ring}>
         <div class="nav-rail__footer">
           <ProgressRing label="阅读" kind="reading" done={props.ring!.reading.done} total={props.ring!.reading.total} />

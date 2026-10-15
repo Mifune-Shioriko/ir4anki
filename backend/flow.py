@@ -21,17 +21,32 @@ def replace_slot(flow, parent, children):
             # transaction, that original pending item still owns the slot.
             break
 
-def reconcile(flow, readings, cards):
+def answer_count(round_state):
+    """Only explicit answer statistics establish recalls; handled can include drift.
+
+    Old rounds without this counter still recover their queues and undo token,
+    but their ambiguous historical handled count must not invent answers.
+    """
+    return max(0, (round_state or {}).get('answered_count', 0))
+
+
+def reconcile(flow, readings, cards, *, answered_count=0):
     pending={tuple(identity(r)) for r in readings}
     consumed=sum(not any(tuple(k) in pending for k in slot) for slot in flow['slots'])
     # Removed/drifted cards consume their original position, but are not answers.
     handled=len(set(flow['card_ids'])-set(cards))
-    s,c=flow['reading_slots'],flow['card_count']
+    # A successful round answer consumes one position, even Again (the native
+    # learning schedule does not change that business-queue fact). Withdrawals
+    # consume none. Include restored/prior-round pending debt in the denominator.
+    answered=max(0, answered_count)
+    s,c=flow['reading_slots'],answered+len(set(cards))
     target=consumed*c//s if s else c
     # Undo can reinsert a prior-round card; drain that debt as well.
     debt=any(cid not in flow['card_ids'] for cid in cards)
-    flow.update(reading_consumed=consumed,card_handled=handled,block_target=target)
-    flow['phase']=('review' if cards and (handled<target or not readings or debt)
+    flow.update(reading_consumed=consumed,card_handled=handled,block_target=target,
+                card_answered=answered,effective_card_count=c,
+                blocks=[i*c//s-(i-1)*c//s for i in range(1,s+1)] if s else [])
+    flow['phase']=('review' if cards and (answered<target or not readings or debt)
                    else 'reading' if readings else 'review' if cards else 'complete')
     flow['status']='complete' if flow['phase']=='complete' else 'active'
     return flow

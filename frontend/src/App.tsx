@@ -1,10 +1,13 @@
+import { createStateGeneration } from './lib/state-generation'
 import { Component, Show, createEffect, createSignal, onMount, onCleanup } from 'solid-js'
 import { api } from './api'
-import type { Card } from './types'
+import type { Card, SessionStateResponse } from './types'
 import { syncThemeColor } from './theme'
 import { stripTemplateBlocks } from './lib/clean'
+import { remapPath } from './lib/files-state'
 import { wrapSelectionAsCloze } from './lib/cloze'
 
+import { ManualSyncDialog } from './components/ManualSyncDialog'
 import { NavRail } from './components/NavRail'
 import type { Section } from './components/NavRail'
 import { FilesScreen } from './components/FilesScreen'
@@ -72,8 +75,8 @@ export const App: Component = () => {
       return
     }
     try {
-      const st = await api.readingStatus()
-      setListedPaths(new Set(st.list.map(s => s.path)))
+      const st = await api.filesMembership()
+      setListedPaths(new Set(st.paths))
     } catch { /* badges are decorative */ }
   }
   const navigate = (s: Section) => {
@@ -119,6 +122,7 @@ export const App: Component = () => {
     const c = cards()[idx()]
     return !!c && revealedFor() === c.cardId
   }
+  const [syncOpen, setSyncOpen] = createSignal(false)
   const [answering, setAnswering] = createSignal(false)
   // roundTotal is the round's ORIGINAL size (done + pending) — from the
   // server, never cards().length after a mid-round resume.
@@ -229,6 +233,30 @@ export const App: Component = () => {
   // otherwise serve stale text). Paired with invalidateFileCache().
   const [noteReloadToken, setNoteReloadToken] = createSignal(0)
 
+  const [sourceGeneration, setSourceGeneration] = createSignal(0)
+  const relocateSources = (event: Event) => {
+    const { oldPath, newPath } = (event as CustomEvent<{ oldPath: string; newPath: string }>).detail
+    const remap = <T extends { path: string },>(value: T | null) => value ? { ...value, path: remapPath(value.path, oldPath, newPath) } : null
+    setRdChunks(prev => prev.map(value => remap(value)!))
+    setTraceChunk(remap)
+    setTraceSource(remap)
+    setAddSource(remap)
+    setSegEditChunk(remap)
+    setListedPaths(prev => new Set([...prev].map(path => remapPath(path, oldPath, newPath))))
+    for (const [id, value] of srcCache) srcCache.set(id, remap(value))
+    setSourceGeneration(n => n + 1)
+  }
+  const deleteSources = (event: Event) => {
+    const path = (event as CustomEvent<{ path: string }>).detail.path
+    const matches = (p: string) => p === path || p.startsWith(path + '/')
+    for (const [id, value] of srcCache) if (value && matches(value.path)) srcCache.delete(id)
+    if (traceSource() && matches(traceSource()!.path)) { setTraceSource(null); setTraceChunk(null); setTraceOpen(false) }
+    setListedPaths(prev => new Set([...prev].filter(p => !matches(p))))
+    setSourceGeneration(n => n + 1)
+  }
+  onMount(() => { window.addEventListener('files-relocated', relocateSources); window.addEventListener('files-deleted', deleteSources) })
+  onCleanup(() => { window.removeEventListener('files-relocated', relocateSources); window.removeEventListener('files-deleted', deleteSources) })
+
   const sourceToChunk = (s: ReadingSource): ReadingChunk => {
     const own = (s.cards_created || []).filter(id => id > 0)
     const anc: number[] = []
@@ -250,6 +278,7 @@ export const App: Component = () => {
       line_end: s.line_end,
       text: s.text,
       fingerprint: s.fingerprint ?? '',
+      edit_revision: s.edit_revision,
       status: (s.status as ReadingChunkStatus) || 'todo',
       cards_created: own,
       ancestor_cards: anc,
@@ -328,6 +357,7 @@ export const App: Component = () => {
     const selections = [{ start_line: base + sel.start_line, end_line: base + sel.end_line }]
     const wasTrace = traceOpen()
     setRdBusy(true)
+    const ticket = stateGeneration.mutate()
     try {
       const res = await api.readingSplit(
         chunk.path, chunk.seg_id, selections,
@@ -336,24 +366,22 @@ export const App: Component = () => {
         // the selection's line numbers would slice the wrong text.
         { fingerprint: chunk.fingerprint, line_start: chunk.line_start },
       )
+      if (!stateGeneration.mutationCurrent(ticket)) return
       let kids = res.child_chunks || []
       if (kids.length === 0) kids = await buildFallbackChildren(chunk, res.children || [])
+      if (!stateGeneration.mutationCurrent(ticket)) return
       if (kids.length === 0) {
         showSnack('分割失败：没有产生新片段')
         return
       }
+      stateGeneration.applyMutation(ticket, () => {})
       if (wasTrace) {
         setTraceChunk(kids[0])
         // the traced segment may have sat in the active reading round's
         // pending list — the backend swapped it for the children there, so
         // rebuild the local mirror (cheap; silent on failure)
         try {
-          const st = await api.readingState()
-          if (st.round?.status === 'active') {
-            setRdChunks(st.round.chunks ?? [])
-            setRdDone(st.round.done)
-            setRdTotal(st.round.total)
-          }
+          if (stateGeneration.mutationCurrent(ticket)) await resync()
         } catch { /* next resync fixes it */ }
       } else {
         setRdChunks(prev => {
@@ -381,6 +409,7 @@ export const App: Component = () => {
         )
       }
     } catch (e) {
+      if (!stateGeneration.mutationCurrent(ticket)) return
       const msg = (e as Error).message || ''
       if (msg.startsWith('stale:')) {
         // the segment moved/changed since this card was dealt (in-app edit
@@ -392,12 +421,7 @@ export const App: Component = () => {
         setNoteReloadToken(t => t + 1)
         srcCache.clear()
         try {
-          const st = await api.readingState()
-          if (st.round?.status === 'active') {
-            setRdChunks(st.round.chunks ?? [])
-            setRdDone(st.round.done)
-            setRdTotal(st.round.total)
-          }
+          if (stateGeneration.mutationCurrent(ticket)) await resync()
         } catch { /* next resync fixes it */ }
         if (wasTrace) {
           closeTrace()
@@ -423,6 +447,7 @@ export const App: Component = () => {
   const openSegEdit = (chunk: ReadingChunk) => setSegEditChunk(chunk)
 
   const onSegEdited = (fresh: ReadingChunk | null) => {
+    stateGeneration.mutate()
     const old = segEditChunk()
     setSegEditChunk(null)
     if (!old) return
@@ -445,13 +470,7 @@ export const App: Component = () => {
     // backstop). Trace variant: its chunk came from /api/reading/source —
     // drop the source cache so a re-opened detour re-fetches fresh coords.
     srcCache.clear()
-    api.readingState().then(st => {
-      if (st.round?.status === 'active') {
-        setRdChunks(st.round.chunks ?? [])
-        setRdDone(st.round.done)
-        setRdTotal(st.round.total)
-      }
-    }).catch(() => { /* next resync / stale-guard fixes it */ })
+    void resync()
     // the .md changed on disk → the right column must re-fetch the file
     invalidateFileCache(old.path)
     setNoteReloadToken(t => t + 1)
@@ -498,70 +517,78 @@ export const App: Component = () => {
 
   // ---- resync from the backend (self-heal after any state drift) ----
   const [railRing, setRailRing] = createSignal<{ reading: {done:number;total:number}; review: {done:number;total:number} } | null>(null)
-  const resync = async () => {
-    try {
-      const d = await api.flowState()
-      setRailRing(d.flow ? {
-        reading: {done: d.flow.reading_consumed, total: d.flow.reading_slots},
-        review: {done: d.flow.card_handled, total: d.flow.card_count},
-      } : null)
-      adoptGlobal(d)
-      setCanUndo(d.can_undo)
-      // pacing-mode table from the wire (2026-09-14); validate the stored
-      // selection against it so a renamed/removed tier can't strand the UI
-      if (d.study_modes) {
-        setStudyModes(d.study_modes)
-      }
-      // preview-pool signals (absent when the backend flag is off). The
-      // manual preview STAGE is gone (2026-09-27): only the pool counters
-      // survive, to explain why today's cards aren't in the new pool yet.
-      setPreviewMode(!!d.preview_mode)
-      if (d.preview_mode) {
-        setPreviewPool(d.preview_pool ?? null)
-        setPendingRelease(d.pending_release ?? null)
-        setReleaseDailyGoal(d.release_daily_goal ?? null)
-        setReleaseBudgetLeft(d.release_budget_left ?? null)
-      }
-      // reading-mode signals (absent when the backend flag is off)
-      setReadingMode(!!d.reading_mode)
-      if (d.reading_mode) {
-        setReadingListSize(d.reading_list_size ?? 0)
-        setReadingAvailable(d.reading_available ?? 0)
-        setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
-        setReadingActive(d.reading_active ?? 0)
-        setReadingGated(d.reading_gated ?? 0)
-      }
-      // 单一流水线 (2026-09-24; preview stage retired 2026-09-27): a page
-      // load resumes an ACTIVE round where it left off; an active reading
-      // round resumes too; anything else lands on the single start screen.
-      if (d.state === 'active') {
-        loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
-      } else if (d.reading_mode && d.reading_round?.status === 'active') {
-        setRdChunks(d.reading_round.chunks ?? [])
-        setRdDone(d.reading_round.done ?? 0)
-        setRdTotal(d.reading_round.total ?? 0)
-        setPhase('reading')
-      } else {
+  const stateGeneration = createStateGeneration()
+  const adoptState = (d: SessionStateResponse) => {
+    setLoadError(false)
+    setRailRing(d.flow ? {
+      reading: {done: d.flow.reading_consumed, total: d.flow.reading_slots},
+      review: {done: d.flow.card_answered, total: d.flow.effective_card_count},
+    } : null)
+    adoptGlobal(d)
+    setCanUndo(d.can_undo)
+    // pacing-mode table from the wire (2026-09-14); validate the stored
+    // selection against it so a renamed/removed tier can't strand the UI
+    if (d.study_modes) {
+      setStudyModes(d.study_modes)
+    }
+    // preview-pool signals (absent when the backend flag is off). The
+    // manual preview STAGE is gone (2026-09-27): only the pool counters
+    // survive, to explain why today's cards aren't in the new pool yet.
+    setPreviewMode(!!d.preview_mode)
+    if (d.preview_mode && 'preview_pool' in d) {
+      setPreviewPool(d.preview_pool ?? null)
+      setPendingRelease(d.pending_release ?? null)
+      setReleaseDailyGoal(d.release_daily_goal ?? null)
+      setReleaseBudgetLeft(d.release_budget_left ?? null)
+    }
+    // reading-mode signals (absent when the backend flag is off)
+    setReadingMode(!!d.reading_mode)
+    if (d.reading_mode && 'reading_list_size' in d) {
+      setReadingListSize(d.reading_list_size ?? 0)
+      setReadingAvailable(d.reading_available ?? 0)
+      setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
+      setReadingActive(d.reading_active ?? 0)
+      setReadingGated(d.reading_gated ?? 0)
+    }
+    // 单一流水线 (2026-09-24; preview stage retired 2026-09-27): a page
+    // load resumes an ACTIVE round where it left off; an active reading
+    // round resumes too; anything else lands on the single start screen.
+    if (d.state === 'active') {
+      loadBatch(d.cards, d.done, d.total, d.new_in_batch ?? undefined)
+    } else if (d.reading_mode && d.reading_round?.status === 'active') {
+      setRdChunks(d.reading_round.chunks ?? [])
+      setRdDone(d.reading_round.done ?? 0)
+      setRdTotal(d.reading_round.total ?? 0)
+      setPhase('reading')
+    } else {
+      setPhase('start')
+    }
+    if (d.flow) {
+      const rr = d.reading_round
+      setRdChunks(rr?.chunks ?? [])
+      setRdDone(rr?.done ?? 0)
+      setRdTotal(rr?.total ?? d.flow.reading_slots)
+      setRevealedFor(null)
+      if (d.flow.phase === 'complete') {
+        setRoundSummary(d.flow.stats)
         setPhase('start')
+      } else {
+        setRoundSummary(null)
+        setPhase(d.flow.phase)
       }
-      if (d.flow) {
-        const rr = d.reading_round
-        setRdChunks(rr?.chunks ?? [])
-        setRdDone(rr?.done ?? 0)
-        setRdTotal(rr?.total ?? d.flow.reading_slots)
-        setRevealedFor(null)
-        if (d.flow.phase === 'complete') {
-          setRoundSummary(d.flow.stats)
-          setPhase('start')
-        } else {
-          setRoundSummary(null)
-          setPhase(d.flow.phase)
-        }
-      }
+    }
+  }
+  const resync = async () => {
+    const ticket = stateGeneration.begin()
+    try {
+      const data = await api.flowState()
+      stateGeneration.apply(ticket, () => adoptState(data))
     } catch {
-      setPhase('loading')
-      setLoadText('加载失败，请重试')
-      setLoadError(true)
+      stateGeneration.apply(ticket, () => {
+        setPhase('loading')
+        setLoadText('加载失败，请重试')
+        setLoadError(true)
+      })
     }
   }
 
@@ -572,13 +599,16 @@ export const App: Component = () => {
   const beginFlow = async () => {
     setPhase('loading')
     setLoadError(false)
+    const ticket = stateGeneration.mutate()
     setLoadText('正在加载今日阅读和卡片…')
     try {
       await api.flowStart(selectedMode())
-      await resync()
+      if (stateGeneration.mutationCurrent(ticket)) await resync()
     } catch (e) {
-      setLoadText('加载失败：' + (e as Error).message)
-      setLoadError(true)
+      stateGeneration.applyMutation(ticket, () => {
+        setLoadText('加载失败：' + (e as Error).message)
+        setLoadError(true)
+      })
     }
   }
 
@@ -588,8 +618,10 @@ export const App: Component = () => {
     const card = cards()[idx()]
     if (!card || answering()) return
     setAnswering(true)
+    const ticket = stateGeneration.mutate()
     try {
       const data = await api.answer(card.cardId, ease)
+      if (!stateGeneration.mutationCurrent(ticket)) return
       if (!data.answered) {
         // backend rejected it (card no longer in this round — e.g. answered
         // on another device). Resync to the server's view instead of
@@ -598,9 +630,12 @@ export const App: Component = () => {
         return
       }
 
-      await resync()
+      if (data.state) stateGeneration.applyMutation(ticket, () => adoptState(data.state!))
+      else await resync()
     } catch (e) {
-      alert('评分失败：' + (e as Error).message)
+      if (!stateGeneration.mutationCurrent(ticket)) return
+      showSnack('评分响应未确认，正在恢复本地状态：' + (e as Error).message)
+      await resync() // response may be lost after durable commit; recover cursor
     } finally {
       setAnswering(false)
     }
@@ -608,10 +643,11 @@ export const App: Component = () => {
 
   const undo = async () => {
     if (undoBusy() || answering() || rdBusy()) return
+    const ticket = stateGeneration.mutate()
     setUndoBusy(true)
     try {
       await api.undo()
-      await resync()
+      if (stateGeneration.mutationCurrent(ticket)) await resync()
     } catch (e) {
       alert('撤销失败：' + (e as Error).message)
     } finally {
@@ -718,8 +754,11 @@ export const App: Component = () => {
     const t = deleteTarget()
     if (!t || deleteBusy()) return
     setDeleteBusy(true)
+    const ticket = stateGeneration.mutate()
     try {
       await api.deleteCard(t.cardId)
+      if (!stateGeneration.mutationCurrent(ticket)) return
+      stateGeneration.applyMutation(ticket, () => {})
       setDeleteTarget(null)
       if (phase() === 'review') {
         const removed = cards().find(c => c.cardId === t.cardId)
@@ -759,14 +798,17 @@ export const App: Component = () => {
     const chunk = rdCurrent()
     if (!chunk || rdBusy()) return
     setRdBusy(true)
+    const ticket = stateGeneration.mutate()
     try {
       const d = await api.readingAct(chunk.path, chunk.chunk_key, action)
+      if (!stateGeneration.mutationCurrent(ticket)) return
       if (!d.ok) {
         // stale / drifted — resync to the server's view
         await resync()
         return
       }
       if (action === 'mark_active') {
+        stateGeneration.applyMutation(ticket, () => {})
         // stays on this chunk (正在制卡): update its status in place
         setRdChunks(prev =>
           prev.map(c =>
@@ -779,6 +821,7 @@ export const App: Component = () => {
       }
       await resync()
     } catch (e) {
+      if (!stateGeneration.mutationCurrent(ticket)) return
       await resync()
       alert('操作失败：' + (e as Error).message)
     } finally {
@@ -790,12 +833,14 @@ export const App: Component = () => {
   // keep their state) and reconcile via resync.
   const rdFinish = async () => {
     setRdBusy(true)
-    try { await api.flowEndReading(); await resync() }
+    const ticket = stateGeneration.mutate()
+    try { await api.flowEndReading(); if (stateGeneration.mutationCurrent(ticket)) await resync() }
     catch (e) { alert('结束阅读失败：' + (e as Error).message) }
     finally { setRdBusy(false) }
   }
   const exitFlow = async () => {
-    try { await api.flowExit(); setRoundSummary(null); await resync() }
+    const ticket = stateGeneration.mutate()
+    try { await api.flowExit(); if (stateGeneration.mutationCurrent(ticket)) { setRoundSummary(null); await resync() } }
     catch (e) { alert('退出失败：' + (e as Error).message) }
   }
 
@@ -810,7 +855,9 @@ export const App: Component = () => {
     return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable === true
   }
   const handleKeyDown = (e: KeyboardEvent) => {
-    if (isTypingTarget(e.target)) return
+    if (section() !== 'study') return
+    if (e.composedPath().some(t => isTypingTarget(t) || (t instanceof HTMLElement &&
+      (t.matches('md-dialog, [role="dialog"], md-outlined-text-field, md-menu') || !!t.closest('[role="dialog"]'))))) return
     if (editOpen() || addOpen() || deleteTarget() || segEditOpen()) return
     // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
     // shortcuts (Space/1-4/approve) must not fire behind the trace card.
@@ -834,6 +881,7 @@ export const App: Component = () => {
       undo()
       return
     }
+    if (syncOpen()) return
     if (phase() === 'reading') {
       // any dialog open (add / cloze): Space is typing there, never complete
       if (clozeOpen()) return
@@ -861,7 +909,7 @@ export const App: Component = () => {
       }
       return
     }
-    if (phase() !== 'review') return
+    if (syncOpen() || phase() !== 'review') return
     if (e.key === ' ' && !revealed()) {
       e.preventDefault()
       setRevealedFor(currentCard()?.cardId ?? null)
@@ -907,6 +955,7 @@ export const App: Component = () => {
     return undefined
   }
   createEffect(() => {
+    const generation = sourceGeneration()
     const c = screenCard()
     const noteId = c?.noteId
     if (!noteId || !readingMode()) {
@@ -919,6 +968,7 @@ export const App: Component = () => {
     }
     setTraceSource(null)
     api.readingSource(noteId).then(s => {
+      if (generation !== sourceGeneration()) return
       srcCache.set(noteId, s)
       // stale-response guard: the card may have swapped while in flight
       if (screenCard()?.noteId === noteId) setTraceSource(s)
@@ -955,7 +1005,7 @@ export const App: Component = () => {
 
   return (
     <div class="app-shell">
-      <NavRail
+      <NavRail onManualSync={() => { if (!answering() && !rdBusy() && !undoBusy()) setSyncOpen(true) }}
         section={section()}
         onNavigate={navigate}
         readingListSize={readingMode() ? readingListSize() : 0}
@@ -1014,6 +1064,11 @@ export const App: Component = () => {
             onSplit={(sel) => doSplit(rdCurrent()!, sel)}
             onEdit={() => openSegEdit(rdCurrent()!)}
             onExit={rdFinish}
+            onUndo={undo}
+            undoEnabled={canUndo()}
+            undoBusy={undoBusy()}
+            onExitRound={exitFlow}
+            exitDisabled={answering() || rdBusy() || undoBusy()}
           />
         </Show>
 
@@ -1066,16 +1121,19 @@ export const App: Component = () => {
             undoBusy={undoBusy()}
             onAdd={openAdd}
             onDelete={() => askDelete(currentCard()!)}
+            dock={
+              <ActionArea
+                nextIntervals={nativeEngine() ? currentCard()?.next_intervals : null}
+                revealed={revealed()}
+                answering={answering()}
+                onReveal={() => setRevealedFor(currentCard()?.cardId ?? null)}
+                onAnswer={answer}
+              />
+            }
           />
-          <ActionArea
-            nextIntervals={nativeEngine() ? currentCard()?.next_intervals : null}
-            revealed={revealed()}
-            answering={answering()}
-            onReveal={() => setRevealedFor(currentCard()?.cardId ?? null)}
-            onAnswer={answer}
-          />
+
         </Show>
-        <Show when={!traceOpen() && (phase() === 'reading' || phase() === 'review' || (phase() === 'start' && canUndo()))}>
+        <Show when={!traceOpen() && (phase() === 'review' || (phase() === 'start' && canUndo()))}>
           <div class="flow-actions">
             <Show when={phase() !== 'review' && canUndo()}>
               <md-text-button disabled={undoBusy() || rdBusy()} onClick={undo}>撤销上次评分</md-text-button>
@@ -1155,6 +1213,9 @@ export const App: Component = () => {
         />
       </Show>
 
+      <Show when={syncOpen()}>
+        <ManualSyncDialog onClose={() => { setSyncOpen(false); void resync() }} />
+      </Show>
       <ConfirmDialog
         open={deleteTarget() !== null}
         headline="删除这张卡片？"

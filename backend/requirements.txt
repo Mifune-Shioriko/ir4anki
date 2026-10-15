@@ -6,3 +6,5 @@ pydantic>=2.5
 python-multipart>=0.0.9
 # Official headless Anki engine; match desktop emergency client version.
 anki==25.2.7
+# Block source maps protect uploaded Markdown code in quote/list containers.
+markdown-it-py==4.0.0

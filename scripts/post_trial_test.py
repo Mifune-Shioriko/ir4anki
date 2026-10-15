@@ -32,8 +32,11 @@ async def run():
     answer_calls=list(calls);calls.clear()
     start=time.perf_counter(); wire=await b.flow_state(); refreshed=time.perf_counter()-start
     print(json.dumps(dict(probe='answer then authoritative refresh',answer_seconds=round(answered,4),refresh_seconds=round(refreshed,4),answer_render_batches=answer_calls,refresh_render_batches=calls,deliberate_seconds_per_card=.025)),flush=True)
-    assert [len(ids) for ids in answer_calls]==[12,1]
-    assert [len(ids) for ids in calls]==[11]
+    assert [len(ids) for ids in answer_calls]==[1]
+    assert result['state']['flow']['card_handled']==1
+    assert calls==[[701]], 'ordinary flow refresh renders exactly its visible card'
+    assert [card['cardId'] for card in wire['cards']]==[701]
+    assert b._round_read()['pending']==list(range(701,712)), 'all remaining work stays in the persisted queue'
     assert wire['flow']['card_handled']==1 and wire['flow']['card_count']==12
     assert wire['can_undo']
     await b.undo()
