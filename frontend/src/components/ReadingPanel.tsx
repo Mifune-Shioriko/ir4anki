@@ -16,6 +16,7 @@ interface Props {
    *  rewrote the .md; the module cache + a stable path would serve stale
    *  text otherwise). Paired with invalidateFileCache() in App. */
   reloadToken?: unknown
+  active?: boolean
 }
 
 export const ReadingPanel: Component<Props> = (props) => {
@@ -33,6 +34,7 @@ export const ReadingPanel: Component<Props> = (props) => {
         anchorLine={props.chunk.line_start}
         anchorEndLine={props.chunk.line_end}
         anchorToken={props.chunk.chunk_key}
+        active={props.active}
         reloadToken={props.reloadToken}
         fetchFile={api.readingFile}
         class="note-body md-typescale-body-medium"

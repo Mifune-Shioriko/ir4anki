@@ -25,6 +25,7 @@ interface Props {
   noteId: number | null | undefined
   /** changes force a full reset even when noteId is unchanged (card swap) */
   cardKey: number | null
+  active?: boolean
   /** card is on screen but face-down: hold everything back until reveal
    *  (answer-leak guard, user spec 2026-09-17) — the source segment
    *  usually contains the answer, so no fetch/scroll/jump may happen before
@@ -143,6 +144,7 @@ export const NotePanel: Component<Props> = (props) => {
           anchorLine={source()!.line_start}
           anchorEndLine={source()!.line_end}
           anchorToken={source()!.seg_id}
+          active={props.active}
           fetchFile={api.readingFile}
           class="note-body md-typescale-body-medium"
           onError={() => setStatus('error')}

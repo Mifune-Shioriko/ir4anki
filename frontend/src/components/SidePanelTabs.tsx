@@ -48,10 +48,11 @@ export const SidePanelTabs: Component<Props> = (props) => {
               noteId={props.noteId}
               cardKey={props.cardKey}
               blocked={props.blocked}
+              active={tab() === 0}
             />
           }
         >
-          <ReadingPanel chunk={props.chunk!} reloadToken={props.noteReloadToken} />
+          <ReadingPanel chunk={props.chunk!} reloadToken={props.noteReloadToken} active={tab() === 0} />
         </Show>
       </div>
       <div

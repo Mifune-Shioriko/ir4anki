@@ -1,5 +1,6 @@
 import { Component, createEffect, createSignal, onCleanup } from 'solid-js'
 import { acquireDocument, invalidateDocuments, observeDocuments } from '../lib/file-cache'
+import { sourceScroll, type SourceScrollSession } from '../lib/source-scroll'
 
 // Shared whole-file markdown viewer with source-line anchoring.
 // Extracted from NotePanel (2026-09-19, 渐进制卡) so the card→note panel and
@@ -15,9 +16,8 @@ import { acquireDocument, invalidateDocuments, observeDocuments } from '../lib/f
 // [data-src-line] get .note-hl (2.8s primary fade) — same idiom as the
 // original NotePanel.
 //
-// The component is a CONTENT div (not a scroll container): whichever
-// ancestor scrolls (.note-body inside the flat side panels) receives the
-// scrollIntoView. File texts are cached module-wide (same cache NotePanel
+// The component root is the panel scroll container (.note-body). A content
+// wrapper lets its source alignment session observe asynchronous layout changes. File texts are cached module-wide (same cache NotePanel
 // used) so tab/panel switches never re-fetch.
 
 export const invalidateFileCache = invalidateDocuments
@@ -32,8 +32,10 @@ interface Props {
    *  just the anchor heading's section. Exact-provenance panel (round 4)
    *  passes the segment's full range; heading-only callers omit it. */
   anchorEndLine?: number | null
-  /** bump to re-fire the anchor effect for the same path+line (tab switch) */
+  /** bump for a new source target at the same path+line */
   anchorToken?: unknown
+  /** Whether the containing note pane is selected; does not renew scroll ownership. */
+  active?: boolean
   /** bump to RE-FETCH the file text for the same path (in-app segment
    *  edit rewrote the .md — the module cache alone would serve stale
    *  text; caller pairs this with invalidateFileCache). */
@@ -82,19 +84,18 @@ export const FileViewer: Component<Props> = (props) => {
   let release: (() => void) | undefined
   let alive = true
   let rootRef: HTMLDivElement | undefined
+  let contentRef: HTMLDivElement | undefined
+  let scrollSession: SourceScrollSession | undefined
   // monotonic request token: a stale fetch (path swapped mid-flight) can
   // never overwrite the newer file's state
   let reqToken = 0
-  let flashTimer: ReturnType<typeof setTimeout> | null = null
 
   const load = () => {
     release?.()
     const path = props.path
     const token = ++reqToken
-    if (flashTimer) {
-      clearTimeout(flashTimer)
-      flashTimer = null
-    }
+    scrollSession?.dispose()
+    scrollSession = undefined
     if (!path) {
       setError('')
       setHtml('')
@@ -135,56 +136,42 @@ export const FileViewer: Component<Props> = (props) => {
     load()
   })
 
-  // scroll + flash the anchored section after (re)render. Tracks html() and
-  // anchorToken: the same file+line must re-flash on a tab/panel swap.
+  // Target ownership is independent of tab visibility: only a new target or
+  // rendered document starts a session. Cleanup invalidates queued layout work.
   createEffect(() => {
     const h = html()
     const line = props.anchorLine
     const endLine = props.anchorEndLine ?? null
-    const tok = props.anchorToken
-    void tok
+    props.anchorToken
     if (!h || line == null) return
     const generation = reqToken
-    requestAnimationFrame(() => {
+    let session: SourceScrollSession | undefined
+    const frame = requestAnimationFrame(() => {
       const root = rootRef
-      if (!alive || generation !== reqToken || !root) return
-      root.querySelectorAll('.note-hl').forEach(el => el.classList.remove('note-hl'))
+      if (!alive || generation !== reqToken || !root || !contentRef) return
       const anchor = findAnchor(root, line)
       if (!anchor) return
-      anchor.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' })
-      const els: HTMLElement[] = []
-      if (endLine == null) {
-        // section mode: the anchor heading + following siblings up to the
-        // next [data-src-line] (original NotePanel idiom)
-        els.push(anchor)
-        let n = anchor.nextElementSibling as HTMLElement | null
-        while (n && !n.hasAttribute('data-src-line')) {
-          els.push(n)
-          n = n.nextElementSibling as HTMLElement | null
+      const els: HTMLElement[] = [anchor]
+      let n = anchor.nextElementSibling as HTMLElement | null
+      while (n) {
+        if (n.hasAttribute('data-src-line')) {
+          if (endLine == null || parseInt(n.dataset.srcLine || '0', 10) > endLine) break
         }
-      } else {
-        // range mode (exact provenance, round 4): anchor heading + siblings
-        // until a heading PAST endLine — only headings carry [data-src-line],
-        // so body blocks belong to their preceding heading. A segment that
-        // starts mid-section (split child) flashes from the closest heading
-        // at-or-before line_start, same fallback as the scroll anchor.
-        els.push(anchor)
-        let n = anchor.nextElementSibling as HTMLElement | null
-        while (n) {
-          if (n.hasAttribute('data-src-line')) {
-            const l = parseInt(n.dataset.srcLine || '0', 10)
-            if (l > endLine) break
-          }
-          els.push(n)
-          n = n.nextElementSibling as HTMLElement | null
-        }
+        els.push(n)
+        n = n.nextElementSibling as HTMLElement | null
       }
-      els.forEach(el => el.classList.add('note-hl'))
-      if (flashTimer) clearTimeout(flashTimer)
-      flashTimer = setTimeout(() => {
-        els.forEach(el => el.classList.remove('note-hl'))
-      }, 2800)
+      session = sourceScroll(root, contentRef, anchor, els, props.active ?? true)
+      scrollSession = session
     })
+    onCleanup(() => {
+      cancelAnimationFrame(frame)
+      session?.dispose()
+      if (scrollSession === session) scrollSession = undefined
+    })
+  })
+  createEffect(() => {
+    const active = props.active ?? true
+    scrollSession?.setVisible(active)
   })
 
   const unsubscribe = observeDocuments(path => {
@@ -195,7 +182,7 @@ export const FileViewer: Component<Props> = (props) => {
     reqToken++
     release?.()
     unsubscribe()
-    if (flashTimer) clearTimeout(flashTimer)
+    scrollSession?.dispose()
   })
 
   return (
@@ -209,7 +196,7 @@ export const FileViewer: Component<Props> = (props) => {
         无法读取 {props.path}：{error()}
         <md-text-button onClick={() => setRetry(n => n + 1)}>重试</md-text-button>
       </div>}
-      <div aria-busy={loading()} data-file-path={props.path ?? ''} class={props.class ?? ''} ref={rootRef} innerHTML={html()} />
+      <div aria-busy={loading()} data-file-path={props.path ?? ''} class={props.class ?? ''} ref={rootRef}><div ref={contentRef} innerHTML={html()} /></div>
     </>
   )
 }

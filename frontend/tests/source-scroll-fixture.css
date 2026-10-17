@@ -1,0 +1,9 @@
+/* Test geometry only; application CSS and components are imported unchanged. */
+body {font-family: Arial, sans-serif; font-size:16px}
+.note-column {flex:none; width:560px}
+.content {min-width:0; flex:1}
+
+/* Make a real native scrollbar hit target available in headless Chromium. */
+.note-body { scrollbar-gutter:stable; }
+.note-body::-webkit-scrollbar { width:14px; }
+.note-body::-webkit-scrollbar-thumb { background:#888; }
