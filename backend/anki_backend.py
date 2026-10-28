@@ -4,6 +4,11 @@ The default app backend is still AnkiConnect. Importing this module does not
 import anki or open a collection; selecting pylib explicitly is required.
 """
 import asyncio
+import json
+import logging
+import os
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -29,6 +34,7 @@ class PylibClient:
         self._journal = None
         self._last_sync_error = None
         self._sync_meta = {}
+        self._sync_diagnostics = os.getenv("ANKI_SYNC_DIAGNOSTICS") == "1"
 
     async def call(self, action, params=None, timeout=30):
         if self._closed:
@@ -86,6 +92,62 @@ class PylibClient:
                 self._sync_meta = {}
                 self._last_sync_error = 'Cannot read sync status; local collection is available'
         return self._col
+
+    @staticmethod
+    def _diagnostic_exception(exc):
+        # Native Rust errors encode SQLite codes in their text. Extract numbers
+        # only: messages, repr and tracebacks can contain account/server secrets.
+        code = getattr(exc, 'sqlite_errorcode', None)
+        if not isinstance(code, int) or not 0 <= code <= 0x7fffffff:
+            code = None
+        try:
+            text = str(exc)
+        except Exception:
+            text = ''
+        match = re.search(r'\bextended_code\s*[:=]\s*(\d{1,10})\b', text)
+        if match and int(match[1]) <= 0x7fffffff:
+            code = int(match[1])
+        return {'class': type(exc).__name__, 'sqlite_primary_code': code & 255 if code is not None else None,
+                'sqlite_extended_code': code}
+
+    @staticmethod
+    def _diagnostic_integrity_error(text):
+        # Never forward arbitrary integrity output: SQLite may echo data/schema
+        # values. Only these stock-index error grammars can pass through.
+        index = r'(?:ix_(?:cards_(?:nid|sched|usn)|notes_(?:csum|usn)|revlog_(?:cid|usn))|idx_(?:cards_odid|decks_name|fields_name_ntid|graves_pending|notes_mid|notetypes_(?:name|usn)|templates_(?:name_ntid|usn)))'
+        patterns = (rf'row \d+ missing from index {index}',
+                    rf'wrong # of entries in index {index}',
+                    rf'non-unique entry in index {index}')
+        if isinstance(text, str) and any(re.fullmatch(pattern, text) for pattern in patterns):
+            return text
+        return 'SQLite integrity diagnostic withheld'
+
+    def _diagnose(self, col, stage, *, exc=None, operation=None):
+        if not self._sync_diagnostics:
+            return
+        # Called on the existing owner only. Observation must never change the
+        # result/exception of the operation, even if SQLite/stat/logging fails.
+        try:
+            record = {'stage': stage, 'path': str(self.path), 'thread': threading.get_ident()}
+            try:
+                record['inode'] = self.path.stat().st_ino
+            except OSError:
+                record['inode'] = None
+            if operation is not None:
+                record['operation'] = operation
+            if exc is not None:
+                record['exception'] = self._diagnostic_exception(exc)
+            try:
+                rows = col.db.all('PRAGMA integrity_check')
+                errors = [row[0] for row in rows if row != ['ok'] and row != ('ok',)]
+                record.update(integrity='errors' if errors else 'ok', error_count=len(errors))
+                if errors:
+                    record['first_error'] = self._diagnostic_integrity_error(errors[0])
+            except Exception as diagnostic_exc:
+                record['diagnostic_exception'] = self._diagnostic_exception(diagnostic_exc)
+            logging.getLogger('ir4anki.anki_diagnostics').warning('anki diagnostics %s', json.dumps(record))
+        except Exception:
+            pass
 
     @staticmethod
     def _fields(note):
@@ -322,7 +384,12 @@ class PylibClient:
                 ids.append(note.id)
             return ids
         if action == 'changeDeck':
-            col.set_deck(params['cards'], col.decks.id(params['deck']))
+            self._diagnose(col, 'set_deck:before')
+            try:
+                col.set_deck(params['cards'], col.decks.id(params['deck']))
+            except Exception as exc:
+                self._diagnose(col, 'set_deck:failure', exc=exc, operation='set_deck')
+                raise
             return None
         if action in ('suspend', 'unsuspend'):
             fn = col.sched.suspend_cards if action == 'suspend' else col.sched.unsuspend_cards
@@ -390,6 +457,8 @@ class PylibClient:
         col = self._open()
         now = lambda: datetime.now(timezone.utc).isoformat(timespec='seconds')
         self._save_sync_status(attempt_at=now(), stage='collection', error=None)
+        self._diagnose(col, 'sync:before')
+        operation = 'configuration'
         try:
             if not self._sync_endpoint or not (self._sync_hkey or (self._sync_username and self._sync_password)):
                 raise BackendError('Anki sync is not configured; explicit endpoint and credentials required')
@@ -397,19 +466,27 @@ class PylibClient:
                 if self._sync_hkey:
                     self._auth = SyncAuth(hkey=self._sync_hkey, endpoint=self._sync_endpoint)
                 else:
+                    operation = 'sync_login'
                     self._auth = col.sync_login(self._sync_username, self._sync_password, self._sync_endpoint)
+            operation = 'sync_collection'
             out = col.sync_collection(self._auth, sync_media=False)
+            self._diagnose(col, 'sync:after_collection')
             if out.required not in (SyncCollectionResponse.NO_CHANGES, SyncCollectionResponse.NORMAL_SYNC):
                 raise BackendError('Anki requires full sync; resolve upload/download in desktop Anki, never chosen automatically')
             self._save_sync_status(collection_at=now(), stage='media')
+            operation = 'sync_media'
             col.sync_media(self._auth)
             deadline = time.monotonic() + 300
+            operation = 'media_sync_status'
             while col.media_sync_status().active:
                 if time.monotonic() >= deadline:
+                    operation = 'abort_media_sync'
                     col.abort_media_sync()
                     raise BackendError('Anki media sync timed out')
                 time.sleep(0.05)
+            self._diagnose(col, 'sync:after_media')
         except Exception as exc:
+            self._diagnose(col, 'sync:failure', exc=exc, operation=operation)
             self._auth = None
             message = str(exc) if isinstance(exc, BackendError) else 'Anki sync failed; verify credentials and server availability'
             self._last_sync_error = message
