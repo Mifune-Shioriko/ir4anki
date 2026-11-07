@@ -3487,9 +3487,12 @@ def _files_root() -> Path:
     return NOTES_DIR.resolve()
 
 
-def _files_resolve(rel: str) -> Path:
-    """Absolute path for a corpus-relative file/dir path; 400 on traversal,
-    the corpus root itself, or a protected dir (.obsidian/_assets/…)."""
+def _files_resolve(rel: str, *, upload_image: bool = False) -> Path:
+    """Resolve safely; only image uploads may enter nested book _assets.
+
+    The root editor asset store and all other protected directories remain
+    off-limits. Browsing/rename/move/delete callers retain the strict default.
+    """
     rel = (rel or "").strip().replace("\\", "/").lstrip("/")
     if not rel:
         raise HTTPException(status_code=400, detail="path 不能为空")
@@ -3500,7 +3503,13 @@ def _files_resolve(rel: str) -> Path:
     p = lexical.resolve()
     if not p.is_relative_to(root) or p == root:
         raise HTTPException(status_code=400, detail="非法路径")
-    if any(part in NOTES_SKIP_DIRS for part in p.relative_to(root).parts):
+    parts = p.relative_to(root).parts
+    for index, part in enumerate(parts):
+        if part not in NOTES_SKIP_DIRS:
+            continue
+        if (upload_image and part == "_assets" and 0 < index < len(parts) - 1
+                and p.suffix.lower() in NOTE_IMAGE_EXTS):
+            continue
         raise HTTPException(status_code=400, detail="该目录受保护，不能在 app 内操作")
     return p
 
@@ -3919,7 +3928,7 @@ async def files_upload(
         if not rel:
             raise HTTPException(status_code=400, detail="缺少相对路径")
         dest = _files_resolve(
-            (tdir_rel + "/" if tdir_rel else "") + rel)
+            (tdir_rel + "/" if tdir_rel else "") + rel, upload_image=True)
         identity = _files_rel(dest)
         if identity in original_paths:
             raise HTTPException(status_code=409, detail=f"批内重复目标：{rel}")
@@ -3951,7 +3960,7 @@ async def files_upload(
     async with _state_lock:
         # Revalidate after off-lock reads; mutations and name allocation remain serialized.
         for it in items:
-            _files_resolve((tdir_rel + "/" if tdir_rel else "") + it["rel"])
+            _files_resolve((tdir_rel + "/" if tdir_rel else "") + it["rel"], upload_image=True)
         if tdir.exists() and not tdir.is_dir():
             raise HTTPException(status_code=409, detail="目标不是文件夹")
         # existing image basenames (media is served corpus-wide by basename)

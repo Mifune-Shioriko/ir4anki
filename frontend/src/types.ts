@@ -373,8 +373,17 @@ export interface ReadingExtras {
 }
 
 export interface EngineStatus {
+  backend?: string
   sync?: unknown
   undo?: unknown
   sync_deferred?: boolean
+  undo_available?: boolean
+  last_sync_success?: string | null
+  last_collection_sync?: string | null
+  last_sync_attempt?: string | null
+  sync_stage?: string
+  local_changes_pending?: boolean
+  media_changes_possible?: boolean
+  last_sync_error?: string | null
   [key: string]: unknown
 }

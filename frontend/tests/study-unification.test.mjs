@@ -48,13 +48,13 @@ test('actual App shortcut source respects dialog, reading busy, trace and review
  const run=(state,key,target={tagName:'BODY'})=>{
   const calls=[];const flags={editOpen:false,addOpen:false,deleteTarget:null,segEditOpen:false,traceOpen:false,clozeOpen:false,canUndo:false,answering:false,syncOpen:false,rdBusy:false,revealed:false,...state}
   const context=Object.fromEntries(Object.entries(flags).map(([name,value])=>[name,()=>value]))
-  Object.assign(context,{section:()=>state.section??'study',HTMLElement:class {},phase:()=>state.phase??'reading',rdCurrent:()=>({chunk_key:'synthetic'}),currentCard:()=>({cardId:42})})
+  Object.assign(context,{document:{querySelector:()=>state.drawerOpen ? {} : null},section:()=>state.section??'study',HTMLElement:class {},phase:()=>state.phase??'reading',rdCurrent:()=>({chunk_key:'synthetic'}),currentCard:()=>({cardId:42})})
   for(const name of ['closeTrace','openReadingAdd','openReadingCloze','undo','rdAct','setRevealedFor','answer'])context[name]=(...args)=>calls.push({name,args})
   const handle=new Function(...Object.keys(context),js+';return handleKeyDown')(...Object.values(context))
   handle({target,key,composedPath:()=>state.eventPath??[target],preventDefault(){},ctrlKey:state.ctrlKey??false,metaKey:false});return calls
  }
  for(const section of ['files','readingList']) for(const key of [' ','1','2','3','4','a','c','s','n','z']) assert.deepEqual(run({section,canUndo:true,ctrlKey:true},key),[],section+key)
- for(const guard of ['editOpen','addOpen','deleteTarget','segEditOpen','clozeOpen','syncOpen','rdBusy']) assert.deepEqual(run({[guard]:true},' '),[],guard)
+ for(const guard of ['drawerOpen','editOpen','addOpen','deleteTarget','segEditOpen','clozeOpen','syncOpen','rdBusy']) assert.deepEqual(run({[guard]:true},' '),[],guard)
  for(const target of [{tagName:'INPUT'},{tagName:'TEXTAREA'},{tagName:'DIV',isContentEditable:true}])assert.deepEqual(run({},' ',target),[])
  assert.deepEqual(run({eventPath:[{tagName:'MD-OUTLINED-TEXT-FIELD'},{tagName:'INPUT'}]},' '),[],'Material shadow input')
  assert.deepEqual(run({},' '),[{name:'rdAct',args:['complete']}])

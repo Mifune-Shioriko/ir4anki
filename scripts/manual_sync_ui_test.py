@@ -40,12 +40,12 @@ with sync_playwright() as pw:
         button.focus();assert button.evaluate('(e)=>e.matches(":focus-visible")')
         button.click();expect(page.locator('md-dialog')).to_be_visible()
         assert page.locator('input[type=password]').count()==0
-        expect(page.get_by_role('button',name='确认并同步')).to_be_disabled()
+        assert page.locator('input[type=checkbox]').count()==0
+        expect(page.get_by_role('button',name='立即同步')).to_be_enabled()
         assert not calls
         page.get_by_role('button',name='取消').click();expect(page.locator('md-dialog')).to_have_count(0);assert not calls
-        button.click();page.get_by_role('checkbox').check()
-        expect(page.get_by_role('checkbox')).to_have_accessible_name('确认结束最后一次评分的撤销，即使同步失败也不能恢复。')
-        confirm=page.get_by_role('button',name='确认并同步');confirm.click()
+        button.click()
+        confirm=page.get_by_role('button',name='立即同步');confirm.click()
         expect(page.get_by_role('button',name='正在同步…')).to_be_disabled()
         expect(page.get_by_role('button',name='取消')).to_be_disabled()
         # Dispatch a second event to exercise the handler's synchronous busy guard.
@@ -53,9 +53,10 @@ with sync_playwright() as pw:
         page.wait_for_timeout(100);assert len(calls)==1 and len(pending)==1
         pending.pop().fulfill(json={'synced':True})
         expect(page.get_by_role('status').last).to_contain_text('集合与媒体同步完成')
-        expect(page.get_by_role('button',name='确认并同步')).to_be_disabled()
-        page.get_by_role('checkbox').check();mode[0]='error'
-        page.get_by_role('button',name='确认并同步').click()
+        expect(page.get_by_role('button',name='关闭')).to_be_enabled()
+        expect(page.get_by_role('button',name='再次同步')).to_be_enabled()
+        mode[0]='error'
+        page.get_by_role('button',name='再次同步').click()
         expect(page.get_by_role('status').last).to_contain_text('同步失败')
         expect(page.get_by_role('status').last).to_contain_text('full sync')
         assert len(calls)==2

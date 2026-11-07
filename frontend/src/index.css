@@ -2320,9 +2320,19 @@ a:focus-visible,
 /* ---- file management (user spec 2026-10-06) ---- */
 .files-tree-head-actions {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 2px;
 }
+.files-import-skipped {
+  flex: none;
+  max-height: 25dvh;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  padding: 8px 12px;
+  font-size: 0.8125rem;
+}
+.files-import-skipped summary { cursor: pointer; }
 .files-upload-btn {
   --md-text-button-label-text-size: 0.78rem;
 }
@@ -2589,6 +2599,87 @@ a:focus-visible,
 /* Shared rail state layers also cover the manual-sync dialog action. */
 .nav-rail__item:focus-visible { outline: 2px solid var(--md-sys-color-primary); outline-offset: 2px; border-radius: 16px; }
 .nav-rail__item:active .nav-rail__indicator { background: var(--md-sys-color-secondary-container); }
+
+/* Manual sync dialog layout (MD3 status rows + contextual notices) */
+.sync-dialog__content {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.sync-status-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: var(--md-sys-shape-corner-medium, 12px);
+  background: var(--md-sys-color-surface-container);
+}
+
+.sync-status-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.sync-status-row__label {
+  color: var(--md-sys-color-on-surface-variant);
+  flex-shrink: 0;
+}
+
+.sync-status-row__value {
+  color: var(--md-sys-color-on-surface);
+  font-weight: 500;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-status-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.sync-status-badge--pending {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.sync-status-badge--clean {
+  background: var(--md-sys-color-surface-container-highest);
+  color: var(--md-sys-color-on-surface-variant);
+}
+
+.sync-notice {
+  padding: 10px 12px;
+  border-radius: var(--md-sys-shape-corner-small, 8px);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.sync-notice--info {
+  background: var(--md-sys-color-surface-container-high);
+  color: var(--md-sys-color-on-surface);
+}
+
+.sync-notice--warn {
+  background: var(--md-sys-color-secondary-container);
+  color: var(--md-sys-color-on-secondary-container);
+}
+
+.sync-notice--success {
+  background: var(--md-sys-color-primary-container);
+  color: var(--md-sys-color-on-primary-container);
+}
+
+.sync-notice--error {
+  background: var(--md-sys-color-error-container);
+  color: var(--md-sys-color-on-error-container);
+}
 
 /* Keep both indicators within the compact phone navigation rail. */
 @media (max-width: 640px) {

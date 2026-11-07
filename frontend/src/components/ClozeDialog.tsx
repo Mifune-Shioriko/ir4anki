@@ -1,6 +1,6 @@
 import { Component, For, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
-import { applyDialogGuard } from '../lib/dialog-guard'
+import { CardDrawer } from './CardDrawer'
 import { MARKDOWN_TAG, clozeRanges, renderClozeMd } from '../lib/cloze'
 import { MarkdownField } from './MarkdownField'
 import type { Cm6Handle } from '../lib/cm6-editor'
@@ -138,6 +138,7 @@ export const ClozeDialog: Component<Props> = (props) => {
   const clozeCount = () => clozeRanges(clozeText()).length
 
   const handleSave = async () => {
+    if (loading() || saving()) return
     setSaving(true)
     setError('')
     try {
@@ -166,15 +167,14 @@ export const ClozeDialog: Component<Props> = (props) => {
   }
 
   return (
-    <md-dialog
-      class="edit-dialog cloze-dialog"
-      open
-      onClose={() => props.onClose()}
-      ref={el => applyDialogGuard(el, () => props.onClose())}
-    >
-      <div slot="headline">添加挖空卡</div>
-
-      <div slot="content" class="edit-dialog-content">
+    <CardDrawer title="添加挖空卡" onClose={props.onClose} busy={saving()}
+      actions={<>
+        <md-text-button disabled={saving()} onClick={props.onClose}>取消</md-text-button>
+        <md-filled-button onClick={handleSave} disabled={loading() || saving()}>
+          {saving() ? '保存中…' : '添加挖空卡'}
+        </md-filled-button>
+      </>}>
+      <div class="edit-dialog-content">
         <Show when={loading()}>
           <div class="edit-loading md-typescale-body-medium">加载中…</div>
         </Show>
@@ -268,12 +268,6 @@ export const ClozeDialog: Component<Props> = (props) => {
         </Show>
       </div>
 
-      <div slot="actions">
-        <md-text-button onClick={() => props.onClose()}>取消</md-text-button>
-        <md-filled-button onClick={handleSave} disabled={loading() || saving()}>
-          添加挖空卡
-        </md-filled-button>
-      </div>
-    </md-dialog>
+    </CardDrawer>
   )
 }

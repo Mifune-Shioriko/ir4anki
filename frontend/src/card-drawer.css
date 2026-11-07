@@ -1,0 +1,148 @@
+/* Float above the existing supporting pane without hiding or resizing it.
+ * Keep the reader's horizontal geometry; use a bottom pane on narrow layouts.
+ * Match the segment editor's actual 32% scrim, not an approximate edge shadow. */
+:root {
+  --card-drawer-width: clamp(360px, 42vw, 620px);
+  --card-drawer-mobile-height: 52dvh;
+}
+body:has(.card-drawer) .columns {
+  flex: 0 0 auto;
+  height: 100dvh;
+  min-height: 0;
+}
+body:has(.card-drawer) .columns > .content {
+  min-height: 0;
+  max-height: 100%;
+  overflow: auto;
+}
+.card-drawer-scrim {
+  position: fixed;
+  z-index: 29;
+  inset: 0;
+  pointer-events: none;
+  background: var(--md-sys-color-scrim, #000);
+  opacity: .32;
+  animation: card-drawer-scrim-enter 500ms linear both;
+}
+@keyframes card-drawer-scrim-enter {
+  from { opacity: 0; }
+  to { opacity: .32; }
+}
+.card-drawer.edit-dialog {
+  position: fixed;
+  z-index: 30;
+  inset: 12px 12px 12px auto;
+  display: flex;
+  flex-direction: column;
+  width: var(--card-drawer-width);
+  max-width: calc(100% - 24px);
+  height: calc(100dvh - 24px);
+  max-height: calc(100dvh - 24px);
+  min-width: 0;
+  margin: 0;
+  background: var(--md-sys-color-surface-container-low);
+  color: var(--md-sys-color-on-surface);
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: 16px;
+  /* The segment editor's md-dialog has no edge shadow: its scrim provides
+   * the visual depth. Keep the same treatment here. */
+  box-shadow: none;
+  animation: card-drawer-enter 500ms cubic-bezier(.3, 0, 0, 1) both;
+}
+.card-drawer-header {
+  display: flex;
+  flex: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px 12px 24px;
+  border-bottom: 1px solid var(--md-sys-color-outline-variant);
+}
+.card-drawer-header h2 { min-width: 0; overflow-wrap: anywhere; }
+.card-drawer-header md-icon-button { flex: none; }
+.card-drawer-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 20px 24px;
+}
+.card-drawer-actions {
+  display: flex;
+  flex: none;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 24px max(12px, env(safe-area-inset-bottom));
+  border-top: 1px solid var(--md-sys-color-outline-variant);
+}
+.card-drawer .edit-fields,
+.card-drawer .lecture-qa-fields {
+  grid-template-columns: minmax(0, 1fr);
+}
+.card-drawer .card-md-editor,
+.card-drawer .rich-field {
+  height: clamp(144px, 22dvh, 240px);
+  min-height: 144px;
+}
+.card-drawer .lecture-section-heading { padding-top: 0; }
+.card-drawer .lecture-save-dock {
+  position: sticky;
+  bottom: -20px;
+  margin-bottom: -20px;
+  padding-bottom: 20px;
+}
+@keyframes card-drawer-enter {
+  from { transform: translateY(-50px); opacity: 0; }
+  10% { opacity: 1; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.card-drawer-header,
+.card-drawer-body {
+  animation: card-drawer-content-enter 250ms linear both;
+}
+.card-drawer-actions {
+  animation: card-drawer-actions-enter 300ms linear both;
+}
+@keyframes card-drawer-content-enter {
+  from, 20% { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes card-drawer-actions-enter {
+  from, 50% { opacity: 0; }
+  to { opacity: 1; }
+}
+/* Available space, not viewport width alone, determines placement. A tablet
+ * can have a full-width reader too; do not squeeze it into a narrow column. */
+body:has(.card-drawer[data-placement="bottom"]) .app {
+  padding-bottom: var(--card-drawer-mobile-height);
+}
+body:has(.card-drawer[data-placement="bottom"]) .columns {
+  height: calc(100dvh - var(--card-drawer-mobile-height));
+}
+.card-drawer.edit-dialog[data-placement="bottom"] {
+  inset: auto 0 0;
+  width: 100%;
+  max-width: 100%;
+  height: var(--card-drawer-mobile-height);
+  max-height: var(--card-drawer-mobile-height);
+  border-radius: 16px 16px 0 0;
+  animation-name: card-drawer-enter-bottom;
+}
+@keyframes card-drawer-enter-bottom {
+  from { transform: translateY(50px); opacity: 0; }
+  10% { opacity: 1; }
+  to { transform: translateY(0); opacity: 1; }
+}
+@media (max-width: 759px) {
+  .card-drawer-header { padding: 4px 12px 4px 16px; }
+  .card-drawer-body { padding: 12px 16px; }
+  .card-drawer-actions { padding: 8px 16px max(8px, env(safe-area-inset-bottom)); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card-drawer.edit-dialog,
+  .card-drawer-scrim,
+  .card-drawer-header,
+  .card-drawer-body,
+  .card-drawer-actions { animation: none; }
+}

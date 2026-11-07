@@ -5,15 +5,14 @@ import { AuthoringToolbar } from './AuthoringToolbar'
 import { cleanCardHtml, cleanEditorHtml } from '../lib/clean'
 import { MARKDOWN_TAG, isMarkdownNote } from '../lib/cloze'
 import { api } from '../api'
-import { applyDialogGuard } from '../lib/dialog-guard'
+import { CardDrawer } from './CardDrawer'
 import { fromEditorHtml, makeMathChip, makeMediaImg, mathifyField, toEditorHtml } from '../lib/rich'
 import {
   IconFormatBold, IconFormatItalic, IconFormatUnderlined, IconInkHighlighter,
   IconImage, IconFormatClear, IconFunctions,
 } from './icons'
 
-// Rich-text note editor (MD3 wide centered dialog, user spec 2026-10-05 —
-// was a bottom sheet; scrim clicks no longer dismiss it, 取消/保存/Esc only).
+// Note editor in a non-modal right drawer; source reading remains available.
 // contenteditable fields are
 // imperative by design: toolbar commands + paste-upload mutate the DOM
 // directly, Solid only mounts the initial HTML (fresh mount per card —
@@ -299,6 +298,7 @@ export const EditDialog: Component<Props> = (props) => {
 
   // ---- save ----
   const handleSave = async () => {
+    if (loading() || saving()) return
     setSaving(true)
     setError('')
     try {
@@ -327,21 +327,14 @@ export const EditDialog: Component<Props> = (props) => {
   }
 
   return (
-    <md-dialog
-      class="edit-dialog"
-      open
-      onClose={() => props.onClose()}
-      ref={el => {
-        // Must be set before the dialog's open animation runs (the open
-        // attribute triggers show() after a connected microtask).
-        // Scrim clicks are blocked (user spec 2026-10-05: 误触即关丢编辑) —
-        // only 取消/保存 and Esc close it. Default center-scale motion.
-        applyDialogGuard(el, () => props.onClose())
-      }}
-    >
-      <div slot="headline">{isAdd() ? '添加卡片' : '编辑卡片'}</div>
-
-      <div slot="content" class="edit-dialog-content">
+    <CardDrawer title={isAdd() ? '添加卡片' : '编辑卡片'} onClose={props.onClose} busy={saving()}
+      actions={<>
+        <md-text-button disabled={saving()} onClick={props.onClose}>取消</md-text-button>
+        <md-filled-button onClick={handleSave} disabled={loading() || saving()}>
+          {saving() ? '保存中…' : isAdd() ? '添加' : '保存'}
+        </md-filled-button>
+      </>}>
+      <div class="edit-dialog-content">
         <Show when={loading()}>
           <div class="edit-loading md-typescale-body-medium">加载中…</div>
         </Show>
@@ -473,12 +466,6 @@ export const EditDialog: Component<Props> = (props) => {
         </Show>
       </div>
 
-      <div slot="actions">
-        <md-text-button onClick={() => props.onClose()}>取消</md-text-button>
-        <md-filled-button onClick={handleSave} disabled={loading() || saving()}>
-          {isAdd() ? '添加' : '保存'}
-        </md-filled-button>
-      </div>
-    </md-dialog>
+    </CardDrawer>
   )
 }

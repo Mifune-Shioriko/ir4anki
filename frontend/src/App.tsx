@@ -858,7 +858,8 @@ export const App: Component = () => {
     if (section() !== 'study') return
     if (e.composedPath().some(t => isTypingTarget(t) || (t instanceof HTMLElement &&
       (t.matches('md-dialog, [role="dialog"], md-outlined-text-field, md-menu') || !!t.closest('[role="dialog"]'))))) return
-    if (editOpen() || addOpen() || deleteTarget() || segEditOpen()) return
+    // Non-modal drawers leave the reader usable, but must not advance its round.
+    if (document.querySelector('.card-drawer') || editOpen() || addOpen() || deleteTarget() || segEditOpen()) return
     // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
     // shortcuts (Space/1-4/approve) must not fire behind the trace card.
     // Escape = 回到复习; A/C keep working (they target the traced chunk).

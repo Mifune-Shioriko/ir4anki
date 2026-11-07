@@ -12,6 +12,7 @@ import {
 } from './icons'
 import { Snackbar } from './Snackbar'
 import { applyDialogGuard } from '../lib/dialog-guard'
+import { partitionImports, type SkippedImport } from '../lib/file-import'
 
 // 文件 section (user spec 2026-09-19 round 3; MANAGEMENT since 2026-10-06):
 // the app is the SINGLE SOURCE OF TRUTH for the ~/anki-notes corpus — no
@@ -146,6 +147,7 @@ export const FilesScreen: Component<Props> = (_props) => {
   let fileInputRef: HTMLInputElement | undefined
   let dirInputRef: HTMLInputElement | undefined
   const [uploading, setUploading] = createSignal(false)
+  const [skippedImports, setSkippedImports] = createSignal<SkippedImport[]>([])
   // conflict dialog state: the batch that 409'd + the clashing names
   const [conflict, setConflict] = createSignal<{ entries: PendingUpload; dir: string; names: string[] } | null>(null)
   const [conflictBusy, setConflictBusy] = createSignal(false)
@@ -209,17 +211,25 @@ export const FilesScreen: Component<Props> = (_props) => {
     }
   }
 
+  const uploadPicked = (entries: PendingUpload) => {
+    if (!entries.length || uploading()) return
+    const { supported, skipped } = partitionImports(entries)
+    setSkippedImports(skipped)
+    if (supported.length) void doUpload(supported, currentDir(), 'error')
+    else showSnack('没有可导入的文件，请展开跳过清单查看原因')
+  }
+
   const onFilesPicked = () => {
     if (!fileInputRef) return
     const entries = entriesFromInput(fileInputRef)
     fileInputRef.value = ''
-    if (entries.length) void doUpload(entries, currentDir(), 'error')
+    uploadPicked(entries)
   }
   const onDirPicked = () => {
     if (!dirInputRef) return
     const entries = entriesFromInput(dirInputRef)
     dirInputRef.value = ''
-    if (entries.length) void doUpload(entries, currentDir(), 'error')
+    uploadPicked(entries)
   }
 
   // ---- rename dialog -------------------------------------------------------
@@ -677,10 +687,8 @@ export const FilesScreen: Component<Props> = (_props) => {
           <div class="files-tree-head">
             <span class="md-typescale-title-small">笔记</span>
             <span class="files-tree-head-actions">
-              <FilesMenu label={`上传至 ${dirLabel()}`} text="上传" disabled={uploading()} actions={[
-                { label: `上传文件至 ${dirLabel()}`, run: () => fileInputRef?.click() },
-                { label: `上传文件夹至 ${dirLabel()}`, run: () => dirInputRef?.click() },
-              ]} />
+              <md-filled-button disabled={uploading()} onClick={() => fileInputRef?.click()}>导入文件</md-filled-button>
+              <md-outlined-button disabled={uploading()} onClick={() => dirInputRef?.click()}>导入文件夹</md-outlined-button>
               <md-icon-button aria-label="刷新" onClick={reload}>
                 <md-icon>
                   <IconRestartAlt size={18} />
@@ -703,6 +711,12 @@ export const FilesScreen: Component<Props> = (_props) => {
               </md-text-button>
             </Show>
           </div>
+          <Show when={skippedImports().length}>
+            <details class="files-import-skipped">
+              <summary>已跳过 {skippedImports().length} 个文件（未上传）</summary>
+              <For each={skippedImports()}>{item => <p>{item.rel}：{item.reason}</p>}</For>
+            </details>
+          </Show>
           <input class="files-search" type="search" aria-label="搜索文件名或路径" placeholder="搜索文件名或路径" value={query()} onInput={e => setQuery(e.currentTarget.value)} />
           <div class="files-scope">Markdown 笔记与文件夹；附件随文件夹移动</div>
           <Show when={uploading()}>

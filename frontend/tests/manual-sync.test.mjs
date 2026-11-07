@@ -21,35 +21,33 @@ test('dialog has no administrator credential input and rail has a labelled icon 
 // Browser layout remains covered separately by the Playwright fixture.
 import ts from 'typescript'
 import vm from 'node:vm'
-async function dialogFixture(result) {
+async function dialogFixture(result, statusOverride = {}) {
  const path=process.env.ORIGINAL_SYNC_DIALOG || new URL('../src/components/ManualSyncDialog.tsx',import.meta.url)
- const source=await readFile(path,'utf8');const signals=[];const mounts=[];const calls=[];let closed=0
- const api={engineStatus:async()=>({backend:'pylib'}),engineSync:async()=>{calls.push('sync');return await result()}}
+ const source=await readFile(path,'utf8');const signals=[];const mounts=[];const calls=[];let closed=0;let synced=0
+ const api={engineStatus:async()=>({backend:'pylib',...statusOverride}),engineSync:async()=>{calls.push('sync');return await result()}}
  const solid={createSignal(value){const state={value};signals.push(state);return [()=>state.value,v=>{state.value=v}]},
- onMount(fn){mounts.push(fn)},onCleanup(){},Show:()=>{}}
+ onMount(fn){mounts.push(fn)},onCleanup(){},Show:(p)=>p.when?p.children:null}
  const output=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.CommonJS,jsx:ts.JsxEmit.React,jsxFactory:'h'}}).outputText
- const exports={};vm.runInNewContext(output,{exports,require:name=>name==='solid-js'?solid:{api,setEngineToken:()=>{}},h:(tag,props,...children)=>({tag,props:props||{},children})})
- const tree=exports.ManualSyncDialog({onClose:()=>closed++})
+ const exports={};vm.runInNewContext(output,{exports,require:name=>name==='solid-js'?solid:{api,setEngineToken:()=>{}},h:(tag,props,...children)=>typeof tag==='function'?tag({...(props||{}),children}):({tag,props:props||{},children})})
+ const tree=exports.ManualSyncDialog({onClose:()=>closed++,onSynced:()=>synced++})
  mounts.forEach(fn=>fn());await new Promise(r=>setImmediate(r))
  const nodes=[];function walk(node){if(node&&typeof node==='object'&&node.tag){nodes.push(node);node.children.flat(Infinity).forEach(walk)}}walk(tree)
- return {calls,signals,closed:()=>closed,button:nodes.find(n=>n.tag==='md-filled-button'),cancel:nodes.find(n=>n.tag==='md-text-button'),checkbox:nodes.find(n=>n.tag==='input'&&n.props.type==='checkbox')}
+ return {calls,signals,closed:()=>closed,synced:()=>synced,button:nodes.find(n=>n.tag==='md-filled-button'),cancel:nodes.find(n=>n.tag==='md-text-button')}
 }
-test('opening, cancelling and unconfirmed submit never sync; confirmed double submit syncs once', async()=>{
+test('opening and cancelling never sync; direct submit syncs once while busy', async()=>{
  let resolve;const f=await dialogFixture(()=>new Promise(r=>resolve=r))
  assert.equal(f.calls.length,0);f.cancel.props.onClick();assert.equal(f.closed(),1)
- await f.button.props.onClick();assert.equal(f.calls.length,0)
- f.checkbox.props.onChange({currentTarget:{checked:true}})
  const first=f.button.props.onClick();const duplicate=f.button.props.onClick()
  assert.equal(f.calls.length,1);f.cancel.props.onClick();assert.equal(f.closed(),1)
  assert.ok(f.signals.some(s=>s.value===true));assert.ok(f.signals.some(s=>String(s.value).includes('正在同步集合')))
  resolve({synced:true});await Promise.all([first,duplicate])
  assert.ok(f.signals.some(s=>s.value==='集合与媒体同步完成。'))
- await f.button.props.onClick();assert.equal(f.calls.length,1)
+ assert.equal(f.synced(),1)
  f.cancel.props.onClick();assert.equal(f.closed(),2)
 })
 test('failure reports error, clears busy, allows explicit retry without full-sync direction',async()=>{
  const f=await dialogFixture(()=>{throw new Error('full sync needs explicit direction')})
- f.checkbox.props.onChange({currentTarget:{checked:true}});await f.button.props.onClick()
+ await f.button.props.onClick()
  assert.equal(f.calls.length,1)
  assert.ok(f.signals.some(s=>String(s.value).includes('同步失败')&&String(s.value).includes('full sync')))
  f.cancel.props.onClick();assert.equal(f.closed(),1)
