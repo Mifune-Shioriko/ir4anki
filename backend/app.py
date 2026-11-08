@@ -2227,9 +2227,11 @@ def _reanchor_entry(entry: dict, lines: list[str], new_sha: str) -> None:
             s["end_line"] = st + span - 1
             s["first_line"] = lines[st - 1] if st - 1 < n else ""
 
-    for s in segs:  # pass 2: containers — own fp, else union of live children
-        if s.get("status") != "container":
-            continue
+    for s in sorted(
+        (x for x in segs if x.get("status") == "container"),
+        key=lambda x: x.get("seg_id") or 0,
+        reverse=True,
+    ):  # pass 2: containers bottom-up — own fp, else union of live children
         span = s["end_line"] - s["start_line"] + 1
         st = _relocate_span(
             lines, s.get("fingerprint", ""), s.get("first_line", ""), span, s["start_line"]
@@ -5069,9 +5071,29 @@ async def reading_reseed(body: ReadingPathBody):
                     continue
             kept_orphans.append(o)
         entry["orphans"] = kept_orphans
+        # recompute surviving containers bottom-up from live children when
+        # their own fingerprint didn't match directly
+        for s in sorted(
+            (x for x in surviving if x.get("status") == "container"),
+            key=lambda x: x.get("seg_id") or 0,
+            reverse=True,
+        ):
+            if not s.get("stale"):
+                continue
+            kids = [
+                c for c in surviving
+                if c.get("parent_seg_id") == s.get("seg_id") and not c.get("stale")
+            ]
+            if kids:
+                s["start_line"] = min(k["start_line"] for k in kids)
+                s["end_line"] = max(k["end_line"] for k in kids)
+                s["fingerprint"] = _seg_fingerprint(lines, s["start_line"], s["end_line"])
+                s["first_line"] = lines[s["start_line"] - 1] if lines else ""
+                s.pop("stale", None)
         covered: set[int] = set()
         for s in surviving:
-            covered.update(range(s["start_line"], s["end_line"] + 1))
+            if s.get("status") != "container" and not s.get("stale"):
+                covered.update(range(s["start_line"], s["end_line"] + 1))
         entry["segments"] = surviving  # id counter must see survivors
         nid = _next_seg_id(entry)
         fresh = []
