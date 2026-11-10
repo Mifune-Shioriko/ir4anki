@@ -16,7 +16,7 @@ def test_app_real_engine_flow(tmp_path,monkeypatch):
     path=tmp_path/'collection.anki2'
     col=Collection(str(path));col.close()
     corpus=tmp_path/'notes';corpus.mkdir();(corpus/'test.md').write_text('# Topic\n\nA substantial isolated reading passage to make cards from.\n')
-    for k,v in {'ANKI_BACKEND':'pylib','ANKI_COLLECTION_PATH':str(path),
+    for k,v in {'ANKI_BACKEND':'pylib','ANKI_TRUSTED_HOSTS':'test','ANKI_COLLECTION_PATH':str(path),
                 'ANKI_STATE_DIR':str(tmp_path/'state'),'ANKI_NOTES_DIR':str(corpus),
                 'ANKI_PREVIEW_MODE':'1','ANKI_READING_MODE':'1',
                 'ANKI_ADD_MODEL':'Basic','ANKI_ADD_CLOZE_MODEL':'Cloze',
@@ -83,7 +83,7 @@ def test_engine_http_security_and_restart_round(tmp_path,monkeypatch):
     path=tmp_path/'collection.anki2'
     from pylib_backend_test import seed
     cid=seed(path)
-    for k,v in {'ANKI_BACKEND':'pylib','ANKI_COLLECTION_PATH':str(path),
+    for k,v in {'ANKI_BACKEND':'pylib','ANKI_TRUSTED_HOSTS':'test','ANKI_COLLECTION_PATH':str(path),
                 'ANKI_STATE_DIR':str(tmp_path/'state'),'ANKI_NOTES_DIR':str(tmp_path/'notes'),
                 'ANKI_BACKUP_DIR':str(tmp_path/'backups'),'ANKI_EXPORT_DIR':str(tmp_path/'exports'),
                 'ANKI_ENGINE_API_TOKEN':'temporary-test-token'}.items():monkeypatch.setenv(k,v)

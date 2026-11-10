@@ -18,7 +18,7 @@ export function FilesMenu(props: { label: string; disabled?: boolean; actions: {
       <For each={props.actions}>{action => <md-menu-item on:close-menu={(event: CloseMenuEvent) => {
         const r = event.detail.reason
         if (r.kind === CloseReason.CLICK_SELECTION || (r.kind === CloseReason.KEYDOWN && 'key' in r && (r.key === 'Enter' || r.key === 'Space'))) {
-          event.stopPropagation(); menu.skipRestoreFocus = true; menu.close(); action.run()
+          event.stopPropagation(); menu.skipRestoreFocus = true; menu.close(); trigger.focus(); action.run()
         }
       }}><div slot="headline">{action.label}</div>{action.icon && <md-icon slot="start">{action.icon()}</md-icon>}</md-menu-item>}</For>
     </md-menu>

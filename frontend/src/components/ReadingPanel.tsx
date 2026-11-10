@@ -1,7 +1,8 @@
 import { Component } from 'solid-js'
 import { api } from '../api'
 import type { ReadingChunk } from '../types'
-import { FileViewer } from './FileViewer'
+import { SourceViewer as FileViewer } from './SourceViewer'
+import type {PageSource} from '../lib/lecture-api'
 
 // Reading right column (渐进制卡, user spec 2026-09-19): the WHOLE source
 // file behind the current chunk, anchored + flashed at the chunk's section —
@@ -30,6 +31,7 @@ export const ReadingPanel: Component<Props> = (props) => {
     <div class="note-panel">
       <div class="note-crumb md-typescale-label-small">{crumb()}</div>
       <FileViewer
+        source={props.chunk.kind==='pdf'?props.chunk as unknown as PageSource:undefined}
         path={props.chunk.path}
         anchorLine={props.chunk.line_start}
         anchorEndLine={props.chunk.line_end}

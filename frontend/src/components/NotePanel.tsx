@@ -1,7 +1,9 @@
 import { Component, Show, createEffect, createSignal } from 'solid-js'
 import { api } from '../api'
 import type { ReadingSource } from '../types'
-import { FileViewer } from './FileViewer'
+import { SourceViewer as FileViewer } from './SourceViewer'
+import {createDocumentBranch} from '../lib/document-branch'
+import type {PageSource} from '../lib/lecture-api'
 
 // Right-hand note panel — EXACT provenance (round 4, 2026-09-21).
 //
@@ -42,6 +44,7 @@ export const NotePanel: Component<Props> = (props) => {
   // monotonic request token: a stale fetch (card swapped mid-flight) can
   // never overwrite the newer card's state
   let reqToken = 0
+  const documentBranch=createDocumentBranch(()=>status()==='ready'?source():null)
 
   const refresh = () => {
     const noteId = props.noteId
@@ -76,9 +79,7 @@ export const NotePanel: Component<Props> = (props) => {
   })
 
   // 文件 · 根标题 › … › 片段标题 (breadcrumb = seeded root → this segment)
-  const crumb = () => {
-    const s = source()
-    if (!s) return ''
+  const crumb = (s:ReadingSource) => {
     const file = s.path.replace(/^\d{4}\//, '')
     const titles = s.breadcrumb
       .map(b => b.title)
@@ -127,11 +128,11 @@ export const NotePanel: Component<Props> = (props) => {
         </div>
       </Show>
 
-      <Show when={status() === 'ready' && source()}>
-        <div class="note-crumb md-typescale-label-small">{crumb()}</div>
+      <Show when={documentBranch()} keyed>{branch=><>
+        <div class="note-crumb md-typescale-label-small">{crumb(branch.current())}</div>
         {/* the header row is gone (user spec 2026-09-29) — the stale flag
             rides above the body as a small warning chip instead */}
-        <Show when={source()?.stale}>
+        <Show when={branch.current().stale}>
           <span
             class="note-stale-chip md-typescale-label-small"
             title="源文件被外部编辑过，片段按指纹重锚失败，范围可能不精确"
@@ -140,16 +141,17 @@ export const NotePanel: Component<Props> = (props) => {
           </span>
         </Show>
         <FileViewer
-          path={source()!.path}
-          anchorLine={source()!.line_start}
-          anchorEndLine={source()!.line_end}
-          anchorToken={source()!.seg_id}
+          source={branch.current().kind==='pdf'?branch.current() as unknown as PageSource:undefined}
+          path={branch.current().path}
+          anchorLine={branch.current().line_start}
+          anchorEndLine={branch.current().line_end}
+          anchorToken={branch.current().seg_id}
           active={props.active}
           fetchFile={api.readingFile}
           class="note-body md-typescale-body-medium"
           onError={() => setStatus('error')}
         />
-      </Show>
+      </>}</Show>
     </div>
   )
 }

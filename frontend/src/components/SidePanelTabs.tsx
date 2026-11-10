@@ -2,6 +2,8 @@ import { Component, Show, createSignal } from 'solid-js'
 import { NotePanel } from './NotePanel'
 import { ReadingPanel } from './ReadingPanel'
 import { RelatedPanel } from './RelatedPanel'
+import {createDocumentBranch} from '../lib/document-branch'
+import type {PageLocator} from '../lib/lecture-api'
 import type { ReadingChunk } from '../types'
 
 // Right-column tabs (2026-09-27 桌面重设计): THE side column, at every
@@ -14,9 +16,11 @@ import type { ReadingChunk } from '../types'
 // refetch or lose scroll position. The reveal gate lives in the props App
 // passes (noteId=null while face-down), identical to the old columns.
 interface Props {
+  active?: boolean
   /** reading round / trace detour: the chunk on screen (switches both
    *  panes to their reading variants) */
   chunk: ReadingChunk | null
+  pageSource?: PageLocator | null
   /** review mode: revealed card's note id (null until reveal — leak gate) */
   noteId: number | null
   cardKey: number | null
@@ -27,6 +31,7 @@ interface Props {
 
 export const SidePanelTabs: Component<Props> = (props) => {
   const [tab, setTab] = createSignal(0)
+  const readingBranch=createDocumentBranch(()=>props.chunk)
   const onTabChange = (e: Event) => {
     const t = e.currentTarget as HTMLElement & { activeTabIndex?: number }
     setTab(t.activeTabIndex ?? 0)
@@ -34,7 +39,7 @@ export const SidePanelTabs: Component<Props> = (props) => {
   return (
     <div class="side-panel-tabs">
       <md-tabs class="note-tabs" activeTabIndex={tab()} onChange={onTabChange}>
-        <md-primary-tab><span class="note-tab-label">笔记</span></md-primary-tab>
+        <md-primary-tab><span class="note-tab-label">全文参考</span></md-primary-tab>
         <md-primary-tab><span class="note-tab-label">相关卡片</span></md-primary-tab>
       </md-tabs>
       <div
@@ -42,17 +47,17 @@ export const SidePanelTabs: Component<Props> = (props) => {
         style={{ display: tab() === 0 ? 'flex' : 'none' }}
       >
         <Show
-          when={props.chunk}
+          when={readingBranch()} keyed
           fallback={
             <NotePanel
               noteId={props.noteId}
               cardKey={props.cardKey}
               blocked={props.blocked}
-              active={tab() === 0}
+              active={props.active !== false && tab() === 0}
             />
           }
         >
-          <ReadingPanel chunk={props.chunk!} reloadToken={props.noteReloadToken} active={tab() === 0} />
+          {branch=><ReadingPanel chunk={branch.current()} reloadToken={props.noteReloadToken} active={props.active !== false && tab() === 0} />}
         </Show>
       </div>
       <div
@@ -60,7 +65,7 @@ export const SidePanelTabs: Component<Props> = (props) => {
         style={{ display: tab() === 1 ? 'flex' : 'none' }}
       >
         <Show
-          when={props.chunk}
+          when={readingBranch()} keyed
           fallback={
             <RelatedPanel
               noteId={props.noteId}
@@ -70,7 +75,7 @@ export const SidePanelTabs: Component<Props> = (props) => {
             />
           }
         >
-          <RelatedPanel chunk={props.chunk!} refreshToken={props.refreshToken} />
+          {branch=><RelatedPanel pageSource={props.pageSource} chunk={branch.current()} refreshToken={props.refreshToken} />}
         </Show>
       </div>
     </div>

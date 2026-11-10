@@ -1,3 +1,4 @@
+import type {PageSource,PageLocator} from './lib/lecture-api'
 // Wire shapes of the review-app FastAPI backend (app.py).
 
 export interface Card {
@@ -145,7 +146,9 @@ export interface ReadingSourceCrumb {
   cards_created: number[]
 }
 
-export interface ReadingSource {
+export interface MarkdownReadingSource {
+  kind?: 'markdown'
+  authoring_id?:never
   path: string
   seg_id: number
   status: string
@@ -213,7 +216,8 @@ export type ReadingChunkStatus =
   | 'background' | 'container'
 
 /** One dealt reading chunk (wire shape of /api/reading/start chunks). */
-export interface ReadingChunk {
+export interface MarkdownReadingChunk {
+  kind?: 'markdown'
   path: string
   chunk_key: string
   seg_id: number | null
@@ -239,19 +243,39 @@ export interface ReadingChunk {
 
 /** Per-file summary row of the 阅读清单 (/api/reading/status list). */
 export interface ReadingFileSummary {
+  kind?: 'pdf' | 'markdown'
   path: string
   title: string
   missing?: boolean
+  needs_resync?: boolean
   total_chunks: number
   todo: number
   active: number
   done: number
   skipped: number
+  background?: number
+  total_chars?: number
+  read_chars?: number
+  active_chars?: number
+  todo_chars?: number
+  done_chars?: number
+  skipped_chars?: number
+  background_chars?: number
+  total_pages?: number
+  read_pages?: number
+  active_pages?: number
+  todo_pages?: number
+  done_pages?: number
+  skipped_pages?: number
+  background_pages?: number
   frontier: {
     chunk_key: string
     status: ReadingChunkStatus
     title: string
-    line_start: number
+    line_start?: number
+    line_end?: number
+    chars?: number
+    preview?: string
   } | null
   /** chunks held by the preview-pool gate (cards not all released yet) —
    * B·二段重推, user spec 2026-09-19 round 3; SEGMENT-LEVEL since the
@@ -265,7 +289,10 @@ export interface ReadingFileSummary {
     chunk_key: string
     status: ReadingChunkStatus
     title: string
-    line_start: number
+    line_start?: number
+    line_end?: number
+    chars?: number
+    preview?: string
   } | null
   orphans: number
   cards_created: number
@@ -347,6 +374,11 @@ export interface ReadingStateResponse {
 }
 
 export interface ReadingCorpusFile {
+  kind?: 'pdf'
+  document_id?: string
+  revision_id?: string
+  status?: string
+  page_count?: number
   path: string
   title: string
   in_list: boolean
@@ -354,6 +386,7 @@ export interface ReadingCorpusFile {
    * restores the progress; the picker offers 重新播种 (fresh=true) instead
    * (whole-file seeding escape hatch, 2026-09-24) */
   archived?: boolean
+  chars?: number
 }
 
 /** Reading fields riding on /api/status + /api/session/state. */
@@ -387,3 +420,36 @@ export interface EngineStatus {
   last_sync_error?: string | null
   [key: string]: unknown
 }
+
+/** PDF pages are a separate discriminated shape. The optional never fields
+ * permit legacy generic UI to inspect absence, never fabricated line numbers. */
+export interface PdfReadingChunk extends PageSource {
+ kind:'pdf'
+ path:string
+ chunk_key:string
+ status:ReadingChunkStatus
+ title:string
+ heading_path:string[]
+ text:string
+ cards_created:number[]
+ ancestor_cards:number[]
+ file_chunks:number
+ file_done:number
+ file_skipped:number
+ authoring_id?:string
+ seg_id?:never
+ parent_seg_id?:never
+ line_start?:never
+ line_end?:never
+ fingerprint?:never
+ edit_revision?:never
+}
+export type ReadingChunk=MarkdownReadingChunk|PdfReadingChunk
+export interface PdfReadingSource extends PdfReadingChunk {
+ effective_source?:PageLocator|null
+ effective_chunk?:PageSource|null
+ ownership_error?:string|null
+ stale:boolean
+ breadcrumb:ReadingSourceCrumb[]
+}
+export type ReadingSource=MarkdownReadingSource|PdfReadingSource

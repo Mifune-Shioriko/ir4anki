@@ -2,10 +2,16 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 import { createRoot, createSignal, createEffect } from 'solid-js'
-const which=process.argv[2]
+const which=process.argv[2]??new URL(import.meta.url).searchParams.get('case')
+// Default runs the three named cases in isolated module scopes; no empty PASS.
+if(!which){const runs=[];for(const name of ['F1','F3','F4'])try{await import(new URL('?case='+name,import.meta.url));runs.push({case:name,status:'PASS'})}catch(e){runs.push({case:name,status:'FAIL',stack:e.stack})}await new Promise(resolve=>process.stdout.write(JSON.stringify(runs,null,2)+'\n',resolve));process.exit(runs.some(r=>r.status==='FAIL')?1:0)}
+assert.ok(['F1','F3','F4'].includes(which),'Unknown findings case')
+
 const compile=s=>ts.transpileModule(s,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText
 const actual=(s,ctx,ret)=>new Function(...Object.keys(ctx),compile(s)+`;return ${ret}`)(...Object.values(ctx))
 const deferred=()=>{let resolve;return {promise:new Promise(r=>resolve=r),resolve}}
+function handler(source,name){const ast=ts.createSourceFile('FilesScreen.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);let code;function walk(n){if(ts.isFunctionDeclaration(n)&&n.name?.text===name)code=n.getText(ast);if(ts.isVariableDeclaration(n)&&n.name.getText(ast)===name&&n.initializer)code='const '+name+' = '+n.initializer.getText(ast);ts.forEachChild(n,walk)}walk(ast);assert.ok(code,'Actual handler absent: '+name);return code}
+function attribute(source,name){const ast=ts.createSourceFile('FilesScreen.tsx',source,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX);let code;function walk(n){if(ts.isJsxAttribute(n)&&n.name.getText(ast)===name)code=n.initializer.expression.getText(ast);ts.forEachChild(n,walk)}walk(ast);assert.ok(code,name);return code}
 const tick=()=>new Promise(r=>setTimeout(r,0))
 if(which==='F1') {
  const {FileOperations}=await import('../src/lib/fileOperations.ts')
@@ -14,32 +20,31 @@ if(which==='F1') {
  const files=readFileSync(new URL('../src/components/FilesScreen.tsx',import.meta.url),'utf8')
  const remapPath=(p,o,n)=>p===null?null:p===o||p.startsWith(o+'/')?n+p.slice(o.length):p
  for(const mode of ['lost-response','FS-recovery','DB-recovery','flow-recovery']) {
-  const state={selected:'a/n.md',currentDir:'a',focused:'a/n.md',expanded:new Set(['a','a/empty']),membership:new Set(['a/n.md']),listedPaths:new Set(['a/n.md']),rdChunks:[{path:'a/n.md',identity:9}],traceChunk:{path:'a/n.md'},traceSource:{path:'a/n.md'},addSource:{path:'a/n.md'},segEditChunk:{path:'a/n.md'},undo:null,viewer:0}
+  const state={selected:new Set(['a/n.md']),currentDir:'a',focused:'a/n.md',history:['a','a/empty'],preview:'a/n.md',files:[{path:'a/n.md'}],dirs:['a','a/empty'],membership:new Set(['a/n.md']),listedPaths:new Set(['a/n.md']),rdChunks:[{path:'a/n.md',identity:9}],traceChunk:{path:'a/n.md'},traceSource:{path:'a/n.md'},addSource:{path:'a/n.md'},segEditChunk:{path:'a/n.md'},undo:null,viewer:0}
   const setter=k=>v=>state[k]=typeof v==='function'?v(state[k]):v
   const ctx={createSignal:v=>{let s=v;return [()=>s,v=>s=typeof v==='function'?v(s):v]},remapPath,srcCache:new Map([[42,{path:'a/n.md'}]]),traceSource:()=>state.traceSource,setTraceOpen(){}}
   for(const k of ['rdChunks','traceChunk','traceSource','addSource','segEditChunk','listedPaths'])ctx['set'+k[0].toUpperCase()+k.slice(1)]=setter(k)
   const start=app.indexOf('  const [sourceGeneration, setSourceGeneration]'),end=app.indexOf('  onMount(() => { window.addEventListener',start)
   const parent=actual(app.slice(start,end),ctx,'({relocateSources})')
   let events=0,invalidated=[]
-  const fctx={remapPath,window:{dispatchEvent:e=>{events++;parent.relocateSources(e)}},CustomEvent:class{constructor(name,options){this.detail=options.detail}},scrollPositions:new Map([['a/n.md',120]]),invalidateFileCache:p=>invalidated.push(p),setViewerVersion:setter('viewer')}
-  for(const k of ['selected','currentDir','focused','expanded','membership'])fctx['set'+k[0].toUpperCase()+k.slice(1)]=setter(k)
-  const fs=files.indexOf('  const applyRelocation ='),fe=files.indexOf('  const operations =',fs)
-  const apply=actual('let previewReadyPath=null;'+files.slice(fs,fe),fctx,'applyRelocation')
+  const fctx={remapPath,window:{dispatchEvent:e=>{events++;parent.relocateSources(e)}},CustomEvent:class{constructor(name,options){this.detail=options.detail}},scrollPositions:new Map([['a/n.md',120]]),invalidateFileCache:p=>invalidated.push(p),alive:true,owner:{},requestDraftLeave:()=>true,previewPath:()=>state.preview,setPreviewPath:setter('preview'),setHistory:setter('history'),setFiles:setter('files'),setDirs:setter('dirs'),setVersion:setter('viewer')}
+  for(const k of ['selected','currentDir','focused','membership'])fctx['set'+k[0].toUpperCase()+k.slice(1)]=setter(k)
+  const apply=actual(handler(files,'applyRelocation'),fctx,'applyRelocation')
   const store=new Map(),storage={getItem:k=>store.get(k)??null,setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)}
   let statusDown=true,ids=[],calls=0
   const result={status:'complete',old_path:'a',path:'dest/a',operationId:'fixture-'+mode}
   const api={filesMove:async(p,v,id)=>{calls++;ids.push(id);throw new Error(mode)},filesRename:async()=>{throw new Error('unexpected')},filesOperation:async id=>{ids.push(id);if(statusDown)throw new Error('connection unavailable');return result}}
   const ops=new FileOperations(api,storage,(r,old)=>{apply(old,r.path);state.undo=r.operationId})
   await assert.rejects(ops.run('move','a','dest'),/待确认/)
-  assert.equal(state.selected,'a/n.md');assert.equal(events,0);assert(ops.hasPending())
+  assert.deepEqual([...state.selected],['a/n.md']);assert.equal(events,0);assert(ops.hasPending())
   statusDown=false
   await Promise.all([ops.reconcile(),ops.reconcile()])
-  for(const k of ['selected','focused'])assert.equal(state[k],'dest/a/n.md')
-  assert.equal(state.currentDir,'dest/a');assert(state.expanded.has('dest/a/empty'))
+  assert.deepEqual([...state.selected],['dest/a/n.md']);assert.equal(state.focused,'dest/a/n.md');assert.equal(state.preview,'dest/a/n.md')
+  assert.equal(state.currentDir,'dest/a');assert.deepEqual(state.history,['dest/a','dest/a/empty']);assert.equal(state.files[0].path,'dest/a/n.md');assert.deepEqual(state.dirs,['dest/a','dest/a/empty'])
   for(const k of ['traceChunk','traceSource','addSource','segEditChunk'])assert.equal(state[k].path,'dest/a/n.md')
   assert.equal(state.rdChunks[0].path,'dest/a/n.md');assert.equal(state.rdChunks[0].identity,9)
   assert.equal(ctx.srcCache.get(42).path,'dest/a/n.md');assert(state.listedPaths.has('dest/a/n.md'));assert(state.membership.has('dest/a/n.md'))
-  assert.equal(fctx.scrollPositions.get('dest/a/n.md'),120);assert.deepEqual(invalidated,['a','dest/a'])
+  assert.equal(state.viewer,1,'Current preview/cache reload generation advances once');assert.deepEqual(invalidated,['a','dest/a'])
   assert.equal(state.undo,result.operationId);assert.equal(events,1);assert.equal(calls,1);assert.equal(new Set(ids).size,1)
   await ops.reconcile();assert.equal(events,1);assert.equal(store.size,0)
   console.log('PASS F1 '+mode+' uncertain→refresh→canonical actual tree/parent/cache/undo mapping once')
@@ -99,50 +104,36 @@ if(which==='F1') {
   })().catch(e=>{dispose();reject(e)})
  }))
  console.log('PASS F4 actual reactive source effect: delayed lookup + unrelated/matching relocation, same card, stale rejection')
-} else if(which==='F3') {
+ } else if(which==='F3') {
+ // Current design uses native HTML drag events; browser pointer capture and
+ // outside/blur delivery are UA-owned. Exercise actual application handlers,
+ // not the removed custom pointerDown/pointerMove/pointerUp implementation.
+ const {normalizeTargets,moveError,editingEvent}=await import('../src/lib/files-browser.ts')
  const source=readFileSync(new URL('../src/components/FilesScreen.tsx',import.meta.url),'utf8')
- const start=source.indexOf('  // Pointer threshold'),end=source.indexOf('  const contextMenu',start)
- let drag=null,drop=null,moves=[],folder='',captured=false,hit=true
- const listeners=new Map(),mounts=[]
- const window={addEventListener:(n,fn)=>listeners.set(n,fn),removeEventListener(){}}
- const document={hidden:false,addEventListener:(n,fn)=>listeners.set(n,fn),removeEventListener(){},elementFromPoint:()=>hit?{closest:()=>({dataset:{folder}})}:null}
- let captures=0
- const row={setPointerCapture(){captured=true;captures++},hasPointerCapture:()=>captured,releasePointerCapture(){captured=false}}
- class Element { constructor(selector=null){this.selector=selector} matches(selectors){return selectors.split(',').map(s=>s.trim()).includes(this.selector)} }
- const ctx={Element,createSignal:v=>{let value=v;return [()=>value,x=>value=x]},window,document,onMount:fn=>mounts.push(fn),onCleanup(){},busy:()=>false,validMove:(p,d,dest)=>dest!==p&&dest!=='a',executeMove:async(t,d)=>moves.push([t.path,d]),setDirOpen(){},showSnack(){},requestAnimationFrame:()=>1,cancelAnimationFrame(){},setTimeout:fn=>{fn();return 1},clearTimeout(){}}
- const h=actual(source.slice(start,end),ctx,'({pointerDown,pointerMove,pointerUp,getClickSuppressed:()=>suppressClick})');mounts.forEach(f=>f())
- const event=(extra={})=>({button:0,buttons:1,pointerType:'mouse',pointerId:1,clientX:10,clientY:10,currentTarget:row,target:{closest:()=>null},composedPath:()=>[new Element(),row],preventDefault(){},...extra})
- // Actual pointerDown: menus/controls in real shadow/slotted paths never
- // create a candidate or capture. Pointermove after their click cannot move.
- for(const tag of ['md-menu','md-menu-item','md-icon-button','button','a','input','textarea','select','chevron','contenteditable']) {
-  const before=captures
-  h.pointerDown(event({composedPath:()=>[new Element(),new Element(tag==='chevron'?'.files-tree-chevron':tag==='contenteditable'?'[contenteditable]:not([contenteditable="false"])':tag),row]}),{path:'a/n.md',isDir:false})
-  assert.equal(captured,false,tag+' captured row');assert.equal(captures,before,tag+' requested capture')
-  h.pointerMove(event({clientX:30}));h.pointerUp(event({buttons:0}));assert.equal(moves.length,0,tag+' created drag candidate')
+ class Element {constructor(selector=''){this.selector=selector}matches(s){return s.split(',').map(x=>x.trim()).includes(this.selector)}closest(s){return this.selector==='.files-menu'&&s.includes('.files-menu')?this:null}}
+ globalThis.Element=Element
+ let drag=[],drop=null,selected=new Set(['a/n.md']),focused='a/n.md',blocked=false,allow=true,external=false,previewed=0
+ const moves=[],messages=[],entries=[{path:'a/n.md',isDir:false}],row={}
+ const ctx={normalizeTargets,moveError,editingEvent,all:()=>entries,rows:()=>entries,selected:()=>selected,targets:()=>entries.filter(t=>selected.has(t.path)),setSelected:v=>selected=typeof v==='function'?v(selected):v,focused:()=>focused,setFocused:v=>focused=v,busy:()=>blocked,requestDraftLeave:()=>allow,setDrag:v=>drag=v,drag:()=>drag,setDrop:v=>drop=v,setExternalDrop:v=>external=v,setMessage:v=>messages.push(v),relocation:async(kind,items,dest)=>moves.push([items.map(t=>t.path),dest]),dialog:()=>null,drawer:()=>false,previewPath:()=>null,preview:()=>previewed++}
+ const code= ['startDrag','over','dropped','key','choose'].map(n=>handler(source,n)).join('\n')+`;const endDrag=${attribute(source,'onDragEnd')};const freshPointer=${attribute(source,'onPointerDown')}`
+ const h=actual('let suppressClick=false,anchor="";'+code,ctx,'({startDrag,over,dropped,key,choose,endDrag,freshPointer,suppressed:()=>suppressClick})')
+ const event=(types=[])=>({types,dataTransfer:{types,effectAllowed:'',dropEffect:'',setData(k,v){this[k]=v}},preventDefault(){this.prevented=true},stopPropagation(){},composedPath:()=>[],key:'Escape'})
+ // Keyboard/menu controls must not become Files keyboard operations, including
+ // Material shadow paths. The old tree chevron is now a directory button.
+ for(const tag of ['md-menu','md-menu-item','md-icon-button','button','a','input','textarea','select','[contenteditable]:not([contenteditable="false"])','.files-menu']){
+  const e={...event(),key:'Enter',composedPath:()=>[new Element(),new Element(tag),row]};h.key(e);assert.equal(previewed,0,tag+' escaped editing scope');assert.equal(moves.length,0)
  }
- h.pointerDown(event(),{path:'a/n.md',isDir:false});assert.equal(captured,false,'ordinary pointerdown captures before threshold')
- h.pointerMove(event({clientX:12}));assert.equal(captured,false,'sub-threshold movement captures')
- h.pointerUp(event({buttons:0}));assert.equal(moves.length,0,'ordinary row click moves')
- for(const cancel of ['blur','visibilitychange','lostpointercapture','buttons','outside']) {
-  h.pointerDown(event(),{path:'a/n.md',isDir:false});h.pointerMove(event({clientX:30}));assert.equal(captured,true,'drag threshold acquires capture')
-  if(cancel==='buttons') h.pointerMove(event({buttons:0}))
-  else if(cancel==='outside'){hit=false;h.pointerUp(event({buttons:0}));hit=true}
-  else {document.hidden=cancel==='visibilitychange';listeners.get(cancel)?.(event());document.hidden=false}
-  h.pointerMove(event({buttons:0}));h.pointerUp(event({buttons:0}));assert.equal(moves.length,0,cancel+' leaves candidate')
+ for(const guard of ['busy','unsafe-draft']){blocked=guard==='busy';allow=guard!=='unsafe-draft';const e=event();h.startDrag(e,entries[0]);assert.equal(e.prevented,true);assert.equal(drag.length,0)}blocked=false;allow=true
+ // No drop callback means no mutation. Native dragend and application Escape
+ // both clear the candidate so a later stale drop cannot move anything.
+ for(const cancel of ['blur','visibilitychange','lostpointercapture','buttons','outside']){
+  h.startDrag(event(),entries[0]);assert.equal(drag.length,1);assert.equal(moves.length,0);h.endDrag();assert.equal(drag.length,0);assert.equal(drop,null);h.dropped(event(),'');assert.equal(moves.length,0,cancel+' stale drop dispatched')
  }
- h.pointerDown(event(),{path:'a/n.md',isDir:false});h.pointerMove(event({clientX:30}));h.pointerUp(event({buttons:0}));assert.deepEqual(moves,[['a/n.md','']])
- // Run all queued timeout callbacks (fixture setTimeout is immediate) before
- // the actual post-pointerup click; suppression must survive that boundary.
- assert.equal(h.getClickSuppressed(),true,'post-drag suppression expired before native click')
- let prevented=false,stopped=false
- const ghost={detail:1,preventDefault(){prevented=true},stopImmediatePropagation(){stopped=true}}
- listeners.get('click')(ghost)
- assert(prevented&&stopped);assert.equal(h.getClickSuppressed(),false)
- h.pointerDown(event(),{path:'a/n.md',isDir:false});h.pointerMove(event({clientX:30}));h.pointerUp(event({buttons:0}))
- prevented=false;stopped=false;listeners.get('click')({...ghost,detail:0})
- assert.equal(prevented,false,'keyboard activation swallowed');assert.equal(stopped,false)
- listeners.get('pointerdown')(event())
- assert.equal(h.getClickSuppressed(),false,'fresh pointerdown did not release suppression')
- listeners.get('click')(ghost);assert.equal(stopped,false,'ordinary next pointer click swallowed')
- console.log('PASS F3 interactive composed paths excluded, capture only beyond threshold; actual drag handlers: blur/hidden/lostcapture/buttons=0/outside release cancel; next click safe; root drop works')
+ h.startDrag(event(),entries[0]);h.key(event());h.dropped(event(),'');assert.equal(moves.length,0,'Escape did not revoke drag')
+ selected=new Set(['a/n.md']);h.startDrag(event(),entries[0]);const invalid=event();h.over(invalid,'a');assert.equal(invalid.dataTransfer.dropEffect,'none');h.dropped(invalid,'a');assert.equal(moves.length,0);assert(messages.length)
+ h.startDrag(event(),entries[0]);const valid=event();h.over(valid,'');assert.equal(valid.dataTransfer.dropEffect,'move');h.dropped(valid,'');assert.deepEqual(moves,[[['a/n.md'],'']]);assert.equal(h.suppressed(),true)
+ const before=new Set(selected);h.choose(entries[0]);assert.deepEqual(selected,before);assert.equal(h.suppressed(),false,'Post-drag click suppression must clear after consuming ghost click')
+ h.startDrag(event(),entries[0]);h.endDrag();h.key({...event(),key:'Enter'});assert.equal(previewed,1,'Keyboard activation swallowed by drag click suppression');h.freshPointer();assert.equal(h.suppressed(),false)
+ const ext=event(['Files']);h.over(ext,'');assert.equal(ext.dataTransfer.dropEffect,'none');assert.equal(external,true);h.dropped(ext,'');assert.equal(moves.length,1,'External file drop moved internal entry')
+ console.log('PASS F3 actual native-handler guards, composed keyboard controls, cancel/end stale-drop rejection, invalid/root/external drop and ghost/fresh-pointer/keyboard activation. UA drag delivery remains browser-gated.')
 }

@@ -1,28 +1,18 @@
-import { Component, For, Show, createSignal, onMount } from 'solid-js'
+import { Component, For, Show, createMemo, createSignal, onMount } from 'solid-js'
 import { api } from '../api'
+import { lectureRequest } from '../lib/lecture-api'
 import type { ReadingCorpusFile, ReadingFileSummary } from '../types'
 import { buildTree, allDirPaths } from '../lib/tree'
 import type { TreeNode } from '../lib/tree'
+import { filterTree } from '../lib/files-state'
 import {
-  IconArrowUpward, IconChevronRight, IconClose, IconDescription, IconFolder,
-  IconMenuBook, IconVerticalAlignTop,
+  IconArrowDownward, IconArrowUpward, IconChevronRight, IconClose, IconDescription, IconFolder,
+  IconMenuBook, IconRestartAlt, IconVerticalAlignTop,
 } from './icons'
 
-// 阅读清单 management screen (渐进制卡, user spec 2026-09-19): files are
-// opt-in (the corpus mixes study notes with misc logs) and manually ordered
-// — top of list = highest priority (decision #2: 置顶/上移 buttons, no
-// drag-and-drop in v1). Each row shows progress (done+skipped / total), the
-// frontier status, a drift warning badge and a remove button (progress is
-// archived server-side, so re-adding restores it).
-//
-// 「添加文件」 opens a corpus picker rendered as a FOLDER TREE (user spec
-// 2026-09-19 round 2 — 像正经的文件管理器: 文件夹可展开，里面是子文件夹
-// 或文件). The tree is built client-side from the flat /api/reading/corpus
-// paths (year/科目/文件.md) via the SHARED lib/tree.ts (the 文件 browser
-// uses the same builder). The dialog STAYS OPEN across adds for batch
-// adding; files already in the list render as 已加入 (disabled). All
-// mutations go through /api/reading/list/* and re-read the status
-// afterwards (single source of truth = the backend's list order).
+// Reading workbench uses the same elevated panes and compact headers as 文件.
+// The narrow corpus picker keeps search, counts and archived-progress actions;
+// the wider priority list keeps dual-segment progress, frontier and reorder controls.
 
 interface Props {
   onBack?: () => void
@@ -37,29 +27,38 @@ const FRONTIER_LABEL: Record<string, string> = {
   active: '正在制卡',
   done: '制卡完成',
   skipped: '已跳过',
-  // held by the preview-pool gate (B·二段重推, round 3) — not a stored
-  // status; the list screen maps gated_frontier.status to this label when
-  // the chunk is currently held
   held: '等卡片过预览池',
 }
+
+const fmtNum = (n: number | undefined): string =>
+  (n ?? 0).toLocaleString('zh-CN')
+
+const calcPercent = (part: number, total: number): number =>
+  total > 0 ? Math.min(100, Math.round((part / total) * 100)) : 0
 
 export const ReadingListScreen: Component<Props> = (props) => {
   const [list, setList] = createSignal<ReadingFileSummary[]>([])
   const [corpus, setCorpus] = createSignal<ReadingCorpusFile[]>([])
-  const [pickerOpen, setPickerOpen] = createSignal(false)
   const [removeTarget, setRemoveTarget] = createSignal<ReadingFileSummary | null>(null)
+  const [error, setError] = createSignal('')
+  const [message, setMessage] = createSignal('')
   const [loading, setLoading] = createSignal(true)
   const [actionBusy, setActionBusy] = createSignal(false)
-  // expanded folders in the picker tree (by dir path); root dirs start open
   const [expanded, setExpanded] = createSignal<Set<string>>(new Set())
+  const [query, setQuery] = createSignal('')
+  const [initializedTree, setInitializedTree] = createSignal(false)
 
   const reload = async () => {
     try {
       const [status, corp] = await Promise.all([api.readingStatus(), api.readingCorpus()])
       setList(status.list)
       setCorpus(corp.files)
+      if (!initializedTree()) {
+        setExpanded(allDirPaths(buildTree(corp.files)))
+        setInitializedTree(true)
+      }
     } catch {
-      /* status screen degrades to empty; the back button always works */
+      setError('读取清单失败，请稍后重试。')
     } finally {
       setLoading(false)
     }
@@ -71,12 +70,15 @@ export const ReadingListScreen: Component<Props> = (props) => {
   const mutate = async (fn: () => Promise<unknown>) => {
     if (busyNow()) return
     setActionBusy(true)
+    setError('')
+    setMessage('')
     try {
       await fn()
       await reload()
       props.onListChange?.()
+      setMessage('阅读清单已更新')
     } catch (e) {
-      alert('操作失败：' + (e as Error).message)
+      setError('操作失败：' + (e as Error).message)
     } finally {
       setActionBusy(false)
     }
@@ -86,12 +88,19 @@ export const ReadingListScreen: Component<Props> = (props) => {
     mutate(() => api.readingListReorder({ path: s.path }))
   const moveTop = (s: ReadingFileSummary) =>
     mutate(() => api.readingListReorder({ path: s.path, top: true }))
-  const addFile = (f: { path: string }, fresh = false) =>
-    // keep the dialog OPEN after an add (batch adding several files is the
-    // common case); the picker list refreshes via reload() and the just-added
-    // file drops out of notListed(). fresh=true discards parked progress and
-    // re-seeds whole-file (2026-09-24 逃生口 for pre-cut legacy entries).
-    mutate(() => api.readingListAdd(f.path, fresh))
+  const moveDown = (idx: number) => {
+    const items = list()
+    if (idx < 0 || idx >= items.length - 1) return
+    const order = items.map(x => x.path)
+    const tmp = order[idx]
+    order[idx] = order[idx + 1]
+    order[idx + 1] = tmp
+    mutate(() => api.readingListReorder({ order }))
+  }
+  const addFile = (f: { path: string; kind?: 'pdf'; document_id?: string; revision_id?: string }, fresh = false) =>
+    mutate(() => f.kind === 'pdf'
+      ? lectureRequest(`/${f.document_id}/revisions/${f.revision_id}/read`, 'POST')
+      : api.readingListAdd(f.path, fresh))
   const confirmRemove = () => {
     const t = removeTarget()
     if (!t) return
@@ -101,10 +110,33 @@ export const ReadingListScreen: Component<Props> = (props) => {
     })
   }
 
-  const progress = (s: ReadingFileSummary) => s.done + s.skipped
-  // tree over the WHOLE corpus; files already in the list show as 已加入
-  const tree = () => buildTree(corpus())
-  const isOpen = (path: string) => expanded().has(path)
+  const isPdf = (s: ReadingFileSummary) => s.kind === 'pdf'
+  const unitName = (s: ReadingFileSummary) => (isPdf(s) ? '页' : '字')
+  const totalUnits = (s: ReadingFileSummary) =>
+    isPdf(s) ? (s.total_pages ?? s.total_chunks) : (s.total_chars ?? 0)
+  const readUnits = (s: ReadingFileSummary) =>
+    isPdf(s)
+      ? (s.read_pages ?? (s.done + s.skipped + (s.background ?? 0)))
+      : (s.read_chars ?? 0)
+  const activeUnits = (s: ReadingFileSummary) =>
+    isPdf(s) ? (s.active_pages ?? s.active) : (s.active_chars ?? 0)
+
+  const readRatio = (s: ReadingFileSummary) => {
+    const tot = totalUnits(s)
+    if (tot > 0) return Math.min(1, readUnits(s) / tot)
+    return s.total_chunks > 0
+      ? (s.done + s.skipped + (s.background ?? 0)) / s.total_chunks
+      : 0
+  }
+  const activeRatio = (s: ReadingFileSummary) => {
+    const tot = totalUnits(s)
+    if (tot > 0) return Math.min(1 - readRatio(s), activeUnits(s) / tot)
+    return 0
+  }
+
+  const fullTree = createMemo(() => buildTree(corpus()))
+  const tree = createMemo(() => filterTree(fullTree(), query()))
+  const isOpen = (path: string) => query().trim() !== '' || expanded().has(path)
   const toggleDir = (path: string) =>
     setExpanded(prev => {
       const next = new Set(prev)
@@ -112,24 +144,21 @@ export const ReadingListScreen: Component<Props> = (props) => {
       else next.add(path)
       return next
     })
-  // open the picker with every folder pre-expanded (small corpus — showing
-  // the whole tree beats making the user click into each folder)
-  const openPicker = () => {
-    setExpanded(allDirPaths(tree()))
-    setPickerOpen(true)
-  }
-  const pendingInTree = () => {
-    let n = 0
-    const count = (nodes: TreeNode[]) =>
-      nodes.forEach(x => {
-        if (x.kind === 'dir') { count(x.dirs); count(x.files) }
-        else if (x.file && !x.file.in_list) n++
-      })
-    count(tree())
-    return n
+  const expandAll = () => setExpanded(allDirPaths(fullTree()))
+
+  const pendingInTree = createMemo(() =>
+    corpus().filter(f => !f.in_list).length
+  )
+
+  const frontierText = (
+    s: ReadingFileSummary,
+    f: NonNullable<ReadingFileSummary['frontier']>,
+  ): string => {
+    const lineTag = (f.line_start ?? 0) > 1 ? `L${f.line_start} · ` : ''
+    const snippet = f.preview && f.preview !== s.title ? f.preview : f.title
+    return `${lineTag}${snippet}`
   }
 
-  // recursive tree rows (depth → indent)
   const TreeRows: Component<{ nodes: TreeNode[]; depth: number }> = (tp) => (
     <For each={tp.nodes}>
       {node =>
@@ -137,14 +166,15 @@ export const ReadingListScreen: Component<Props> = (props) => {
           <>
             <div
               class="reading-tree-dir"
-              style={{ 'padding-left': `${tp.depth * 18 + 4}px` }}
+              title={node.path}
+              style={{ 'padding-left': `${tp.depth * 16 + 8}px` }}
               onClick={() => toggleDir(node.path)}
             >
               <span class={`reading-tree-chevron${isOpen(node.path) ? ' reading-tree-chevron--open' : ''}`}>
                 <IconChevronRight size={18} />
               </span>
               <md-icon class="reading-tree-icon"><IconFolder /></md-icon>
-              <span class="md-typescale-title-small">{node.name}</span>
+              <span class="reading-tree-dir__name md-typescale-title-small">{node.name}</span>
             </div>
             <Show when={isOpen(node.path)}>
               <TreeRows nodes={node.dirs} depth={tp.depth + 1} />
@@ -154,34 +184,43 @@ export const ReadingListScreen: Component<Props> = (props) => {
         ) : (
           <div
             class="reading-tree-file"
+            title={node.path}
             classList={{ 'reading-tree-file--added': !!node.file?.in_list }}
-            style={{ 'padding-left': `${tp.depth * 18 + 4}px` }}
+            style={{ 'padding-left': `${tp.depth * 16 + 8}px` }}
           >
             <md-icon class="reading-tree-icon"><IconDescription /></md-icon>
             <div class="reading-tree-file__text">
-              <div class="md-typescale-title-small">{node.name}</div>
+              <div class="reading-tree-file__title md-typescale-body-medium">{node.name}</div>
+              <Show when={(node.file?.chars ?? 0) > 0 || (node.file?.page_count ?? 0) > 0}>
+                <div class="reading-tree-file__meta md-typescale-label-small">
+                  {node.file?.kind === 'pdf'
+                    ? `${fmtNum(node.file?.page_count)} 页`
+                    : `${fmtNum(node.file?.chars)} 字`}
+                  {node.file?.archived && !node.file?.in_list ? ' · 有存档进度' : ''}
+                </div>
+              </Show>
             </div>
-            <Show
-              when={!node.file?.in_list}
-              fallback={<span class="reading-tree-added md-typescale-label-small">已加入</span>}
-            >
-              {/* 有存档进度的文件：默认加入=恢复进度；重新播种=丢弃进度按
-                  整文件播种（预切片退役逃生口，2026-09-24） */}
-              <Show when={node.file?.archived}>
+            <div class="reading-tree-file__actions">
+              <Show
+                when={!node.file?.in_list}
+                fallback={<span class="reading-tree-added md-typescale-label-small">已加入</span>}
+              >
+                <Show when={node.file?.kind !== 'pdf' && node.file?.archived}>
+                  <md-text-button
+                    disabled={busyNow()}
+                    onClick={() => node.file && addFile(node.file, true)}
+                  >
+                    重新播种
+                  </md-text-button>
+                </Show>
                 <md-text-button
                   disabled={busyNow()}
-                  onClick={() => node.file && addFile(node.file, true)}
+                  onClick={() => node.file && addFile(node.file)}
                 >
-                  重新播种
+                  {node.file?.archived ? '恢复进度' : '加入清单'}
                 </md-text-button>
               </Show>
-              <md-text-button
-                disabled={busyNow()}
-                onClick={() => node.file && addFile(node.file)}
-              >
-                {node.file?.archived ? '恢复进度' : '加入清单'}
-              </md-text-button>
-            </Show>
+            </div>
           </div>
         )
       }
@@ -189,143 +228,235 @@ export const ReadingListScreen: Component<Props> = (props) => {
   )
 
   return (
-    <div class="screen">
-      <md-elevated-card class="screen-card reading-list-card">
-        <div class="screen-content">
-          <h1 class="screen-title md-typescale-headline-small">阅读清单</h1>
-          <p class="screen-detail md-typescale-body-medium">
-            排在前面的文件先推进；一个文件内按顺序读，每轮每篇最多推两段，前一段没完成不会推更后面的。
-            今天制过卡的片段当天不再重推（等卡片次日放行后恢复），文件其余部分照常推进；补卡后点「制卡完成」解锁下一段。
-            移出清单不会丢进度，重新添加即恢复。
-          </p>
+    <div class="reading-workbench">
+      {/* ---- Left column: Corpus file picker tree ---- */}
+      <md-elevated-card class="reading-corpus-card reading-picker-dialog" role="region" aria-label="语料库文件">
+        <div class="reading-corpus-inner">
+          <div class="reading-corpus-head">
+            <div>
+              <h2 class="md-typescale-title-small">语料库文件</h2>
+            </div>
+            <div class="reading-corpus-head__actions">
+              <md-text-button onClick={expandAll} disabled={busyNow()}>
+                全部展开
+              </md-text-button>
+              <md-icon-button aria-label="刷新" onClick={reload} disabled={busyNow()}>
+                <md-icon><IconRestartAlt size={18} /></md-icon>
+              </md-icon-button>
+            </div>
+          </div>
 
-          <Show when={loading()}>
-            <div class="reading-list-loading">
-              <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />
+          <div class="reading-picker-hint md-typescale-label-small">
+            待加入 {pendingInTree()} 篇 · 共 {corpus().length} 篇
+          </div>
+          <input
+            class="reading-corpus-search"
+            type="search"
+            aria-label="搜索语料文件"
+            placeholder="搜索文件名或路径…"
+            value={query()}
+            onInput={e => setQuery(e.currentTarget.value)}
+          />
+
+          <Show when={!loading() && corpus().length === 0}>
+            <div class="reading-picker-empty md-typescale-body-medium">
+              还没有可读内容。可先在「文件」页上传笔记或导入 PDF / PPTX。
             </div>
           </Show>
 
-          <Show when={!loading() && list().length === 0}>
-            <div class="reading-list-empty md-typescale-body-medium">
-              <md-icon class="reading-list-empty-icon"><IconMenuBook /></md-icon>
-              清单还是空的——点下面的「添加文件」把要读的笔记加进来。
+          <Show when={!loading() && corpus().length > 0 && tree().length === 0}>
+            <div class="reading-picker-empty md-typescale-body-medium" role="status">
+              没有匹配的文件，试试其他文件名或路径。
             </div>
           </Show>
 
-          <div class="reading-list">
-            <For each={list()}>
-              {(s, i) => (
-                <div class="reading-list-item" classList={{ 'reading-list-item--missing': !!s.missing }}>
-                  <div class="reading-list-item__main">
-                    <div class="reading-list-item__title md-typescale-title-small">
-                      {s.title}
-                      <Show when={s.missing}>
-                        <span class="reading-badge reading-badge--warn">文件已不在语料中</span>
-                      </Show>
-                      <Show when={!s.missing && s.orphans > 0}>
-                        <span class="reading-badge reading-badge--warn">
-                          文件已变更 · {s.orphans} 段状态待确认
-                        </span>
-                      </Show>
-                    </div>
-                    <div class="reading-list-item__meta md-typescale-label-small">
-                      <span>{s.path.replace(/^\d{4}\//, '')}</span>
-                      <Show when={!s.missing}>
-                        <span>
-                          进度 {progress(s)} / {s.total_chunks}
-                          {s.active > 0 ? ` · 正在制卡 ${s.active}` : ''}
-                          {s.cards_created > 0 ? ` · 已制卡 ${s.cards_created}` : ''}
-                        </span>
-                      </Show>
-                    </div>
-                    <Show when={!s.missing}>
-                      <md-linear-progress
-                        class="reading-list-item__bar"
-                        value={s.total_chunks > 0 ? progress(s) / s.total_chunks : 0}
-                      />
-                    </Show>
-                    <div class="reading-list-item__frontier md-typescale-label-small">
-                      <Show when={s.frontier}>
-                        下一段：{s.frontier!.title}
-                        <span class={`reading-status-chip reading-status-${s.frontier!.status}`}>
-                          {FRONTIER_LABEL[s.frontier!.status] ?? s.frontier!.status}
-                        </span>
-                      </Show>
-                      {/* B·二段重推 (round 3): frontier held because its
-                          cards are still inside the preview pipeline */}
-                      <Show when={!s.frontier && s.gated_frontier}>
-                        下一段：{s.gated_frontier!.title}
-                        <span class="reading-status-chip reading-status-held">
-                          等卡片过预览池
-                        </span>
-                      </Show>
-                      <Show when={!s.frontier && !s.gated_frontier && !s.missing}>
-                        <span class="reading-frontier-done">全部读完 ✓</span>
-                      </Show>
-                    </div>
-                  </div>
-                  <div class="reading-list-item__actions">
-                    <md-icon-button
-                      aria-label="置顶"
-                      disabled={busyNow() || i() === 0}
-                      onClick={() => moveTop(s)}
-                    >
-                      <md-icon><IconVerticalAlignTop /></md-icon>
-                    </md-icon-button>
-                    <md-icon-button
-                      aria-label="上移"
-                      disabled={busyNow() || i() === 0}
-                      onClick={() => moveUp(s)}
-                    >
-                      <md-icon><IconArrowUpward /></md-icon>
-                    </md-icon-button>
-                    <md-icon-button
-                      aria-label="移出清单"
-                      disabled={busyNow()}
-                      onClick={() => setRemoveTarget(s)}
-                    >
-                      <md-icon><IconClose /></md-icon>
-                    </md-icon-button>
-                  </div>
-                </div>
-              )}
-            </For>
+          <div class="reading-tree" role="tree" aria-label="语料库目录树" aria-busy={loading()}>
+            <TreeRows nodes={tree()} depth={0} />
           </div>
-
-          <div class="screen-actions">
-            <md-filled-tonal-button onClick={openPicker} disabled={busyNow()}>
-              添加文件
-            </md-filled-tonal-button>
-          </div>
-          <Show when={props.onBack}>
-            <md-text-button onClick={() => props.onBack?.()} disabled={busyNow()}>
-              返回
-            </md-text-button>
-          </Show>
         </div>
       </md-elevated-card>
 
-      <Show when={pickerOpen()}>
-        <md-dialog class="reading-picker-dialog" open onClose={() => setPickerOpen(false)}>
-          <div slot="headline">选择要读的文件</div>
-          <div slot="content" class="reading-picker-list">
-            <div class="reading-picker-hint md-typescale-label-small">
-              待加入 {pendingInTree()} 个文件 · 点文件夹展开/收起 · 可连续添加
+      {/* ---- Right column: Reading list priority queue & character progress ---- */}
+      <md-elevated-card class="reading-queue-card reading-list-card" role="region" aria-label="阅读清单">
+        <div class="reading-queue-inner">
+          <div class="reading-queue-head">
+            <div class="reading-queue-head__title-row">
+              <h1 class="reading-queue-title md-typescale-title-small">阅读清单</h1>
+              <span class="reading-queue-count md-typescale-label-small">{list().length} 篇</span>
+              <Show when={props.onBack}>
+                <md-text-button onClick={() => props.onBack?.()} disabled={busyNow()}>
+                  返回
+                </md-text-button>
+              </Show>
             </div>
-            <Show when={corpus().length === 0}>
-              <div class="reading-picker-empty md-typescale-body-medium">
-                语料库里没有找到可读的 .md 文件。
+          </div>
+
+          <div class="reading-queue-body" aria-busy={loading()}>
+            <Show when={error()}><p role="alert" class="lecture-error">{error()}</p></Show>
+            <Show when={message()}><p role="status" class="reading-status-banner md-typescale-label-medium">{message()}</p></Show>
+            <Show when={loading()}>
+              <div class="reading-list-loading">
+                <md-circular-progress indeterminate style="--md-circular-progress-size:32px" />
               </div>
             </Show>
-            <div class="reading-tree">
-              <TreeRows nodes={tree()} depth={0} />
+
+            <Show when={!loading() && list().length === 0}>
+              <div class="reading-list-empty md-typescale-body-medium">
+                <md-icon class="reading-list-empty-icon"><IconMenuBook /></md-icon>
+                <div>清单还是空的——从左侧语料库目录树点击「加入清单」把要读的笔记加进来。</div>
+              </div>
+            </Show>
+
+            <div class="reading-list">
+              <For each={list()}>
+                {(s, i) => {
+                  const pct = () => calcPercent(readUnits(s), totalUnits(s))
+                  const unit = () => unitName(s)
+                  const doneSegs = () => s.done + s.skipped + (s.background ?? 0)
+                  const dirPath = () => {
+                    const stripped = s.path.replace(/^\d{4}\//, '')
+                    const slash = stripped.lastIndexOf('/')
+                    return slash > 0 ? stripped.slice(0, slash) : stripped
+                  }
+                  return (
+                    <div
+                      class="reading-list-item"
+                      classList={{
+                        'reading-list-item--missing': !!s.missing,
+                        'reading-list-item--top': i() === 0,
+                      }}
+                    >
+                      <div class="reading-list-item__rank" title={`优先级 #${i() + 1}`}>
+                        #{i() + 1}
+                      </div>
+
+                      <div class="reading-list-item__main">
+                        <div class="reading-list-item__header">
+                          <div class="reading-list-item__title md-typescale-title-small">
+                            {s.title}
+                            <span class="reading-list-item__path md-typescale-label-small">
+                              {dirPath()}
+                            </span>
+                            <Show when={s.missing}>
+                              <span class="reading-badge reading-badge--warn">文件已不在语料中</span>
+                            </Show>
+                            <Show when={!s.missing && s.orphans > 0}>
+                              <span class="reading-badge reading-badge--warn">
+                                文件已变更 · {s.orphans} 段状态待确认
+                              </span>
+                            </Show>
+                          </div>
+
+                          <div class="reading-list-item__actions">
+                            <md-icon-button
+                              aria-label="置顶"
+                              title="置顶"
+                              disabled={busyNow() || i() === 0}
+                              onClick={() => moveTop(s)}
+                            >
+                              <md-icon><IconVerticalAlignTop /></md-icon>
+                            </md-icon-button>
+                            <md-icon-button
+                              aria-label="上移"
+                              title="上移一位"
+                              disabled={busyNow() || i() === 0}
+                              onClick={() => moveUp(s)}
+                            >
+                              <md-icon><IconArrowUpward /></md-icon>
+                            </md-icon-button>
+                            <md-icon-button
+                              aria-label="下移"
+                              title="下移一位"
+                              disabled={busyNow() || i() === list().length - 1}
+                              onClick={() => moveDown(i())}
+                            >
+                              <md-icon><IconArrowDownward /></md-icon>
+                            </md-icon-button>
+                            <md-icon-button
+                              aria-label="移出清单"
+                              title="移出清单（保留进度）"
+                              disabled={busyNow()}
+                              onClick={() => setRemoveTarget(s)}
+                            >
+                              <md-icon><IconClose /></md-icon>
+                            </md-icon-button>
+                          </div>
+                        </div>
+
+                        <Show when={!s.missing}>
+                          <div class="reading-list-item__progress-row">
+                            <div
+                              class="reading-char-bar reading-list-item__bar"
+                              role="progressbar"
+                              aria-valuemin={0}
+                              aria-valuemax={totalUnits(s)}
+                              aria-valuenow={readUnits(s)}
+                              title={`已读 ${fmtNum(readUnits(s))} ${unit()} / 共 ${fmtNum(totalUnits(s))} ${unit()}${activeUnits(s) > 0 ? `（正在制卡 ${fmtNum(activeUnits(s))} ${unit()}）` : ''}`}
+                            >
+                              <div
+                                class="reading-char-bar__read"
+                                style={{ width: `${readRatio(s) * 100}%` }}
+                              />
+                              <div
+                                class="reading-char-bar__active"
+                                style={{ width: `${activeRatio(s) * 100}%` }}
+                              />
+                            </div>
+                            <span class="reading-list-item__pct md-typescale-label-medium">
+                              {pct()}%
+                            </span>
+                          </div>
+
+                          <div class="reading-list-item__meta md-typescale-label-small">
+                            <div class="reading-list-item__stats">
+                              <span class="reading-stat-Highlight">
+                                已读 {fmtNum(readUnits(s))} / {fmtNum(totalUnits(s))} {unit()}
+                              </span>
+                              <Show when={activeUnits(s) > 0}>
+                                <span class="reading-stat-active">
+                                  · 正在制卡 {fmtNum(activeUnits(s))} {unit()} ({s.active} 段)
+                                </span>
+                              </Show>
+                              <Show when={s.cards_created > 0}>
+                                <span>· 已制卡 {s.cards_created} 张</span>
+                              </Show>
+                              <span class="reading-stat-chunks">
+                                · 片段 {doneSegs()} / {s.total_chunks}
+                              </span>
+                            </div>
+
+                            <div class="reading-list-item__frontier">
+                              <Show when={s.frontier}>
+                                <span class="reading-frontier-text" title={s.frontier!.preview || s.frontier!.title}>
+                                  下一段：{frontierText(s, s.frontier!)}
+                                </span>
+                                <span class={`reading-status-chip reading-status-${s.frontier!.status}`}>
+                                  {FRONTIER_LABEL[s.frontier!.status] ?? s.frontier!.status}
+                                </span>
+                              </Show>
+                              <Show when={!s.frontier && s.gated_frontier}>
+                                <span class="reading-frontier-text" title={s.gated_frontier!.preview || s.gated_frontier!.title}>
+                                  下一段：{frontierText(s, s.gated_frontier!)}
+                                </span>
+                                <span class="reading-status-chip reading-status-held">
+                                  等卡片过预览池
+                                </span>
+                              </Show>
+                              <Show when={!s.frontier && !s.gated_frontier && !s.missing}>
+                                <span class="reading-frontier-done">全部读完 ✓</span>
+                              </Show>
+                            </div>
+                          </div>
+                        </Show>
+                      </div>
+                    </div>
+                  )
+                }}
+              </For>
             </div>
           </div>
-          <div slot="actions">
-            <md-text-button onClick={() => setPickerOpen(false)}>关闭</md-text-button>
-          </div>
-        </md-dialog>
-      </Show>
+        </div>
+      </md-elevated-card>
 
       <Show when={removeTarget() !== null}>
         <md-dialog class="confirm-dialog" open onClose={() => setRemoveTarget(null)}>

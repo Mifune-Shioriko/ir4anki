@@ -15,17 +15,17 @@ test('reading command order and exact handlers survive; trace has no status chip
 test('review retains delete confirmation wiring and bottom exit while deck is not duplicated',()=>{
  const s=read('components/Flashcard.tsx'),app=read('App.tsx')
  assert.match(app,/onDelete=\{\(\) => askDelete\(currentCard\(\)!\)\}/)
- assert.match(app,/onClick=\{exitFlow\}>退出本轮/)
+ assert.match(app,/onExit=\{exitFlow\}/);assert.match(read('components/ActionArea.tsx'),/onClick=\{props.onExit\}>退出本轮/)
  assert.equal((s.match(/props.card.deckName/g)||[]).length,1)
  assert.doesNotMatch(s,/header-actions-sep/)
 })
 test('shared toolbar contains keys without blocking native activation',()=>{
- const s=read('components/StudyCardShell.tsx');const body=s.match(/onKeyDown=\{event => \{(.*?)\}\}/s)[1]
+ const s=read('components/StudyCardShell.tsx');const body=s.match(/const containKeys=\(event:KeyboardEvent\)=>\{(.*?)\}\n/s)[1]
  const handle=new Function('event',body)
  for(const key of [' ','Enter','a','ArrowRight']) {let stopped=0;handle({key,stopPropagation(){stopped++},preventDefault(){throw Error('native activation must survive')}});assert.equal(stopped,[' ','Enter'].includes(key)?1:0)}
 })
 test('20px glyph contract sets both installed Material size tokens',()=>{
- const css=read('index.css');const toolbar=css.match(/\.study-toolbar md-icon-button\s*\{([^}]+)\}/)[1]
+ const css=read('study.css');const toolbar=css.match(/\.study-toolbar md-icon-button\s*\{([^}]+)\}/)[1]
  assert.match(toolbar,/--md-icon-button-icon-size:\s*20px/)
  assert.match(toolbar,/--md-icon-size:\s*20px/)
 })

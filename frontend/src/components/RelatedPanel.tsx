@@ -1,6 +1,8 @@
-import { Component, For, Show, createEffect, createSignal } from 'solid-js'
+import { Component, For, Show, createEffect, createSignal, onCleanup } from 'solid-js'
 import renderMathInElement from 'katex/contrib/auto-render'
 import 'katex/dist/katex.min.css'
+import {lectureRequest,pageRequestPath,type PageLocator,type PageSource} from '../lib/lecture-api'
+import {relatedDetails,sourcePage} from '../lib/lecture-session'
 import { api } from '../api'
 import { MARKDOWN_TAG, renderField, renderClozeField } from '../lib/cloze'
 import { KATEX_OPTS } from '../lib/math'
@@ -29,6 +31,7 @@ import type { ReadingChunk, ReadingCreatedCard } from '../types'
 interface Props {
   /** reading-round mode: the chunk on screen (mutually exclusive with noteId) */
   chunk?: ReadingChunk | null
+  pageSource?: PageLocator | null
   /** review/preview mode: resolve provenance for this note. Gated on
    *  reveal by the App (noteCard()) — face-down cards pass null so the
    *  list can't leak which segment the answer sits in. */
@@ -51,6 +54,7 @@ export const RelatedPanel: Component<Props> = (props) => {
   const [selfNote, setSelfNote] = createSignal<number | null>(null)
   let listRef: HTMLDivElement | undefined
   let reqToken = 0
+  onCleanup(()=>{++reqToken})
 
   // merge chunk.cards_created + ancestor_cards (reading mode) — dedup, own
   // cards first (provenance order = creation order)
@@ -62,75 +66,46 @@ export const RelatedPanel: Component<Props> = (props) => {
     return [...own, ...anc]
   }
 
-  const refresh = () => {
+  const refresh = async () => {
     const token = ++reqToken
-    setCards([])
-    setCount(null)
-    setSelfNote(null)
-
-    const chunk = props.chunk
-    if (chunk) {
-      const ids = chunkIds()
-      setCount(ids.length)
-      if (ids.length === 0) {
-        setStatus('ready')
-        return
-      }
-      setStatus('loading')
-      api.readingCards(ids).then(res => {
-        if (token !== reqToken) return
-        setCards(res.cards || [])
-        setStatus('ready')
-      }).catch(() => {
-        if (token === reqToken) setStatus('error')
-      })
-      return
-    }
-
-    const noteId = props.noteId
-    if (!noteId) {
-      setStatus('idle')
-      return
-    }
+    setCards([]);setCount(null);setSelfNote(null)
+    const chunk=props.chunk
+    if(!chunk&&!props.noteId){setStatus('idle');return}
     setStatus('loading')
-    api.readingSource(noteId).then(src => {
-      if (token !== reqToken) return
-      if (src === null) {
-        setStatus('empty')
-        return
-      }
-      setSelfNote(noteId)
-      // same-segment cards = this segment's + every ancestor crumb's (a card
-      // made before a split stays on the container — it covers this content
-      // too, which is exactly the duplicate-guard the left column exists for)
-      const ids: number[] = []
-      for (const list of [src.cards_created, ...src.breadcrumb.map(b => b.cards_created)]) {
-        for (const id of list || []) {
-          if (id > 0 && !ids.includes(id)) ids.push(id)
-        }
+    try{
+      let ids:number[]=[]
+      const source=chunk??await api.readingSource(props.noteId!)
+      if(token!==reqToken)return
+      if(!source){setStatus('empty');return}
+      if(!chunk)setSelfNote(props.noteId!)
+      if(source.kind==='pdf'){
+        const pdf=source as unknown as PageSource
+        const selected=chunk?props.pageSource:null
+        const page=selected&&selected.document_id===pdf.document_id&&selected.revision_id===pdf.revision_id&&selected.segment_id===pdf.segment_id?selected.page:sourcePage(pdf)
+        const result=await lectureRequest<{note_ids:number[]}>(pageRequestPath(pdf,page)+'/related')
+        if(token!==reqToken)return
+        ids=result.note_ids
+      }else if(chunk){ids=chunkIds()}
+      else{
+        const historical=source as Awaited<ReturnType<typeof api.readingSource>>
+        for(const list of [historical!.cards_created,...historical!.breadcrumb.map(b=>b.cards_created)])for(const id of list??[])if(id>0&&!ids.includes(id))ids.push(id)
       }
       setCount(ids.length)
-      if (ids.length === 0) {
-        setStatus('ready')
-        return
-      }
-      return api.readingCards(ids).then(res => {
-        if (token !== reqToken) return
-        setCards(res.cards || [])
-        setStatus('ready')
-      })
-    }).catch(() => {
-      if (token === reqToken) setStatus('error')
-    })
+      const result=await relatedDetails(ids,api.readingCards)
+      if(token!==reqToken)return
+      setCards(result);setStatus('ready')
+    }catch{if(token===reqToken)setStatus('error')}
   }
 
   createEffect(() => {
+    props.pageSource // exact left-reader identity, never reference-pane scroll
+    props.chunk // document/revision changes reset even for repeating local keys
     props.chunk?.chunk_key // track
     props.chunk?.cards_created.length // track (optimistic add bumps it)
     props.noteId // track
     props.cardKey // track (card swap with the same note still resets)
     props.refreshToken // track
-    refresh()
+    void refresh()
   })
 
   // math in the fetched card HTML (same pattern as Flashcard)

@@ -16,7 +16,7 @@ async def run():
   col=Collection(str(root/'collection.anki2')); col.close()
   for key in list(os.environ):
    if key.startswith('ANKI_SYNC_'): del os.environ[key]
-  os.environ.update(ANKI_BACKEND='pylib',ANKI_COLLECTION_PATH=str(root/'collection.anki2'),ANKI_STATE_DIR=str(root/'state'),ANKI_NOTES_DIR=str(notes),ANKI_BACKUP_DIR=str(root/'backups'),ANKI_ADD_MODEL='Basic',ANKI_ADD_CLOZE_MODEL='Cloze',ANKI_PREVIEW_MODE='1',ANKI_READING_MODE='1',REVIEW_DIST_DIR=str(root/'no-dist'))
+  os.environ.update(ANKI_TRUSTED_HOSTS='temporary',ANKI_BACKEND='pylib',ANKI_COLLECTION_PATH=str(root/'collection.anki2'),ANKI_STATE_DIR=str(root/'state'),ANKI_NOTES_DIR=str(notes),ANKI_BACKUP_DIR=str(root/'backups'),ANKI_ADD_MODEL='Basic',ANKI_ADD_CLOZE_MODEL='Cloze',ANKI_PREVIEW_MODE='1',ANKI_READING_MODE='1',REVIEW_DIST_DIR=str(root/'no-dist'))
   sys.path.insert(0,str(ROOT/'backend')); app=importlib.import_module('app')
   print('Temporary engine imported', flush=True)
   # Keep this persistence verification independent of background sync jobs.

@@ -1,0 +1,138 @@
+/* PDF.js TextLayer appends this measurement-only canvas directly to body.
+   Match its upstream viewer rule; a zero-sized inline canvas still adds a line. */
+body > canvas.hiddenCanvasElement { position:absolute; top:0; left:0; width:0; height:0; display:none; }
+/* Project layout choices. M3 semantic surface/text roles, existing offline
+   typography and Material controls; no generated color tokens are changed. */
+/* A min-height-only outer flex chain lets the whole PDF become the flex base.
+   Bound the active study root; descendant min-height:0 can then shrink to it. */
+.app-shell--study { --study-panel-surface:var(--md-sys-color-surface); background:var(--md-sys-color-surface-container); height:100dvh; min-height:0; overflow:hidden; }
+.dark .app-shell--study { --study-panel-surface:var(--md-sys-color-surface-container-low); background:var(--md-sys-color-surface-dim); }
+.app-shell--study>.app { height:100%; min-height:0; overflow:hidden; }
+.columns:not(.columns--solo) {
+ flex:0 0 auto; display:flex; gap:16px; height:100dvh; max-width:1760px; padding:16px;
+ min-height:0; align-items:stretch;
+}
+.columns:not(.columns--solo)>.content {
+ flex:1 1 54%; width:0; min-width:0; min-height:0; max-width:none;
+ height:100%; padding:0; margin:0;
+}
+.columns:not(.columns--solo)>.note-column {
+ flex:1 1 46%; width:0; min-width:0; min-height:0; height:100%; padding:0;
+ position:relative; top:auto; align-self:stretch; border:0; border-radius:12px;
+ background:var(--study-panel-surface, var(--md-sys-color-surface)); overflow:hidden;
+}
+.study-shell {
+ flex:1; min-height:0; width:100%; display:grid;
+ grid-template-rows: auto minmax(0, 1fr) auto;
+ background:var(--study-panel-surface, var(--md-sys-color-surface)); color:var(--md-sys-color-on-surface);
+ border-radius:12px; overflow:hidden;
+}
+.study-header { display:grid; grid-template-rows:32px 48px; padding:0 16px; margin:0; min-width:0; border-bottom:1px solid var(--md-sys-color-outline-variant); }
+.study-source-row { display:flex; align-items:center; gap:12px; min-width:0; margin:0; color:var(--md-sys-color-on-surface-variant); }
+.study-kind { flex:none; color:var(--md-sys-color-primary); font-weight:650; }
+.study-source { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.study-toolbar { margin-left:auto; gap:4px; max-width:100%; }
+.study-toolbar md-icon-button {
+ flex:none; width:48px; height:48px;
+ --md-icon-button-state-layer-width:48px; --md-icon-button-state-layer-height:48px;
+ --md-icon-button-icon-size:20px; --md-icon-size:20px;
+}
+.study-scroll { min-height:0; overflow:auto; overscroll-behavior:contain; scrollbar-gutter:stable; }
+.study-body { padding:16px 20px 24px; min-width:0; }
+.study-content { padding:0; }
+/* The central study row owns reading scroll; do not cap a second inner pane. */
+.study-shell.stage-reading .reading-chunk-body { max-height:none; overflow-y:visible; }
+.study-content>:first-child { margin-top:0; }
+.study-action-dock.action-area { position:static; margin:0; width:100%; z-index:auto; border-top:1px solid var(--md-sys-color-outline-variant); background:var(--md-sys-color-surface-container-low); }
+.study-action-dock .ease-buttons { width:100%; padding:12px; gap:4px 8px; border-radius:0; box-shadow:none; background:transparent; }
+.study-action-dock :is(md-text-button,md-filled-button,md-filled-tonal-button,md-outlined-button) { min-height:48px; --md-text-button-container-height:48px; --md-filled-button-container-height:48px; --md-filled-tonal-button-container-height:48px; --md-outlined-button-container-height:48px; }
+.note-tabs { --md-primary-tab-container-height:48px; }
+.note-column .note-tabs { --md-primary-tab-container-color:var(--study-panel-surface, var(--md-sys-color-surface)); background:var(--study-panel-surface, var(--md-sys-color-surface)); }
+.note-crumb { display:flex; align-items:center; height:32px; min-height:32px; padding:0 16px; font-size:.75rem; border-bottom:1px solid var(--md-sys-color-outline-variant); }
+.note-panel>.note-body { padding:16px 20px 32px; scrollbar-gutter:stable; }
+.note-panel>.note-body>*:first-child { margin-top:0; }
+.note-column .side-panel-tabs { overflow:hidden; }
+.study-body .lecture-controls.lecture-pager { margin:0; padding:0; border-radius:0; background:transparent; height:48px; }
+.study-body .pdf-viewport { border-radius:0; }
+.study-body .pdf-source { margin-inline:-4px; }
+.study-body .page-annotation { margin-top:16px; }
+.page-annotation .note-body { flex:none; padding:0; overflow:visible; }
+.page-annotation .note-body>:first-child { margin-top:0; }
+.pdf-reference { display:flex; flex:1; flex-direction:column; min-height:0; }
+.pdf-reference-scroll { flex:1; min-height:0; overflow:auto; padding:16px; position:relative; overscroll-behavior:contain; overflow-anchor:none; scrollbar-gutter:stable; }
+.pdf-reference-page { margin:0 0 20px; min-width:0; }
+.pdf-reference-page-label { height:48px; display:flex; align-items:center; justify-content:space-between; gap:12px; font-size:.75rem; color:var(--md-sys-color-on-surface-variant); }
+.pdf-reference-page-label span { color:var(--md-sys-color-primary); }
+.pdf-reference-sheet { position:relative; width:100%; background:white; color:#202020; }
+.pdf-reference-raster { width:100%; height:100%; margin:0; }
+.pdf-reference-raster canvas { max-width:100%; }
+.pdf-page-placeholder { position:absolute; inset:0; display:grid; place-content:center; font-size:.875rem; color:#777; background:#fff; }
+.pdf-page-error { position:absolute; inset:0; padding:20px; background:var(--md-sys-color-error-container); color:var(--md-sys-color-on-error-container); line-height:1.6; }
+/* The measured inner flow root owns all note spacing. The outer slot keeps
+   exactly that extent while its bounded resources are unmounted. */
+.pdf-reference-annotation { display:flow-root; }
+.pdf-reference-annotation-content { display:flow-root; padding-top:8px; }
+.pdf-reference-scroll:focus-visible,.study-scroll:focus-visible { outline:2px solid var(--md-sys-color-primary); outline-offset:-2px; }
+.files-workspace { display:flex; flex-direction:column; flex:1; min-height:0; width:100%; }
+.files-workspace-header { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px 24px; margin-bottom:16px; }
+.files-workspace-header h1 { font-size:1.25rem; line-height:1.5; font-weight:650; }
+.files-workspace-header p,.lecture-import-hint { font-size:.8125rem; color:var(--md-sys-color-on-surface-variant); }
+.lecture-import { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; min-width:0; }
+.lecture-import>p { flex-basis:100%; max-width:600px; line-height:1.5; }
+.files-workspace .files-screen { flex:1; min-height:0; height:auto; }
+.lecture-controls { border-radius:8px; }
+.lecture-files .lecture-controls>strong { flex:1; min-width:120px; overflow-wrap:anywhere; }
+.nav-rail { background:var(--md-sys-color-surface-container); }
+@media(max-width:1179px){
+ .columns:not(.columns--solo) { padding:12px; display:flex; }
+ .columns:not(.columns--solo)>.content { width:100%; flex:1; max-width:none; padding:0; }
+ .lecture-reference-toggle { display:inline-flex; flex:none; align-self:flex-end; margin:0 0 8px; min-height:40px; }
+ .columns:not(.columns--solo)>.note-column { display:none; }
+ .columns--reference:not(.columns--solo)>.content { display:none; }
+ .columns--reference:not(.columns--solo)>.note-column { display:flex; width:100%; flex:1; }
+ .columns--reference .lecture-reference-close { min-height:40px; margin:4px 8px; }
+}
+@media(max-width:640px){
+ .columns:not(.columns--solo) { padding:8px; }
+ .study-header { padding-inline:8px; }
+ .study-body { padding:12px; }
+ .pdf-reference-scroll { padding:12px; }
+ .study-action-dock .ease-buttons { padding:8px; }
+ .study-action-dock :is(md-text-button,md-filled-button,md-filled-tonal-button,md-outlined-button) { font-size:.8125rem; }
+ .files-workspace-header { align-items:flex-start; gap:8px; }
+ .files-workspace-header .lecture-import { flex-basis:100%; }
+}
+@media(prefers-reduced-motion:reduce){
+ .study-shell *,.pdf-reference * { scroll-behavior:auto!important; animation:none!important; transition:none!important; }
+}
+
+.files-page { height:100dvh; min-height:0; display:flex; }
+.files-workspace .files-tree-card,.files-workspace .files-viewer-card { height:100%; }
+.files-preview-scroll>.lecture-files { padding:12px 16px; margin:0; border:0; }
+
+/* Lecture authoring adds two labelled actions. Let only its narrow header grow
+   with wrapped controls. The ordinary shell marker survives Material ARIA
+   delegation; Markdown/review and desktop rows retain their layout. */
+@media(max-width:640px){
+ .study-shell[data-lecture-reading] > .study-header { grid-template-rows:32px auto; }
+ .study-shell[data-lecture-reading] > .study-header > .study-toolbar { flex-wrap:wrap; margin-left:0; justify-content:flex-end; }
+ .study-shell[data-lecture-reading] > .study-header > .study-toolbar md-text-button { min-height:48px; --md-text-button-container-height:48px; }
+}
+
+/* Both readers share a viewport modal; source scroll remains untouched. */
+.split-dialog {
+ width:min(640px, calc(100vw - 32px)); max-width:calc(100vw - 32px);
+ max-height:calc(100dvh - 32px);
+}
+.split-dialog-content { min-width:0; min-height:0; max-height:56dvh; overflow:auto; overflow-wrap:anywhere; }
+.split-dialog-content p { margin:0 0 12px; line-height:1.6; }
+.split-line-previews { max-height:40dvh; overflow:auto; white-space:pre-wrap; }
+.split-page-range { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:12px; }
+.split-page-range label { display:flex; align-items:center; gap:8px; }
+.split-page-range input { width:5em; min-height:48px; font:inherit; text-align:center; color:var(--md-sys-color-on-surface); background:var(--md-sys-color-surface); border:1px solid var(--md-sys-color-outline-variant); border-radius:12px; }
+.split-action-hint { display:inline-flex; flex:none; }
+@media(max-width:640px){
+ .study-shell.stage-reading > .study-header { grid-template-rows:32px auto; }
+ .study-shell.stage-reading > .study-header > .study-toolbar { flex-wrap:wrap; margin-left:0; justify-content:flex-end; }
+ .split-dialog { width:calc(100vw - 16px); max-width:calc(100vw - 16px); max-height:calc(100dvh - 16px); }
+}

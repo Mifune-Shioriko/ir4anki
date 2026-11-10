@@ -1,6 +1,6 @@
 import { Component, For, Show, createEffect, createSignal, onMount } from 'solid-js'
 import katex from 'katex'
-import { MarkdownField } from './MarkdownField'
+import { QuestionAnswerField as MarkdownField } from './QuestionAnswerFields'
 import { AuthoringToolbar } from './AuthoringToolbar'
 import { cleanCardHtml, cleanEditorHtml } from '../lib/clean'
 import { MARKDOWN_TAG, isMarkdownNote } from '../lib/cloze'
@@ -307,7 +307,7 @@ export const EditDialog: Component<Props> = (props) => {
         out[name] = fromEditorHtml(el.innerHTML)
       })
       if (isAdd()) {
-        if (!Object.values(out).some(v => v.replace(/<[^>]*>/g, '').trim())) {
+        if (!Object.values(out).some(v => v.replace(/<[^>]*>/g, '').trim() || /<img\s[^>]*src=/i.test(v))) {
           setError('卡片内容不能为空')
           setSaving(false)
           return

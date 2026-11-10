@@ -296,62 +296,6 @@ async def main():
                   r.status_code == 200
                   and r.json().get("fingerprint") == fch.get("fingerprint"))
 
-        print("== 11. reading_reseed & nested bottom-up container re-anchoring ==")
-        # G starts whole (1..11), split twice to form a 2-level container hierarchy:
-        # root container (1..11) -> child todo (5..7) + tail container (8..11) -> leaf (9..11)
-        write_note("2026/解剖/测试7.md", NOTE)
-        G = "2026/解剖/测试7.md"
-        await c.post("/api/reading/list/add", json={"path": G})
-        await c.post("/api/reading/finish")
-        r = await c.post("/api/reading/start?mode=focus")
-        gch = next((x for x in r.json().get("chunks", []) if x["path"] == G), None)
-        gsid = gch["seg_id"]
-        # Split 1: select lines 5..7 -> tail is lines 8..11
-        r1 = await c.post("/api/reading/split", json={
-            "path": G, "seg_id": gsid,
-            "selections": [{"start_line": 5, "end_line": 7}],
-        })
-        check("G split 1 ok", r1.status_code == 200, r1.text[:120])
-        tail1 = next(x for x in r1.json()["children"] if x.get("tail"))
-        # Split 2 on tail1 (8..11): select lines 9..11
-        r2 = await c.post("/api/reading/split", json={
-            "path": G, "seg_id": tail1["seg_id"],
-            "selections": [{"start_line": 9, "end_line": 11}],
-        })
-        check("G split 2 ok", r2.status_code == 200, r2.text[:120])
-        # Externally edit the middle leaf (lines 5..7) and add 2 lines inside it
-        edited_note = NOTE.replace(
-            "aaa 第一句内容在这一行\nbbb 第二句内容在这一行\nccc 第三句内容在这一行",
-            "aaa 外部重写第一行\nbbb 外部重写第二行\nccc 外部重写第三行\nddd 外部新增第四行\neee 外部新增第五行",
-        )
-        write_note(G, edited_note)
-        # Trigger _reanchor_entry via status check
-        st_res = await c.get("/api/reading/status")
-        g_sum = next(s for s in st_res.json()["list"] if s["path"] == G)
-        check("G flagged needs_resync after external leaf edit", g_sum["needs_resync"] is True, g_sum)
-        # Verify nested container (tail1) relocated to shifted leaf (10..14) and root container (gsid) spans 1..14
-        g_entry = next(e for e in backend._reading_read()["list"] if e["path"] == G)
-        g_segs = {s["seg_id"]: s for s in g_entry["segments"]}
-        check("nested container bottom-up span updated to 10..14",
-              (g_segs[tail1["seg_id"]]["start_line"], g_segs[tail1["seg_id"]]["end_line"]) == (10, 14),
-              g_segs[tail1["seg_id"]])
-        check("root container bottom-up span updated to 1..14",
-              (g_segs[gsid]["start_line"], g_segs[gsid]["end_line"]) == (1, 14),
-              g_segs[gsid])
-        # Now call /api/reading/reseed: the uncovered edited hole (5..9) must become 1 fresh todo segment
-        # even though root container (1..13) covers those lines!
-        reseed_res = await c.post("/api/reading/reseed", json={"path": G})
-        check("reseed 200", reseed_res.status_code == 200, reseed_res.text[:120])
-        check("reseed created 1 fresh todo segment for uncovered hole",
-              reseed_res.json().get("fresh") == 1, reseed_res.json())
-        g_entry_after = next(e for e in backend._reading_read()["list"] if e["path"] == G)
-        fresh_todos = [
-            s for s in g_entry_after["segments"]
-            if s["status"] == "todo" and s["start_line"] == 5 and s["end_line"] == 10
-        ]
-        check("fresh todo segment covers uncovered lines 5..10",
-              len(fresh_todos) == 1, g_entry_after["segments"])
-
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

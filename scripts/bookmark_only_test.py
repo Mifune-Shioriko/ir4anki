@@ -21,6 +21,7 @@ def test_bookmark_protocol(tmp_path, monkeypatch, policy, tail):
         if key.startswith('ANKI_'):
             monkeypatch.delenv(key)
     for key, value in {'ANKI_BACKEND':'connect', 'ANKI_READING_MODE':'1',
+                       'ANKI_TRUSTED_HOSTS':'test',
                        'ANKI_STATE_DIR':str(tmp_path/'state'),
                        'ANKI_NOTES_DIR':str(tmp_path/'corpus'),
                        'ANKI_MEDIA_DIR':str(tmp_path/'media')}.items():

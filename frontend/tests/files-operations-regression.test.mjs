@@ -35,6 +35,13 @@ const {readFileSync}=await import('node:fs')
 const ts=(await import('typescript')).default
 const screen=readFileSync(process.env.FILES_SOURCE ?? new URL('../src/components/FilesScreen.tsx',import.meta.url),'utf8')
 const make=(code,ctx,name)=>new Function(...Object.keys(ctx),ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText+`;return ${name}`)(...Object.values(ctx))
+// AST extraction tolerates function declarations and formatting while executing
+// the actual current handler bodies. This is a pure handler test, not DOM/native QA.
+const sourceAst=ts.createSourceFile('FilesScreen.tsx',screen,ts.ScriptTarget.Latest,true,ts.ScriptKind.TSX)
+function actual(name,ctx){let code
+ function walk(n){if(ts.isVariableDeclaration(n)&&n.name.getText(sourceAst)===name&&n.initializer)code=`const ${name} = ${n.initializer.getText(sourceAst)}`
+ else if(ts.isFunctionDeclaration(n)&&n.name?.text===name)code=n.getText(sourceAst)
+ ts.forEachChild(n,walk)}walk(sourceAst);assert.ok(code,'Actual handler absent: '+name);return make(code,ctx,name)}
 await check('undo lost response then remount maps descendants and clears original undo',async()=>{
  const store=new Map(),storage={getItem:k=>store.get(k)??null,setItem:(k,v)=>store.set(k,v),removeItem:k=>store.delete(k)}
  let online=false,busy=false,id='a'.repeat(32),calls=0,events=[],selected='dest/a/n.md',parent='dest/a/n.md',invalidated=[]
@@ -48,15 +55,13 @@ await check('undo lost response then remount maps descendants and clears origina
  for(const k of Object.keys(parentState))pc['set'+k[0].toUpperCase()+k.slice(1)]=v=>parentState[k]=typeof v==='function'?v(parentState[k]):v
  const pa=app.indexOf('  const [sourceGeneration, setSourceGeneration]'),pb=app.indexOf('  onMount(() => { window.addEventListener',pa)
  const relocateSources=make(app.slice(pa,pb),pc,'relocateSources')
- const fc={remapPath,invalidateFileCache:p=>invalidated.push(p),setSelected:f=>selected=f(selected),setCurrentDir(){},setFocused(){},setExpanded(){},setMembership(){},scrollPositions:new Map(),setViewerVersion(){},CustomEvent:class{constructor(n,o){this.detail=o.detail}},window:{dispatchEvent:e=>{relocateSources(e);parent=parentState.rdChunks[0].path;events.push(e.detail)}}}
- const fa=screen.indexOf('  const applyRelocation ='),fb=screen.indexOf('  const operations =',fa)
- const applyRelocation=make('let previewReadyPath=null;'+screen.slice(fa,fb),fc,'applyRelocation')
- const construction=screen.slice(screen.indexOf('  const operations ='),screen.indexOf('  const undoMove ='))
- const construct=()=>make(construction,{FileOperations,api,sessionStorage:storage,applyRelocation,undoId:()=>id,setUndoId:v=>id=v,setOperationVersion(){}},'operations')
+ let preview=selected
+ const fc={alive:true,owner:{},remapPath,invalidateFileCache:p=>invalidated.push(p),setSelected:f=>selected=[...f(new Set([selected]))][0],setCurrentDir(){},setFocused(){},previewPath:()=>preview,setPreviewPath:f=>preview=f(preview),requestDraftLeave:()=>true,setMessage(){},setHistory(){},setMembership(){},setFiles(){},setDirs(){},setVersion(){},CustomEvent:class{constructor(n,o){this.detail=o.detail}},window:{dispatchEvent:e=>{relocateSources(e);parent=parentState.rdChunks[0].path;events.push(e.detail)}}}
+ const applyRelocation=actual('applyRelocation',fc)
+ const construct=()=>actual('operations',{alive:true,FileOperations,api,sessionStorage:storage,applyRelocation,undoId:()=>id,setUndoId:v=>id=v,remember(){},setOperationVersion(){}})
  const ops=construct()
- const ctx={undoId:()=>id,busy:()=>false,setUndoBusy:v=>busy=v,operations:ops,selected:()=>selected,showSnack(){},reload:async()=>ops.reconcile()}
- const start=screen.indexOf('  const undoMove ='),end=screen.indexOf('  const selectFile =',start)
- const undo=make(screen.slice(start,end),ctx,'undoMove')
+ const ctx={alive:true,undoId:()=>id,busy:()=>false,requestDraftLeave:()=>true,setWorking:v=>busy=v,operations:ops,setMessage(){},reload:async()=>{try{await ops.reconcile()}catch{}}}
+ const undo=actual('undo',ctx)
  await undo();assert.equal(busy,false);assert(ops.hasPending());assert.equal(parent,'dest/a/n.md');assert.equal(calls,1)
  online=true
  const remount=construct();await remount.reconcile()
@@ -73,12 +78,36 @@ await check('undelivered pending intent never moves overwritten replacement on r
 })
 await check('upload and delete refuse mutation while unresolved intent exists',async()=>{
  let mutations=0
- const context={operations:{isBusy:()=>true},showSnack(){},uploading:()=>false,renameBusy:()=>false,deleteTarget:()=>({path:'a.md'}),deleteCanSubmit:()=>true,UploadConflictError:class{},setUploading(){},setDeleteBusy(){},api:{filesUpload:()=>{mutations++;throw Error('upload must not run')},filesDelete:()=>{mutations++;throw Error('delete must not run')}}}
- const a=screen.indexOf('  const doUpload ='),b=screen.indexOf('\n  const ',a+22)
- // Include exactly the function, up to the next declaration.
- const upload=make(screen.slice(a,b),context,'doUpload');await upload([{file:{},rel:'a.md'}],'','overwrite')
- const c=screen.indexOf('  const submitDelete ='),d=screen.indexOf('\n  type Target',c)
- await make(screen.slice(c,d),context,'submitDelete')();assert.equal(mutations,0)
+ const operations={isBusy:()=>true}
+ const context={busy:()=>operations.isBusy(),requestDraftLeave:()=>true,api:{filesUpload:()=>{mutations++;throw Error('upload must not run')},filesDelete:()=>{mutations++;throw Error('delete must not run')}}}
+ const upload=actual('importFiles',context)
+ await upload({files:[{name:'a.md'}],value:'a.md'})
+ const runItems=actual('runItems',context)
+ await actual('remove',{...context,runItems})([{path:'a.md',isDir:false}])
+ assert.equal(mutations,0)
+
+})
+await check('disposed relocation acknowledges original cache/source without view writes',async()=>{
+ const invalidated=[],events=[],owner={}
+ const ack=actual('applyRelocation',{alive:false,owner,invalidateFileCache:p=>invalidated.push(p),CustomEvent:class{constructor(type,value){this.type=type;this.detail=value.detail}},window:{dispatchEvent:event=>events.push(event)}})
+ ack('original/a.md','confirmed/a.md')
+ assert.deepEqual(invalidated,['original/a.md','confirmed/a.md']);assert.equal(events.length,1);assert.equal(events[0].detail.oldPath,'original/a.md');assert.equal(events[0].detail.owner,owner)
+ // No report/setter/dispatch-next capability was supplied; any access fails.
+})
+await check('generic upload conflict keeps captured folder and explicit retry policy',async()=>{
+ const {ApiError,UploadConflictError,UploadPartialError}=await import('../src/api.ts')
+ const {SerialBatch}=await import('../src/lib/files-browser.ts');globalThis.crypto??=(await import('node:crypto')).webcrypto
+ const requests=[],conflicts=[];let reject=true
+ const context={alive:true,busy:()=>false,requestDraftLeave:()=>true,setWorking(){},setMessage(){},setImportConflict:x=>conflicts.push(x),UploadConflictError,UploadPartialError,ApiError,
+  batch:new SerialBatch(()=>{}),
+  api:{async filesUpload(entries,dir,policy){requests.push({entries,dir,policy});if(reject)throw new UploadConflictError(JSON.stringify({conflicts:['note.md']}));return {saved:[{path:dir+'/note.md',action:'skipped'}],images_renamed:{}}}},
+  invalidateFileCache(){},window:{dispatchEvent(){}},Event:class{},setVersion(){},reload:async()=>{}}
+ const importing=actual('importEntries',context),entries=[{file:{name:'note.md'},rel:'note.md'}]
+ await importing(entries,'original-folder','error')
+ assert.equal(requests.length,1);assert.equal(conflicts.length,1);assert.equal(conflicts[0].dir,'original-folder');assert.deepEqual(conflicts[0].names,['note.md'])
+ reject=false
+ for(const policy of ['skip','rename','overwrite'])await importing(conflicts[0].entries,conflicts[0].dir,policy)
+ assert.deepEqual(requests.map(x=>x.policy),['error','skip','rename','overwrite']);assert.ok(requests.every(x=>x.dir==='original-folder'))
 })
 console.log(JSON.stringify(results.slice(2),null,2))
 process.exitCode=results.some(r=>r.status==='FAIL')?1:0

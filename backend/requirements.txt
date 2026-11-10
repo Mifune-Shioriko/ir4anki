@@ -8,3 +8,10 @@ python-multipart>=0.0.9
 anki==25.2.7
 # Block source maps protect uploaded Markdown code in quote/list containers.
 markdown-it-py==4.0.0
+
+# Local lecture parsing/rendering. LibreOffice is an optional system prerequisite.
+pypdfium2>=4.30,<6
+Pillow>=11,<14
+
+# Validate legacy PowerPoint OLE containers before isolated conversion.
+olefile==0.47

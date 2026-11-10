@@ -30,17 +30,17 @@ def test_access_control(backend,monkeypatch):
     async def run():
         async with client(b) as c:
             for headers in [{'Origin':'https://evil.example'},{'Origin':'null'},{'Sec-Fetch-Site':'cross-site'},{'Host':'evil.example'},{'Host':'localhost.evil.example'}]:
-                r=await c.get('/api/files/list',headers=headers)
+                r=await c.get('/api/files/tree',headers=headers)
                 assert r.status_code==403,(headers,r.status_code)
-            assert (await c.get('/api/files/list')).status_code==200
-            assert (await c.get('/api/files/list',headers={'Origin':'http://localhost','Sec-Fetch-Site':'same-origin'})).status_code==200
+            assert (await c.get('/api/files/tree')).status_code==200
+            assert (await c.get('/api/files/tree',headers={'Origin':'http://localhost','Sec-Fetch-Site':'same-origin'})).status_code==200
             r=await c.options('/api/files/upload',headers={'Origin':'https://evil.example','Access-Control-Request-Method':'POST'})
             assert r.status_code==403 and 'access-control-allow-origin' not in r.headers
             assert (await c.get('/api/engine/stats')).status_code==403
             assert (await c.post('/api/local/sync',json={'commit_undo':True},headers={'Origin':'http://localhost'})).status_code==403
             monkeypatch.setenv('ANKI_TRUSTED_HOSTS','phone.example,100.100.1.2')
-            assert (await c.get('/api/files/list',headers={'Host':'phone.example','Origin':'http://phone.example'})).status_code==200
-            assert (await c.get('/api/files/list',headers={'Host':'100.100.1.2'})).status_code==200
+            assert (await c.get('/api/files/tree',headers={'Host':'phone.example','Origin':'http://phone.example'})).status_code==200
+            assert (await c.get('/api/files/tree',headers={'Host':'100.100.1.2'})).status_code==200
             assert (await c.post('/api/local/sync',json={'commit_undo':True},headers={'Host':'phone.example','Origin':'http://phone.example'})).status_code==403
     run_alive(run())
 
@@ -320,8 +320,8 @@ def test_security_ports_media_write(backend,monkeypatch):
     async def run():
         async with client(b,'localhost:80') as c:
             # Browser Origin omits the default HTTP port.
-            assert (await c.get('/api/files/list',headers={'Origin':'http://localhost'})).status_code==200
-            assert (await c.get('/api/files/list',headers={'Origin':'http://localhost:81'})).status_code==403
+            assert (await c.get('/api/files/tree',headers={'Origin':'http://localhost'})).status_code==200
+            assert (await c.get('/api/files/tree',headers={'Origin':'http://localhost:81'})).status_code==403
             assert (await c.get('/media/guard.png',headers={'Origin':'https://evil.example'})).status_code==403
             assert (await c.get('/media/guard.png')).content==b'fixture'
             r=await c.post('/api/files/delete',json={'path':'guard.md','confirm':'guard.md'},headers={'Origin':'https://evil.example'})
@@ -329,8 +329,8 @@ def test_security_ports_media_write(backend,monkeypatch):
             r=await c.options('/api/files/upload',headers={'Origin':'http://localhost','Access-Control-Request-Method':'POST'})
             assert r.status_code==200 and 'access-control-allow-origin' not in r.headers
         monkeypatch.delenv('ANKI_TRUSTED_HOSTS')
-        async with client(b,'test') as c:assert (await c.get('/api/files/list')).status_code==403
-        async with client(b,'127.0.0.2') as c:assert (await c.get('/api/files/list')).status_code==200
+        async with client(b,'test') as c:assert (await c.get('/api/files/tree')).status_code==403
+        async with client(b,'127.0.0.2') as c:assert (await c.get('/api/files/tree')).status_code==200
     run_alive(run())
 
 def test_upload_markdown_forms(backend):

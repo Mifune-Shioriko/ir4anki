@@ -188,6 +188,9 @@ class PylibClient:
 
     def _dispatch(self, action, params):
         col = self._open()
+        if action in ('lectureManagedNote', 'lectureManagedLookup', 'lectureManagedDelete'):
+            from lecture_anki import managed
+            return managed(self, action, params)
         if action == 'answerCards':
             from anki.errors import NotFoundError
             from anki.scheduler.v3 import CardAnswer

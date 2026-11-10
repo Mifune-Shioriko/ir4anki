@@ -16,3 +16,25 @@ backend/state/
 # Misc
 *.log
 .DS_Store
+
+# Local databases and user study data
+*.anki2
+*.anki2-journal
+*.anki2-wal
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.private
+
+# Local runtime directories & backups
+.hermes/
+.memory/
+.skill/
+skills/
+anki-notes/
+anki-backups/
+anki-exports/
+frontend/dist.*/

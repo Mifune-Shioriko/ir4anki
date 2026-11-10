@@ -1,1020 +1,294 @@
-import { Component, For, Show, createSignal, createMemo, createEffect, onCleanup, onMount } from 'solid-js'
-import { api, UploadConflictError, UploadPartialError } from '../api'
-import { FilesMenu } from './FilesMenu'
-import { remapPath, validMove, filterTree } from '../lib/files-state'
-import { FileOperations } from '../lib/fileOperations'
-import { FileViewer, invalidateFileCache } from './FileViewer'
-import { buildTree, allDirPaths } from '../lib/tree'
-import type { TreeNode, TreeFile } from '../lib/tree'
-import {
-  IconChevronRight, IconDelete, IconDescription, IconDriveFileMove, IconEdit,
-  IconFolder, IconFolderOpen, IconRestartAlt, IconArrowBack,
-} from './icons'
-import { Snackbar } from './Snackbar'
-import { applyDialogGuard } from '../lib/dialog-guard'
-import { partitionImports, type SkippedImport } from '../lib/file-import'
-
-// 文件 section (user spec 2026-09-19 round 3; MANAGEMENT since 2026-10-06):
-// the app is the SINGLE SOURCE OF TRUTH for the ~/anki-notes corpus — no
-// more side-channel file-manager edits. Left = folder tree with a CURRENT
-// DIRECTORY (upload target), right = FileViewer. Management commands belong
-// to the single row menu. Uploads accept .md + images (folders keep their
-// subtree via webkitRelativePath); rename/move migrate reading progress
-// through a recoverable backend journal (path-keyed rows follow the file);
-// delete is HARD (disk + reading progress) behind a type-the-name 防呆.
-// The list endpoint is NOT reading-gated, so browsing works with the
-// reading feature flag off too.
-
-interface Props {
-  /** reading-list membership: render an 清单 badge + a delete warning */
-  listedPaths?: () => Set<string>
-}
-
-type PendingUpload = { file: File; rel: string }[]
-
-export const FilesScreen: Component<Props> = (_props) => {
-  const [files, setFiles] = createSignal<TreeFile[]>([])
-  const [dirs, setDirs] = createSignal<string[]>([])
-  const [loading, setLoading] = createSignal(true)
-  const [loadError, setLoadError] = createSignal('')
-  const [selected, setSelected] = createSignal<string | null>(null)
-  const readSaved = <T,>(key: string, fallback: T): T => {
-    try { return JSON.parse((key === 'width' ? localStorage : sessionStorage).getItem('files-' + key) ?? 'null') ?? fallback } catch { return fallback }
-  }
-  const [expanded, setExpanded] = createSignal<Set<string>>(new Set(readSaved<string[]>('expanded', [])))
-  const [focused, setFocused] = createSignal('')
-  const [query, setQuery] = createSignal('')
-  const [preview, setPreview] = createSignal(false)
-  const [membership, setMembership] = createSignal(new Set<string>())
-  const [undoId, setUndoId] = createSignal<string | null>(readSaved<string | null>('undo-operation', null))
-  createEffect(() => sessionStorage.setItem('files-undo-operation', JSON.stringify(undoId())))
-  const [undoBusy, setUndoBusy] = createSignal(false)
-  const [viewerVersion, setViewerVersion] = createSignal(0)
-  const [treeWidth, setTreeWidth] = createSignal(Math.max(260, Math.min(600, readSaved<number>('width', 380))))
-  const scrollPositions = new Map<string, number>()
-  let previewReadyPath: string | null = null
-  let previewBody: HTMLDivElement | undefined
-  createEffect(() => {
-    sessionStorage.setItem('files-expanded', JSON.stringify([...expanded()]))
-    localStorage.setItem('files-width', JSON.stringify(treeWidth()))
+import {Component,For,Show,createSignal,createMemo,onMount,onCleanup} from 'solid-js'
+import {api,ApiError,UploadPartialError,UploadConflictError} from '../api'
+import {lectureRequest} from '../lib/lecture-api'
+import {FileOperations} from '../lib/fileOperations'
+import {remapPath} from '../lib/files-state'
+import {fileIntentId,basename,parentPath,normalizeTargets,visibleEntries,moveError,SerialBatch,editingEvent,type Entry,type BatchReport} from '../lib/files-browser'
+import {requestDraftLeave} from '../lib/draft-leave'
+import {partitionImports,type SkippedImport} from '../lib/file-import'
+import {FileViewer,invalidateFileCache} from './FileViewer'
+import {FilesLecturePreview} from './FilesLecturePreview'
+import {FilesMenu} from './FilesMenu'
+import {IconFolder,IconFolderOpen,IconDescription,IconArrowBack,IconChevronRight,IconRestartAlt} from './icons'
+import '../files.css'
+interface Props{listedPaths?:()=>Set<string>;onListChange?:()=>void}
+type ImportEntry={file:File;rel:string}
+type ImportConflict={entries:ImportEntry[];dir:string;names:string[]}
+type DialogState={kind:'rename'|'delete'|'mkdir';targets:Entry[]}
+const batchKey='files-batch-report-v1',mkdirKey='files-mkdir-pending-v1'
+const read=<T,>(key:string,fallback:T):T=>{try{return JSON.parse(sessionStorage.getItem(key)??'null')??fallback}catch{return fallback}}
+export const FilesScreen:Component<Props>=(props)=>{
+ const [files,setFiles]=createSignal<{path:string;title:string;revision?:string}[]>([]),[dirs,setDirs]=createSignal<string[]>([]),[membership,setMembership]=createSignal(new Set<string>())
+ const [currentDir,setCurrentDir]=createSignal(read('files-directory','')),[selected,setSelected]=createSignal(new Set<string>()),[focused,setFocused]=createSignal(''),[query,setQuery]=createSignal('')
+ const [previewPath,setPreviewPath]=createSignal<string|null>(null),[drawer,setDrawer]=createSignal(false),[loading,setLoading]=createSignal(true),[loadError,setLoadError]=createSignal(''),[message,setMessage]=createSignal('')
+ const [importConflict,setImportConflict]=createSignal<ImportConflict|null>(null)
+ const [skippedImports,setSkippedImports]=createSignal<SkippedImport[]>([])
+ const [working,setWorking]=createSignal(false),[version,setVersion]=createSignal(0),[operationVersion,setOperationVersion]=createSignal(0)
+ const [undoId,setUndoId]=createSignal<string|null>(read('files-undo-operation',null)),[dialog,setDialog]=createSignal<DialogState|null>(null),[value,setValue]=createSignal(''),[dialogError,setDialogError]=createSignal('')
+ const savedReport=read<BatchReport|null>(batchKey,null)
+ const restored=savedReport&&Array.isArray(savedReport.items)?savedReport:null
+ if(restored)restored.items=restored.items.map(i=>({...i,status:i.status==='running'?'unconfirmed':i.status}))
+ const [report,setReport]=createSignal(restored),[mkdirPending,setMkdirPending]=createSignal<{id:string;path:string}|null>(read(mkdirKey,null)),[mkdirObserved,setMkdirObserved]=createSignal(false)
+ const [drag,setDrag]=createSignal<Entry[]>([]),[drop,setDrop]=createSignal<string|null>(null),[externalDrop,setExternalDrop]=createSignal(false)
+ const [history,setHistory]=createSignal<string[]>([])
+ const owner={}
+ let alive=true,generation=0,anchor='',list!:HTMLDivElement,input!:HTMLInputElement,folderInput!:HTMLInputElement,uploadDirectory='',suppressClick=false,returnFocus:HTMLElement|null=null
+ const all=createMemo<Entry[]>(()=>[...dirs().map(path=>({path,isDir:true})),...files().map(f=>({path:f.path,isDir:false,revision:f.revision}))])
+ const rows=createMemo(()=>visibleEntries(all(),currentDir(),query(),'all'))
+ const targets=()=>normalizeTargets(all().filter(t=>selected().has(t.path)))
+ const unresolved=()=>report()?.items.some(i=>i.status==='running'||i.status==='unconfirmed')??false
+ const busy=()=>{operationVersion();return working()||operations.isBusy()||!!mkdirPending()||unresolved()||(!loading()&&!!currentDir()&&!dirs().includes(currentDir()))}
+ const remember=(key:string,v:unknown)=>{try{sessionStorage.setItem(key,JSON.stringify(v))}catch{setMessage('浏览器无法保留操作状态，请勿刷新或离开，先核对结果')}}
+ const batch=new SerialBatch(r=>{if(alive){sessionStorage.setItem(batchKey,JSON.stringify(r));setReport(r)}})
+ const applyRelocation=(old:string,next:string)=>{
+  if(!alive){invalidateFileCache(old);invalidateFileCache(next);window.dispatchEvent(new CustomEvent('files-relocated',{detail:{oldPath:old,newPath:next,owner}}));return}
+  invalidateFileCache(old);invalidateFileCache(next)
+  setSelected(s=>new Set([...s].map(p=>remapPath(p,old,next))));setFocused(p=>remapPath(p,old,next));setCurrentDir(p=>remapPath(p,old,next));if(previewPath()&&remapPath(previewPath(),old,next)!==previewPath()){if(requestDraftLeave())setPreviewPath(p=>remapPath(p,old,next));else setMessage('文件迁移已确认；当前页笔记无法保留草稿，原编辑器仍保留。请先复制或保存，再关闭预览。')}
+  setHistory(h=>h.map(p=>remapPath(p,old,next)));setMembership(s=>new Set([...s].map(p=>remapPath(p,old,next))))
+  setFiles(fs=>fs.map(f=>({...f,path:remapPath(f.path,old,next)})));setDirs(ds=>ds.map(p=>remapPath(p,old,next)))
+  window.dispatchEvent(new CustomEvent('files-relocated',{detail:{oldPath:old,newPath:next,owner}}));setVersion(v=>v+1)
+ }
+ const operations=new FileOperations(api,sessionStorage,(result,old,request)=>{
+  applyRelocation(old,result.path)
+  if(!alive)return
+  setUndoId(request.action==='undo'?null:result.operationId??undoId());remember('files-undo-operation',undoId())
+ },()=>{if(alive)setOperationVersion(v=>v+1)})
+ async function reload(){
+  if(!alive)return
+  const token=++generation;setLoading(true);setLoadError('')
+  try{
+   await operations.reconcile() // status only; never redispatch a stored intent
+   const [d,m]=await Promise.all([api.filesList(),api.filesMembership()])
+   if(!alive||token!==generation)return
+   setFiles(d.files);setDirs(d.dirs??[]);setMembership(new Set(m.paths))
+   if(mkdirPending())setMkdirObserved((d.dirs??[]).includes(mkdirPending()!.path))
+   // Preserve unsafe editor/source even when server list no longer has its path.
+   if(currentDir()&&!(d.dirs??[]).includes(currentDir())&&requestDraftLeave()){setCurrentDir('');remember('files-directory','')}
+   if(previewPath()&&!d.files.some(f=>f.path===previewPath())&&requestDraftLeave())setPreviewPath(null)
+  }catch(e){if(alive&&token===generation)setLoadError((e as Error).message)}finally{if(alive&&token===generation)setLoading(false)}
+ }
+ const foreignChange=(event:Event)=>{if((event as CustomEvent).detail?.owner!==owner)void reload()}
+ onMount(()=>{window.addEventListener('files-relocated',foreignChange);window.addEventListener('files-deleted',foreignChange);window.addEventListener('lecture-documents-changed',foreignChange);void reload()})
+ onCleanup(()=>{alive=false;++generation;batch.revoke();window.removeEventListener('files-relocated',foreignChange);window.removeEventListener('files-deleted',foreignChange);window.removeEventListener('lecture-documents-changed',foreignChange)})
+ function focusRow(path=focused()){
+  requestAnimationFrame(()=>{if(!alive)return;const row=Array.from(list.querySelectorAll<HTMLElement>('[data-entry]')).find(e=>e.dataset.entry===path);(row??list).focus()})
+ }
+ function navigate(path:string,back=false){
+  if(!requestDraftLeave())return
+  if(path!==currentDir()&&!back)setHistory(h=>[...h,currentDir()])
+  setCurrentDir(path);remember('files-directory',path);setQuery('');setSelected(new Set<string>());setFocused('');setPreviewPath(null);setDrawer(false);anchor='';focusRow('')
+ }
+ function goBack(){const h=history();if(!h.length)return;if(!requestDraftLeave())return;setHistory(h.slice(0,-1));navigate(h[h.length-1],true)}
+ function choose(t:Entry,event?:MouseEvent|KeyboardEvent){
+  if(suppressClick){suppressClick=false;return}
+  // Changing selection alone retains the current editor. Opening/closing is explicit.
+  const toggle=!!event&&(event.ctrlKey||event.metaKey),range=!!event?.shiftKey
+  setSelected(previous=>{
+   if(range&&anchor){const paths=rows().map(x=>x.path),a=paths.indexOf(anchor),b=paths.indexOf(t.path);if(a>=0&&b>=0)return new Set([...(toggle?previous:[]),...paths.slice(Math.min(a,b),Math.max(a,b)+1)])}
+   if(toggle){const next=new Set(previous);next.has(t.path)?next.delete(t.path):next.add(t.path);return next}
+   return new Set([t.path])
+  });if(!range)anchor=t.path;setFocused(t.path)
+ }
+ function preview(t:Entry){
+  if(t.isDir){navigate(t.path);return}
+  if(!requestDraftLeave())return
+  setPreviewPath(p=>p===t.path?null:t.path)
+ }
+ function closePreview(){if(requestDraftLeave()){setPreviewPath(null);focusRow()}}
+ function open(kind:DialogState['kind'],items=targets()){
+  if(busy()||(kind!=='mkdir'&&!items.length))return
+  if((kind==='rename'||kind==='delete')&&!requestDraftLeave())return
+  returnFocus=document.activeElement as HTMLElement
+  setValue(kind==='rename'?basename(items[0].path):'');setDialogError('');setDialog({kind,targets:normalizeTargets(items)})
+ }
+ function restoreFocus(){requestAnimationFrame(()=>{if(returnFocus?.isConnected)returnFocus.focus();else focusRow()})}
+ function closeDialog(){if(working())return;setDialog(null);restoreFocus()}
+ function uncertain(error:unknown){return !(error instanceof ApiError&&error.status>=400&&error.status<500)}
+ async function runItems(action:string,items:Entry[],executor:(t:Entry)=>Promise<'confirmed'|'unconfirmed'>){
+  if(busy()||!requestDraftLeave())return
+  setWorking(true);setDialog(null)
+  try{await batch.run(action,normalizeTargets(items),executor)}catch(e){if(alive)setMessage('操作状态无法保留，请核对后再继续：'+(e as Error).message)}finally{if(alive){setWorking(false);await reload();focusRow()}}
+ }
+ async function relocation(kind:'move'|'rename',items:Entry[],destination:string){
+  if(kind==='move'){const error=moveError(items,destination,all());if(error){setDialogError(error);setMessage(error);return}}
+  await runItems(kind==='move'?'移动':'重命名',items,async t=>{
+   try{const r=await operations.run(kind,t.path,destination);if(!r)throw Object.assign(new Error('迁移结果待确认，请刷新核对'),{uncertain:true});return 'confirmed'}
+   catch(e){if(operations.hasPending())throw Object.assign(new Error((e as Error).message),{uncertain:true});throw e}
   })
-  let refreshGeneration = 0
-  let alive = true
-  // current directory = the upload target (user ruling 2026-10-06:
-  // 先选中当前文件夹作为落点). '' = corpus root.
-  const [currentDir, setCurrentDir] = createSignal(readSaved<string>('directory', ''))
-  createEffect(() => sessionStorage.setItem('files-directory', JSON.stringify(currentDir())))
-  const [snack, setSnack] = createSignal('')
-  let snackTimer: ReturnType<typeof setTimeout> | null = null
-  const showSnack = (msg: string) => {
-    setSnack(msg)
-    if (snackTimer) clearTimeout(snackTimer)
-    snackTimer = setTimeout(() => setSnack(''), 4000)
-  }
-
-  const reload = async () => {
-    const hadTreeFocus = !!document.activeElement?.closest('.files-tree')
-    const generation = ++refreshGeneration
-    setLoading(true)
-    setLoadError('')
-    try {
-      const confirmed = await operations.reconcile()
-      if (confirmed && alive) showSnack('已确认文件迁移，可撤销')
-      if (!alive || generation !== refreshGeneration) return
-      const [d, members] = await Promise.all([api.filesList(), api.filesMembership()])
-      if (!alive || generation !== refreshGeneration) return
-      setMembership(new Set(members.paths))
-      setFiles(d.files)
-      setDirs(d.dirs ?? [])
-      const available = allDirPaths(buildTree(d.files, d.dirs))
-      setExpanded(prev => new Set([...prev].filter(p => available.has(p))))
-      if (currentDir() && !available.has(currentDir())) setCurrentDir('')
-      if (selected() && !d.files.some(f => f.path === selected())) setSelected(null)
-      if (focused() && !available.has(focused()) && !d.files.some(f => f.path === focused())) setFocused('')
-      if (hadTreeFocus) requestAnimationFrame(() => focusRow(focused()))
-    } catch (e) {
-      if (alive && generation === refreshGeneration) setLoadError((e as Error).message || '加载失败')
-    } finally {
-      if (alive && generation === refreshGeneration) setLoading(false)
+ }
+ async function remove(items:Entry[]){
+  await runItems('永久删除',items,async t=>{
+   try{
+    await api.filesDelete(t.path,basename(t.path))
+    if(!alive)return 'confirmed'
+    invalidateFileCache(t.path);setUndoId(null);remember('files-undo-operation',null)
+    if(previewPath()===t.path||previewPath()?.startsWith(t.path+'/')){
+     if(requestDraftLeave())setPreviewPath(null)
     }
-  }
-  onMount(reload)
-  onCleanup(() => { alive = false; refreshGeneration++; if (snackTimer) clearTimeout(snackTimer) })
-
-  const fullTree = createMemo(() => buildTree(files(), dirs()))
-  const tree = createMemo(() => filterTree(fullTree(), query()))
-  const fileIndex = createMemo(() => new Map(files().map(file => [file.path, file])))
-
-  // Directory tree for the MOVE dialog, built from the backend's real dir
-  // list (includes empty dirs the file-tree can't show). Returns nested
-  // {name, path, children} so a freshly-created empty folder is a valid
-  // move destination.
-  interface DirNode { name: string; path: string; children: DirNode[] }
-  const dirTree = (): DirNode[] => {
-    const roots: DirNode[] = []
-    const index = new Map<string, DirNode>()
-    for (const d of [...dirs()].sort()) {
-      const parts = d.split('/')
-      const node: DirNode = {
-        name: parts[parts.length - 1], path: d, children: [] }
-      index.set(d, node)
-      if (parts.length === 1) {
-        roots.push(node)
-      } else {
-        const parent = index.get(parts.slice(0, -1).join('/'))
-        if (parent) parent.children.push(node)
-        else roots.push(node)
-      }
-    }
-    return roots
-  }
-  const isOpen = (path: string) => expanded().has(path)
-  const setDirOpen = (path: string, open: boolean) =>
-    setExpanded(prev => {
-      const next = new Set(prev)
-      if (open) next.add(path)
-      else next.delete(path)
-      return next
-    })
-  const toggleDir = (path: string) => setDirOpen(path, !isOpen(path))
-  const isListed = (path: string) => membership().has(path)
-  const dirLabel = () => currentDir() || '语料库根目录'
-
-  // ---- upload -------------------------------------------------------------
-  // Hidden inputs: `multiple` for loose files (they land directly in the
-  // current dir), `webkitdirectory` for a whole folder (entries keep their
-  // relative subtree under the current dir).
-  let fileInputRef: HTMLInputElement | undefined
-  let dirInputRef: HTMLInputElement | undefined
-  const [uploading, setUploading] = createSignal(false)
-  const [skippedImports, setSkippedImports] = createSignal<SkippedImport[]>([])
-  // conflict dialog state: the batch that 409'd + the clashing names
-  const [conflict, setConflict] = createSignal<{ entries: PendingUpload; dir: string; names: string[] } | null>(null)
-  const [conflictBusy, setConflictBusy] = createSignal(false)
-
-  const entriesFromInput = (input: HTMLInputElement): PendingUpload => {
-    const out: PendingUpload = []
-    for (const f of Array.from(input.files ?? [])) {
-      // webkitRelativePath is set for folder picks ("sub/dir/file.md"),
-      // empty for loose file picks → rel = just the name
-      const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name
-      out.push({ file: f, rel })
-    }
-    return out
-  }
-
-  const doUpload = async (
-    entries: PendingUpload,
-    dir: string,
-    policy: 'error' | 'overwrite' | 'rename' | 'skip',
-  ) => {
-    if (!entries.length || uploading()) return
-    if (operations.isBusy()) { showSnack('请先刷新确认待处理的文件操作，再重新上传'); return }
-    setUploading(true)
-    try {
-      const d = await api.filesUpload(entries, dir, policy)
-      d.saved.filter(s => s.action !== 'skipped').forEach(s => invalidateFileCache(s.path))
-      setViewerVersion(n => n + 1)
-      const n = d.saved.filter(s => s.action !== 'skipped').length
-      const skipped = d.saved.filter(s => s.action === 'skipped').length
-      const renamedImgs = Object.keys(d.images_renamed ?? {}).length
-      let msg = `已上传 ${n} 个文件`
-      if (skipped) msg += `，跳过 ${skipped} 个重名文件`
-      if (renamedImgs) msg += `，${renamedImgs} 张重名图片已自动改名`
-      showSnack(msg)
-      await reload()
-    } catch (e) {
-      if (e instanceof UploadConflictError) {
-        setConflict({ entries, dir, names: e.conflicts })
-      } else if (e instanceof UploadPartialError) {
-        e.saved.filter(s => s.action !== 'skipped').forEach(s => invalidateFileCache(s.path))
-        setViewerVersion(n => n + 1)
-        showSnack(e.message)
-        await reload()
-      } else {
-        showSnack('上传失败：' + ((e as Error).message || e))
-      }
-    } finally {
-      setUploading(false)
-    }
-  }
-
-  const retryWithPolicy = async (policy: 'overwrite' | 'rename' | 'skip') => {
-    const c = conflict()
-    if (!c) return
-    setConflictBusy(true)
-    setConflict(null)
-    try {
-      await doUpload(c.entries, c.dir, policy)
-    } finally {
-      setConflictBusy(false)
-    }
-  }
-
-  const uploadPicked = (entries: PendingUpload) => {
-    if (!entries.length || uploading()) return
-    const { supported, skipped } = partitionImports(entries)
-    setSkippedImports(skipped)
-    if (supported.length) void doUpload(supported, currentDir(), 'error')
-    else showSnack('没有可导入的文件，请展开跳过清单查看原因')
-  }
-
-  const onFilesPicked = () => {
-    if (!fileInputRef) return
-    const entries = entriesFromInput(fileInputRef)
-    fileInputRef.value = ''
-    uploadPicked(entries)
-  }
-  const onDirPicked = () => {
-    if (!dirInputRef) return
-    const entries = entriesFromInput(dirInputRef)
-    dirInputRef.value = ''
-    uploadPicked(entries)
-  }
-
-  // ---- rename dialog -------------------------------------------------------
-  const [renameTarget, setRenameTarget] = createSignal<{ path: string; isDir: boolean } | null>(null)
-  const [renameValue, setRenameValue] = createSignal('')
-  const [renameBusy, setRenameBusy] = createSignal(false)
-  const openRename = (path: string, isDir: boolean) => {
-    const name = path.split('/').pop() ?? path
-    setRenameValue(isDir ? name : name.replace(/\.md$/, ''))
-    setRenameTarget({ path, isDir })
-  }
-  const closeRename = () => { if (!renameBusy()) setRenameTarget(null) }
-  const submitRename = async () => {
-    const t = renameTarget()
-    if (!t || renameBusy()) return
-    const name = renameValue().trim()
-    if (!name) return
-    setRenameBusy(true)
-    try {
-      const d = await operations.run('rename', t.path, name)
-      if (!d) return
-      setRenameTarget(null)
-      showSnack(d.unchanged ? '名称未变化' : `已重命名为 ${d.path.split('/').pop()}`)
-      await reload()
-      requestAnimationFrame(() => focusRow(focused()))
-    } catch (e) {
-      showSnack((operations.hasPending() ? '' : '无法重命名：') + ((e as Error).message || e))
-    } finally {
-      setRenameBusy(false)
-    }
-  }
-
-  // ---- move dialog (folder-tree picker + 根目录) ---------------------------
-  const [moveTarget, setMoveTarget] = createSignal<{ path: string; isDir: boolean } | null>(null)
-  const [moveDest, setMoveDest] = createSignal<string | null>(null)
-  const [moveBusy, setMoveBusy] = createSignal(false)
-  const openMove = (path: string, isDir: boolean) => {
-    setMoveDest(null)
-    setMoveTarget({ path, isDir })
-  }
-  const closeMove = () => { if (!moveBusy()) setMoveTarget(null) }
-  // a directory can't move into itself or its own subtree
-  const moveForbidden = (dirPath: string): boolean => {
-    const t = moveTarget()
-    if (!t || !t.isDir) return false
-    return dirPath === t.path || dirPath.startsWith(t.path + '/')
-  }
-  const moveCurrentParent = () => {
-    const t = moveTarget()
-    if (!t) return ''
-    const i = t.path.lastIndexOf('/')
-    return i < 0 ? '' : t.path.slice(0, i)
-  }
-  const executeMove = async (t: { path: string; isDir: boolean }, dest: string) => {
-    if (moveBusy() || !validMove(t.path, t.isDir, dest)) return
-    setMoveBusy(true)
-    try {
-      const d = await operations.run('move', t.path, dest)
-      if (!d) return
-      setMoveTarget(null)
-      showSnack(d.unchanged ? '位置未变化' : `已移动到 ${d.path}`)
-      await reload()
-      requestAnimationFrame(() => focusRow(focused()))
-    } catch (e) {
-      showSnack((operations.hasPending() ? '' : '无法移动：') + ((e as Error).message || e))
-    } finally {
-      setMoveBusy(false)
-    }
-  }
-
-  const submitMove = () => {
-    const target = moveTarget(), dest = moveDest()
-    if (target && dest !== null) return executeMove(target, dest)
-  }
-
-  const MoveDirRows: Component<{ nodes: DirNode[]; depth: number }> = (tp) => (
-    <For each={tp.nodes}>
-      {node => (
-        <>
-          <div
-            class="files-move-dir" role="button" tabIndex={moveForbidden(node.path) ? -1 : 0} aria-disabled={moveForbidden(node.path)} onKeyDown={e => { if ((e.key === 'Enter' || e.key === ' ') && !moveForbidden(node.path)) { e.preventDefault(); setMoveDest(node.path) } }}
-            classList={{
-              'files-move-dir--pick': moveDest() === node.path,
-              'files-move-dir--disabled': moveForbidden(node.path),
-            }}
-            style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 8}px` }}
-            onClick={() => {
-              if (!moveForbidden(node.path)) setMoveDest(node.path)
-            }}
-          >
-            <md-icon class="files-tree-icon">
-              {moveDest() === node.path ? <IconFolderOpen size={18} /> : <IconFolder size={18} />}
-            </md-icon>
-            <span class="md-typescale-body-medium">{node.name}</span>
-          </div>
-          <MoveDirRows nodes={node.children} depth={tp.depth + 1} />
-        </>
-      )}
-    </For>
-  )
-
-  // ---- delete dialog (HARD delete + typed-name 防呆, user ruling) ----------
-  const [deleteTarget, setDeleteTarget] = createSignal<{ path: string; isDir: boolean } | null>(null)
-  const [deleteConfirm, setDeleteConfirm] = createSignal('')
-  const [deleteBusy, setDeleteBusy] = createSignal(false)
-  const openDelete = (path: string, isDir: boolean) => {
-    setDeleteConfirm('')
-    setDeleteTarget({ path, isDir })
-  }
-  const closeDelete = () => { if (!deleteBusy()) setDeleteTarget(null) }
-  const deleteBasename = () => {
-    const t = deleteTarget()
-    if (!t) return ''
-    return t.path.split('/').pop() ?? t.path
-  }
-  // files under a deleted directory that sit in the reading list
-  const deleteListedCount = () => {
-    const t = deleteTarget()
-    if (!t) return 0
-    const listed = membership()
-    if (t.isDir) {
-      return Array.from(listed).filter(p =>
-        p === t.path || p.startsWith(t.path + '/')).length
-    }
-    return listed.has(t.path) ? 1 : 0
-  }
-  const deleteCanSubmit = () => deleteConfirm().trim() === deleteBasename() && !deleteBusy()
-  const submitDelete = async () => {
-    const t = deleteTarget()
-    if (!t || !deleteCanSubmit()) return
-    if (operations.isBusy()) { showSnack('请先刷新确认待处理的文件操作，再重新删除'); return }
-    setDeleteBusy(true)
-    try {
-      await api.filesDelete(t.path, deleteConfirm().trim())
-      setDeleteTarget(null)
-      showSnack(`已删除 ${t.path.split('/').pop()}`)
-      window.dispatchEvent(new CustomEvent('files-deleted', { detail: { path: t.path } }))
-      invalidateFileCache(t.path)
-      setUndoId(null)
-      if (selected() === t.path || (t.isDir && (selected() ?? '').startsWith(t.path + '/'))) {
-        setSelected(null)
-      }
-      if (currentDir() === t.path || currentDir().startsWith(t.path + '/')) {
-        setCurrentDir('')
-      }
-      await reload()
-      requestAnimationFrame(() => focusRow(focused()))
-    } catch (e) {
-      showSnack('删除失败：' + ((e as Error).message || e))
-    } finally {
-      setDeleteBusy(false)
-    }
-  }
-
-  type Target = { path: string; isDir: boolean }
-  const [operationVersion, setOperationVersion] = createSignal(0)
-  const busy = () => { operationVersion(); return operations.isBusy() || renameBusy() || moveBusy() || deleteBusy() || uploading() || undoBusy() }
-  const copyPath = async (path: string) => {
-    try {
-      if (!navigator.clipboard?.writeText) {
-        showSnack(`此浏览器无法自动复制，请手动复制路径：${path}`)
-        return
-      }
-      await navigator.clipboard.writeText(path)
-      showSnack('路径已复制')
-    } catch { showSnack(`无法复制路径，请手动复制：${path}`) }
-  }
-  const command = (target: Target, action: 'rename' | 'move' | 'delete' | 'copy') => {
-    if (busy() || !target.path) return
-    if (action === 'rename') openRename(target.path, target.isDir)
-    if (action === 'move') openMove(target.path, target.isDir)
-    if (action === 'delete') openDelete(target.path, target.isDir)
-    if (action === 'copy') void copyPath(target.path)
-  }
-  const applyRelocation = (old: string, next: string) => {
-    if (old === next) return
-    // Invalidate before reactive path updates can mount any reading consumer.
-    invalidateFileCache(old); invalidateFileCache(next)
-    setSelected(p => remapPath(p, old, next))
-    setCurrentDir(p => remapPath(p, old, next))
-    setFocused(p => remapPath(p, old, next))
-    setExpanded(prev => new Set([...prev].map(p => remapPath(p, old, next))))
-    setMembership(prev => new Set([...prev].map(p => remapPath(p, old, next))))
-    for (const [p, top] of [...scrollPositions]) {
-      const mapped = remapPath(p, old, next)
-      if (p !== mapped) { scrollPositions.delete(p); scrollPositions.set(mapped, top) }
-    }
-    window.dispatchEvent(new CustomEvent('files-relocated', { detail: { oldPath: old, newPath: next } }))
-    previewReadyPath = null
-    setViewerVersion(n => n + 1)
-  }
-  const operations = new FileOperations(api, sessionStorage, (result, old, request) => {
-    applyRelocation(old, result.path)
-    if (request.action === 'undo') { if (undoId() === request.value) setUndoId(null) }
-    else if (result.operationId) setUndoId(result.operationId)
-  }, () => setOperationVersion(v => v + 1))
-  const undoMove = async () => {
-    const id = undoId()
-    if (!id || busy()) return
-    setUndoBusy(true)
-    try {
-      const result = await operations.run('undo', selected() ?? '', id)
-      if (!result) return
-      showSnack('已撤销文件迁移'); await reload()
-    } catch (e) { showSnack('无法撤销：' + (e as Error).message) }
-    finally { setUndoBusy(false) }
-  }
-  const selectFile = (path: string) => {
-    if (selected() && previewReadyPath === selected() && previewBody) scrollPositions.set(selected()!, previewBody.scrollTop)
-    previewReadyPath = null
-    setSelected(path); setFocused(path)
-    setCurrentDir(path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '')
-    setPreview(true)
-
-  }
-  const focusRow = (path: string) => {
-    const row = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [data-path]')).find(el => el.dataset.path === path)
-    if (row?.getClientRects().length) row.focus()
-  }
-  const locate = () => {
-    const path = selected()
-    if (!path) return
-    setQuery(''); setPreview(false); setFocused(path)
-    const parts = path.split('/')
-    setExpanded(prev => new Set([...prev, ...parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'))]))
-    requestAnimationFrame(() => {
-      const row = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [data-path]')).find(el => el.dataset.path === path)
-      row?.focus(); row?.scrollIntoView({ block: 'nearest' })
-    })
-  }
-  const rowKey = (e: KeyboardEvent, target: Target) => {
-    if (e.composedPath().some(p => p instanceof HTMLElement && p.matches('md-icon-button, md-menu, md-menu-item'))) return
-    const row = e.currentTarget as HTMLElement
-    const rows = Array.from(document.querySelectorAll<HTMLElement>('.files-tree [role="treeitem"]'))
-    const index = rows.indexOf(row)
-    let next: HTMLElement | undefined
-    if (e.key === 'ArrowDown') next = rows[index + 1]
-    if (e.key === 'ArrowUp') next = rows[index - 1]
-    if (e.key === 'Home') next = rows[0]
-    if (e.key === 'End') next = rows.at(-1)
-    if (next) { e.preventDefault(); next.focus(); return }
-    if (e.key === 'ArrowRight' && target.isDir) { e.preventDefault(); setDirOpen(target.path, true) }
-    if (e.key === 'ArrowLeft') {
-      e.preventDefault()
-      if (target.isDir && isOpen(target.path)) setDirOpen(target.path, false)
-      else rows.find(r => r.dataset.path === target.path.slice(0, Math.max(0, target.path.lastIndexOf('/'))))?.focus()
-    }
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); if (target.isDir) { setCurrentDir(target.path); setDirOpen(target.path, true) } else selectFile(target.path) }
-    if (e.key === 'F2') { e.preventDefault(); command(target, 'rename') }
-    if (e.key === 'ContextMenu' || (e.shiftKey && e.key === 'F10')) { e.preventDefault(); (row.querySelector('md-icon-button') as HTMLElement)?.click() }
-  }
-  const RowActions: Component<Target> = ap => <FilesMenu label={`更多操作：${ap.path}`} disabled={busy()} actions={[
-    { label: '重命名', icon: () => <IconEdit />, run: () => command(ap, 'rename') },
-    { label: '移动到…', icon: () => <IconDriveFileMove />, run: () => command(ap, 'move') },
-    { label: '复制路径', run: () => command(ap, 'copy') },
-    { label: '永久删除', icon: () => <IconDelete />, run: () => command(ap, 'delete') },
-  ]} />
-  // Pointer threshold keeps ordinary clicks distinct from a single-item move.
-  const [drag, setDrag] = createSignal<Target | null>(null)
-  const [externalDrop, setExternalDrop] = createSignal<string | null>(null)
-  const [drop, setDrop] = createSignal<string | null>(null)
-  let candidate: { target: Target; x: number; y: number; pointer: number; owner: HTMLElement } | null = null
-  let hoverTimer: ReturnType<typeof setTimeout> | undefined
-  let scrollFrame = 0, pointerY = 0, pointerX = 0, suppressClick = false
-  let treeElement: HTMLDivElement | undefined
-  // No timer: a native click may arrive in a later task after capture release.
-  // Consume that pointer click once; keyboard activation remains independent.
-  const consumeDragClick = (e: MouseEvent) => {
-    if (!suppressClick || e.detail === 0) return
-    suppressClick = false
-    e.preventDefault(); e.stopImmediatePropagation()
-  }
-  const freshPointerDown = (e: PointerEvent) => { if (e.isPrimary !== false) suppressClick = false }
-  const clearDrag = () => {
-    const previous = candidate
-    candidate = null; setDrag(null); setDrop(null)
-    if (previous?.owner.hasPointerCapture(previous.pointer)) previous.owner.releasePointerCapture(previous.pointer)
-    clearTimeout(hoverTimer); cancelAnimationFrame(scrollFrame); scrollFrame = 0
-  }
-  const updateDestination = (x: number, y: number) => {
-    const folder = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-folder]')
-    const dest = folder?.dataset.folder ?? null
-    if (dest !== drop()) {
-      clearTimeout(hoverTimer); setDrop(dest)
-      if (dest && drag() && validMove(drag()!.path, drag()!.isDir, dest)) hoverTimer = setTimeout(() => setDirOpen(dest, true), 650)
-    }
-  }
-  const autoScroll = () => {
-    if (!drag() || !treeElement) return
-    const rect = treeElement.getBoundingClientRect()
-    const delta = pointerX < rect.left || pointerX > rect.right ? 0 : pointerY < rect.top + 36 ? -12 : pointerY > rect.bottom - 36 ? 12 : 0
-    if (delta) treeElement.scrollTop += delta
-    // Re-hit-test after scrolling/expansion: never commit to a stale folder.
-    updateDestination(pointerX, pointerY)
-    scrollFrame = requestAnimationFrame(autoScroll)
-  }
-  const pointerMove = (e: PointerEvent) => {
-    if (!candidate || e.pointerId !== candidate.pointer) return
-    if (!(e.buttons & 1)) { clearDrag(); return }
-    if (!drag() && Math.hypot(e.clientX - candidate.x, e.clientY - candidate.y) < 7) return
-    if (!drag()) {
-      // Capture only once this is a drag; ordinary controls and row clicks
-      // must retain their native pointerup/click targets.
-      try { candidate.owner.setPointerCapture(candidate.pointer) }
-      catch { clearDrag(); return }
-      setDrag(candidate.target); suppressClick = true; scrollFrame = requestAnimationFrame(autoScroll)
-    }
-    e.preventDefault(); pointerY = e.clientY; pointerX = e.clientX
-    updateDestination(pointerX, pointerY)
-  }
-
-  const performMove = async (target: Target, dest: string) => {
-    if (busy() || !validMove(target.path, target.isDir, dest)) return
-    await executeMove(target, dest)
-  }
-  const pointerUp = (e: PointerEvent) => {
-    if (!candidate || candidate.pointer !== e.pointerId) return
-    if (e.button !== 0) { clearDrag(); return }
-    updateDestination(e.clientX, e.clientY)
-    const source = drag(), dest = drop()
-    clearDrag()
-    if (source && dest !== null) void performMove(source, dest)
-  }
-  const cancelKey = (e: KeyboardEvent) => { if (e.key === 'Escape' && candidate) { clearDrag(); showSnack('已取消移动') } }
-  const hidden = () => { if (document.hidden) clearDrag() }
-  onMount(() => {
-    window.addEventListener('pointerdown', freshPointerDown, true)
-    window.addEventListener('click', consumeDragClick, true)
-    window.addEventListener('pointermove', pointerMove, { passive: false })
-    window.addEventListener('pointerup', pointerUp)
-    window.addEventListener('pointercancel', clearDrag)
-    window.addEventListener('keydown', cancelKey)
-    window.addEventListener('blur', clearDrag)
-    window.addEventListener('lostpointercapture', clearDrag)
-    document.addEventListener('visibilitychange', hidden)
+    setSelected(s=>new Set([...s].filter(p=>p!==t.path&&!p.startsWith(t.path+'/'))))
+    window.dispatchEvent(new CustomEvent('files-deleted',{detail:{path:t.path,owner}}));props.onListChange?.();return 'confirmed'
+   }catch(e){if(uncertain(e))throw Object.assign(new Error('删除结果待确认，请刷新并核对；不会自动重试。'+(e as Error).message),{uncertain:true});throw e}
   })
-  onCleanup(() => {
-    clearDrag(); window.removeEventListener('pointerdown', freshPointerDown, true); window.removeEventListener('click', consumeDragClick, true); window.removeEventListener('pointermove', pointerMove); window.removeEventListener('pointerup', pointerUp)
-    window.removeEventListener('pointercancel', clearDrag); window.removeEventListener('keydown', cancelKey)
-    window.removeEventListener('blur', clearDrag); window.removeEventListener('lostpointercapture', clearDrag)
-    document.removeEventListener('visibilitychange', hidden)
-  })
-  const pointerDown = (e: PointerEvent, target: Target) => {
-    freshPointerDown(e)
-    const interactive = 'md-menu, md-menu-item, md-icon-button, button, a, input, textarea, select, summary, [contenteditable]:not([contenteditable="false"]), [role="button"], [role="menuitem"], [role="link"], [role="checkbox"], [role="radio"], [role="switch"], [role="textbox"], [role="combobox"], .files-tree-chevron'
-    // closest(target) cannot cross a Material shadow/slot boundary. The real
-    // composed path includes both the internal control and its custom host.
-    if (e.composedPath().some(node => node instanceof Element && node.matches(interactive))) { clearDrag(); return }
-    if (e.button || e.pointerType === 'touch' || busy() || !target.path) return
-    clearDrag()
-    const owner = e.currentTarget as HTMLElement
-    candidate = { target, x: e.clientX, y: e.clientY, pointer: e.pointerId, owner }
+ }
+ async function mkdir(){
+  if(busy()||!value().trim())return
+  const name=value().trim(),dir=currentDir(),intent={id:fileIntentId(),path:[dir,name].filter(Boolean).join('/')}
+  // The persisted identity is observational recovery, never authority to retry.
+  try{sessionStorage.setItem(mkdirKey,JSON.stringify(intent))}catch{setDialogError('无法保留创建意图，请先恢复浏览器存储');return}
+  setMkdirPending(intent);setMkdirObserved(false);setWorking(true)
+  try{await api.filesMkdir(dir,name);if(!alive)return;setMessage('');setMkdirPending(null);sessionStorage.removeItem(mkdirKey);setDialog(null)}
+  catch(e){if(!alive)return;if(!uncertain(e)){setMkdirPending(null);sessionStorage.removeItem(mkdirKey);setDialogError((e as Error).message)}else{setDialog(null);setMessage('创建结果待确认。请刷新并核对目标目录；不会自动重试。')}}
+  finally{if(alive){setWorking(false);await reload()}}
+ }
+ function command(action:'rename'|'delete'|'copy'|'preview',items:Entry[]){
+  if(busy())return
+  const normalized=normalizeTargets(items)
+  if(action==='preview'&&normalized.length===1)preview(normalized[0])
+  else if(action==='copy'){
+   if(!navigator.clipboard?.writeText){setMessage('无法复制：浏览器不支持剪贴板，请从行的完整名称或路径手动复制');return}
+   void navigator.clipboard.writeText(normalized.map(t=>t.path).join('\n')).then(()=>{if(alive)setMessage('路径已复制')}).catch(()=>{if(alive)setMessage('无法复制，请从行的完整名称或路径复制')})
   }
-  const contextMenu = (e: MouseEvent) => { e.preventDefault(); ((e.currentTarget as HTMLElement).querySelector('md-icon-button') as HTMLElement)?.click() }
-  const resize = (e: PointerEvent) => {
-    e.preventDefault()
-    const start = e.clientX, width = treeWidth(), handle = e.currentTarget as HTMLElement
-    handle.setPointerCapture(e.pointerId)
-    const move = (ev: PointerEvent) => setTreeWidth(Math.max(260, Math.min(600, width + ev.clientX - start)))
-    const finish = () => { handle.removeEventListener('pointermove', move); handle.removeEventListener('pointerup', finish); handle.removeEventListener('pointercancel', finish) }
-    handle.addEventListener('pointermove', move); handle.addEventListener('pointerup', finish); handle.addEventListener('pointercancel', finish)
-  }
-
-  const TreeRows: Component<{ nodes: TreeNode[]; depth: number }> = (tp) => (
-    <For each={tp.nodes}>
-      {node =>
-        node.kind === 'dir' ? (
-          <>
-            <div
-              class="files-tree-dir" role="treeitem" data-path={node.path} data-folder={node.path}
-              title={node.path} aria-label={node.path} aria-expanded={!!query() || isOpen(node.path)} aria-selected={currentDir() === node.path}
-              tabIndex={focused() === node.path ? 0 : -1} onFocus={() => setFocused(node.path)}
-              onKeyDown={e => rowKey(e, { path: node.path, isDir: true })} onContextMenu={contextMenu}
-              onPointerDown={e => pointerDown(e, { path: node.path, isDir: true })}
-              classList={{ 'files-tree-dir--current': currentDir() === node.path, 'files-drop-valid': drop() === node.path && !!drag() && validMove(drag()!.path, drag()!.isDir, node.path), 'files-drop-invalid': drop() === node.path && !!drag() && !validMove(drag()!.path, drag()!.isDir, node.path) }}
-              style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 8}px` }}
-              onClick={() => {
-                // row click = make this the CURRENT DIRECTORY (upload
-                // target) and open it; the chevron alone collapses
-                setCurrentDir(node.path)
-                setDirOpen(node.path, true)
-              }}
-            >
-              <span
-                class={`files-tree-chevron${isOpen(node.path) ? ' files-tree-chevron--open' : ''}`}
-                onClick={e => { e.stopPropagation(); toggleDir(node.path) }}
-              >
-                <IconChevronRight size={18} />
-              </span>
-              <md-icon class="files-tree-icon">
-                {currentDir() === node.path
-                  ? <IconFolderOpen size={18} />
-                  : <IconFolder size={18} />}
-              </md-icon>
-              <span class="md-typescale-label-large files-tree-dir__name">{node.name}</span>
-              <RowActions path={node.path} isDir={true} />
-            </div>
-            <Show when={!!query() || isOpen(node.path)}>
-              <TreeRows nodes={node.dirs} depth={tp.depth + 1} />
-              <TreeRows nodes={node.files} depth={tp.depth + 1} />
-            </Show>
-          </>
-        ) : (
-          <div
-            class="files-tree-file" role="treeitem" data-path={node.path} title={node.path} aria-label={node.path}
-            aria-selected={selected() === node.path} tabIndex={focused() === node.path ? 0 : -1}
-            onFocus={() => setFocused(node.path)} onKeyDown={e => rowKey(e, { path: node.path, isDir: false })}
-            onContextMenu={contextMenu} onPointerDown={e => pointerDown(e, { path: node.path, isDir: false })}
-            classList={{ 'files-tree-file--selected': selected() === node.path }}
-            style={{ 'padding-left': `${Math.min(tp.depth, 5) * 14 + 30}px` }}
-            onClick={() => selectFile(node.path)}
-          >
-            <md-icon class="files-tree-icon"><IconDescription /></md-icon>
-            <span class="files-tree-file__name md-typescale-body-medium">
-              {node.name}
-            </span>
-            <Show when={isListed(node.path)}>
-              <span class="files-tree-badge md-typescale-label-small">清单</span>
-            </Show>
-            <RowActions path={node.path} isDir={false} />
-          </div>
-        )
-      }
-    </For>
-  )
-
-  return (
-    <div class="files-screen" classList={{ 'files-screen--preview': preview(), 'files-screen--dragging': !!drag() }} style={{ '--files-tree-width': `${treeWidth()}px` }}>
-      {/* hidden upload inputs (webkitdirectory is a non-standard attr —
-          set it via ref so TSX doesn't reject it) */}
-      <input
-        ref={fileInputRef}
-        type="file"
-        multiple
-        accept=".md,.png,.jpg,.jpeg,.gif,.webp,.svg,.bmp,.avif"
-        style={{ display: 'none' }}
-        onChange={onFilesPicked}
-      />
-      <input
-        ref={el => {
-          dirInputRef = el
-          // webkitdirectory is a non-standard attribute — TS's lib.dom
-          // doesn't know it; set it imperatively so a folder pick keeps
-          // webkitRelativePath on every entry
-          el.setAttribute('webkitdirectory', '')
-        }}
-        type="file"
-        multiple
-        style={{ display: 'none' }}
-        onChange={onDirPicked}
-      />
-
-      <md-elevated-card class="files-tree-card">
-        <div class="files-tree-inner">
-          <div class="files-tree-head">
-            <span class="md-typescale-title-small">笔记</span>
-            <span class="files-tree-head-actions">
-              <md-filled-button disabled={uploading()} onClick={() => fileInputRef?.click()}>导入文件</md-filled-button>
-              <md-outlined-button disabled={uploading()} onClick={() => dirInputRef?.click()}>导入文件夹</md-outlined-button>
-              <md-icon-button aria-label="刷新" onClick={reload}>
-                <md-icon>
-                  <IconRestartAlt size={18} />
-                </md-icon>
-              </md-icon-button>
-            </span>
-          </div>
-          <div
-            class="files-current-dir md-typescale-label-small"
-            title="上传落点：在左侧树中点击文件夹切换"
-          >
-            <md-icon class="files-tree-icon"><IconFolderOpen size={14} /></md-icon>
-            上传到：<span class="files-current-dir__path">{dirLabel()}</span>
-            <Show when={currentDir()}>
-              <md-text-button
-                class="files-current-dir__root"
-                onClick={() => setCurrentDir('')}
-              >
-                回到根目录
-              </md-text-button>
-            </Show>
-          </div>
-          <Show when={skippedImports().length}>
-            <details class="files-import-skipped">
-              <summary>已跳过 {skippedImports().length} 个文件（未上传）</summary>
-              <For each={skippedImports()}>{item => <p>{item.rel}：{item.reason}</p>}</For>
-            </details>
-          </Show>
-          <input class="files-search" type="search" aria-label="搜索文件名或路径" placeholder="搜索文件名或路径" value={query()} onInput={e => setQuery(e.currentTarget.value)} />
-          <div class="files-scope">Markdown 笔记与文件夹；附件随文件夹移动</div>
-          <Show when={uploading()}>
-            <md-linear-progress indeterminate />
-          </Show>
-          <Show when={loading()}>
-            <div class="files-tree-loading">
-              <md-circular-progress
-                indeterminate
-                style="--md-circular-progress-size:28px"
-              />
-            </div>
-          </Show>
-          <Show when={!loading() && loadError()}>
-            <div class="files-tree-error md-typescale-body-small">
-              加载失败：{loadError()}
-              <md-text-button onClick={reload}>重试</md-text-button>
-            </div>
-          </Show>
-          <Show when={!loading() && !loadError() && files().length === 0}>
-            <div class="files-tree-empty md-typescale-body-small">
-              语料库里没有 .md 文件。用上方按钮上传笔记开始。
-            </div>
-          </Show>
-          <div class="files-tree" ref={treeElement} role="tree" aria-label="笔记文件" aria-busy={loading()}
-            onDragOver={e => { if (e.dataTransfer?.types.includes('Files')) {
-              e.preventDefault()
-              setExternalDrop((e.target as Element).closest<HTMLElement>('[data-folder]')?.dataset.folder ?? currentDir())
-            } }}
-            onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setExternalDrop(null) }}
-            onDrop={e => {
-              if (!e.dataTransfer?.types.includes('Files') || busy()) return
-              e.preventDefault()
-              setExternalDrop(null)
-              const target = (e.target as Element).closest<HTMLElement>('[data-folder]')?.dataset.folder ?? currentDir()
-              const entries = Array.from(e.dataTransfer.files).map(file => ({ file, rel: file.name }))
-              void doUpload(entries, target, 'error')
-            }}>
-            <div
-              class="files-tree-dir files-tree-dir--root" role="treeitem" data-path="" data-folder="" tabIndex={focused() === '' ? 0 : -1}
-              title="语料库根目录" aria-label="语料库根目录" onFocus={() => setFocused('')} onKeyDown={e => rowKey(e, { path: '', isDir: true })}
-              classList={{ 'files-tree-dir--current': currentDir() === '', 'files-drop-valid': drop() === '' && !!drag() && validMove(drag()!.path, drag()!.isDir, ''), 'files-drop-invalid': drop() === '' && !!drag() && !validMove(drag()!.path, drag()!.isDir, '') }}
-              onClick={() => setCurrentDir('')}
-            >
-              <md-icon class="files-tree-icon">
-                {currentDir() === '' ? <IconFolderOpen size={18} /> : <IconFolder size={18} />}
-              </md-icon>
-              <span class="md-typescale-label-large">/ 根目录</span>
-            </div>
-            <TreeRows nodes={tree()} depth={0} />
-          </div>
-        </div>
-      </md-elevated-card>
-
-      <div class="files-resizer" role="separator" aria-label="调整文件树宽度" aria-orientation="vertical" aria-valuemin={260} aria-valuemax={600} aria-valuenow={treeWidth()} tabIndex={0}
-        onPointerDown={resize} onKeyDown={e => { if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') { e.preventDefault(); setTreeWidth(w => Math.max(260, Math.min(600, w + (e.key === 'ArrowRight' ? 20 : -20)))) } }} />
-      <md-elevated-card class="files-viewer-card">
-        <div class="files-viewer-inner">
-          <Show
-            when={selected()}
-            fallback={
-              <div class="files-viewer-empty md-typescale-body-medium">
-                从左边选择一个文件查看内容。点击文件夹可将其设为上传落点；
-                行尾更多菜单可重命名、移动或永久删除。
-              </div>
-            }
-          >
-            <div class="files-preview-heading">
-              <md-text-button class="files-back" onClick={() => setPreview(false)}><md-icon slot="icon"><IconArrowBack /></md-icon>返回文件列表</md-text-button>
-              <nav aria-label="文件路径" class="files-breadcrumbs">
-                <md-text-button onClick={() => { setCurrentDir(''); setPreview(false) }}>根目录</md-text-button>
-                <For each={selected()!.split('/').slice(0, -1)}>{(part, index) => <><span aria-hidden="true">/</span><md-text-button onClick={() => {
-                  const path = selected()!.split('/').slice(0, index() + 1).join('/')
-                  setCurrentDir(path); setDirOpen(path, true); setPreview(false)
-                }}>{part}</md-text-button></>}</For>
-              </nav>
-              <h2 class="md-typescale-title-large" title={selected()!}>{selected()!.split('/').pop()}</h2>
-              <md-text-button onClick={locate}>在文件树中定位</md-text-button>
-            </div>
-            <div class="files-preview-scroll" ref={previewBody} onScroll={() => { if (selected() && previewReadyPath === selected()) scrollPositions.set(selected()!, previewBody!.scrollTop) }}>
-            <FileViewer
-              path={selected()}
-              anchorLine={null}
-              fetchFile={api.filesRaw}
-              revision={fileIndex().get(selected()!)?.revision}
-              onReady={path => {
-                if (path !== selected() || !previewBody) return
-                previewReadyPath = path
-                previewBody.scrollTop = scrollPositions.get(path) ?? 0
-              }}
-              reloadToken={viewerVersion()}
-              class="note-body md-typescale-body-medium files-viewer-body"
-            />
-            </div>
-          </Show>
-        </div>
-      </md-elevated-card>
-
-      {/* ---- rename dialog ---- */}
-      <Show when={renameTarget()}>
-        <md-dialog
-          class="files-dialog"
-          open
-          ref={el => el && applyDialogGuard(el as HTMLElement, closeRename)}
-        >
-          <div slot="headline">
-            重命名{renameTarget()!.isDir ? '文件夹' : '文件'}
-          </div>
-          <div slot="content" class="files-dialog-content">
-            <div class="files-dialog-path md-typescale-label-small">
-              {renameTarget()!.path}
-            </div>
-            <md-outlined-text-field
-              class="files-rename-input"
-              label="新名称"
-              value={renameValue()}
-              onInput={(e: Event) =>
-                setRenameValue((e.target as HTMLInputElement).value)}
-              on:keydown={(e: KeyboardEvent) => {
-                if (e.key === 'Enter' && !e.isComposing) { e.preventDefault(); void submitRename() }
-              }}
-            />
-            <Show when={isListed(renameTarget()!.path)}>
-              <div class="files-dialog-note md-typescale-body-small">
-                该文件在阅读清单中——重命名后阅读进度会自动跟随，不会丢失。
-              </div>
-            </Show>
-          </div>
-          <div slot="actions">
-            <md-text-button onClick={closeRename} disabled={renameBusy()}>
-              取消
-            </md-text-button>
-            <md-filled-button
-              onClick={submitRename}
-              disabled={renameBusy() || !renameValue().trim()}
-            >
-              重命名
-            </md-filled-button>
-          </div>
-        </md-dialog>
-      </Show>
-
-      {/* ---- move dialog ---- */}
-      <Show when={moveTarget()}>
-        <md-dialog
-          class="files-dialog"
-          open
-          ref={el => el && applyDialogGuard(el as HTMLElement, closeMove)}
-        >
-          <div slot="headline">
-            移动{moveTarget()!.isDir ? '文件夹' : '文件'}
-          </div>
-          <div slot="content" class="files-dialog-content">
-            <div class="files-dialog-path md-typescale-label-small">
-              {moveTarget()!.path}
-            </div>
-            <div class="files-move-hint md-typescale-label-small">选择目标文件夹：</div>
-            <div class="files-move-list">
-              <div
-                class="files-move-dir" role="button" tabIndex={0} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setMoveDest('') } }}
-                classList={{
-                  'files-move-dir--pick': moveDest() === '',
-                  'files-move-dir--disabled': moveTarget()!.isDir && moveForbidden(''),
-                }}
-                onClick={() => {
-                  if (!(moveTarget()!.isDir && moveForbidden(''))) setMoveDest('')
-                }}
-              >
-                <md-icon class="files-tree-icon">
-                  {moveDest() === '' ? <IconFolderOpen size={18} /> : <IconFolder size={18} />}
-                </md-icon>
-                <span class="md-typescale-body-medium">/ 根目录</span>
-              </div>
-              <MoveDirRows nodes={dirTree()} depth={1} />
-            </div>
-            <Show when={moveDest() !== null && moveDest() === moveCurrentParent()}>
-              <div class="files-dialog-note md-typescale-body-small">
-                已在该文件夹中——继续将不会有任何变化。
-              </div>
-            </Show>
-            <Show when={isListed(moveTarget()!.path)}>
-              <div class="files-dialog-note md-typescale-body-small">
-                该文件在阅读清单中——移动后阅读进度会自动跟随，不会丢失。
-              </div>
-            </Show>
-          </div>
-          <div slot="actions">
-            <md-text-button onClick={closeMove} disabled={moveBusy()}>
-              取消
-            </md-text-button>
-            <md-filled-button
-              onClick={submitMove}
-              disabled={moveBusy() || moveDest() === null || !validMove(moveTarget()!.path, moveTarget()!.isDir, moveDest()!)}
-            >
-              移动
-            </md-filled-button>
-          </div>
-        </md-dialog>
-      </Show>
-
-      {/* ---- delete dialog (typed-name 防呆) ---- */}
-      <Show when={deleteTarget()}>
-        <md-dialog
-          class="files-dialog"
-          open
-          ref={el => el && applyDialogGuard(el as HTMLElement, closeDelete)}
-        >
-          <div slot="headline">
-            永久删除{deleteTarget()!.isDir ? '文件夹' : '文件'}
-          </div>
-          <div slot="content" class="files-dialog-content">
-            <div class="files-dialog-path md-typescale-label-small">
-              {deleteTarget()!.path}
-            </div>
-            <div class="files-delete-warn md-typescale-body-medium">
-              将从磁盘永久删除{deleteTarget()!.isDir ? '整个文件夹及其内容' : '该文件'}，无法恢复。
-            </div>
-            <Show when={deleteListedCount() > 0}>
-              <div class="files-delete-warn files-delete-warn--listed md-typescale-body-small">
-                其中 {deleteListedCount()} 个文件在阅读清单中：阅读进度将一并清除；已制的 Anki 卡片会保留。
-              </div>
-            </Show>
-            <md-outlined-text-field
-              class="files-delete-input"
-              label={`输入 ${deleteBasename()} 以确认`}
-              value={deleteConfirm()}
-              onInput={(e: Event) =>
-                setDeleteConfirm((e.target as HTMLInputElement).value)}
-            />
-          </div>
-          <div slot="actions">
-            <md-text-button onClick={closeDelete} disabled={deleteBusy()}>
-              取消
-            </md-text-button>
-            <md-filled-button
-              class="danger-button"
-              onClick={submitDelete}
-              disabled={!deleteCanSubmit()}
-            >
-              永久删除
-            </md-filled-button>
-          </div>
-        </md-dialog>
-      </Show>
-
-      {/* ---- upload conflict dialog ---- */}
-      <Show when={conflict()}>
-        <md-dialog class="files-dialog" open>
-          <div slot="headline">文件名冲突</div>
-          <div slot="content" class="files-dialog-content">
-            <div class="md-typescale-body-medium">
-              以下 {conflict()!.names.length} 个文件在目标位置已存在：
-            </div>
-            <div class="files-conflict-list md-typescale-body-small">
-              <For each={conflict()!.names.slice(0, 8)}>
-                {n => <div class="files-conflict-item">{n}</div>}
-              </For>
-              <Show when={conflict()!.names.length > 8}>
-                <div class="files-conflict-item">…等共 {conflict()!.names.length} 个</div>
-              </Show>
-            </div>
-          </div>
-          <div slot="actions">
-            <md-text-button
-              onClick={() => setConflict(null)}
-              disabled={conflictBusy()}
-            >
-              取消上传
-            </md-text-button>
-            <md-outlined-button
-              onClick={() => retryWithPolicy('skip')}
-              disabled={conflictBusy()}
-            >
-              跳过重名
-            </md-outlined-button>
-            <md-outlined-button
-              onClick={() => retryWithPolicy('rename')}
-              disabled={conflictBusy()}
-            >
-              改名保留两者
-            </md-outlined-button>
-            <md-filled-button
-              class="danger-button"
-              onClick={() => retryWithPolicy('overwrite')}
-              disabled={conflictBusy()}
-            >
-              覆盖
-            </md-filled-button>
-          </div>
-        </md-dialog>
-      </Show>
-
-      <div class="files-feedback" role="status" aria-live="polite">
-        <Show when={externalDrop() !== null}>外部文件：上传至 {externalDrop() || '根目录'}</Show>
-        <Show when={drag()}>{drop() === null ? '拖到文件夹或根目录以移动；Esc 取消' : validMove(drag()!.path, drag()!.isDir, drop()!) ? `移动至 ${drop() || '根目录'}` : '不能移动到此位置'}</Show>
-        <Show when={undoId()}><md-text-button disabled={busy()} onClick={undoMove}>撤销上次文件迁移</md-text-button></Show>
-      </div>
-      <Snackbar open={!!snack()} label={snack()} />
+  else if(action!=='preview')open(action,normalized)
+ }
+ const menuTargets=(t:Entry)=>selected().has(t.path)?targets():[t]
+ function context(e:MouseEvent,t:Entry){e.preventDefault();if(!selected().has(t.path))choose(t);const row=e.currentTarget as HTMLElement;(row.querySelector('md-icon-button') as HTMLElement)?.click()}
+ function key(e:KeyboardEvent){
+  if(editingEvent(e)||dialog())return
+  const t=rows().find(x=>x.path===focused()),paths=rows().map(t=>t.path),i=paths.indexOf(focused())
+  if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='a'){e.preventDefault();setSelected(new Set(paths));return}
+  if(e.key==='Escape'){e.preventDefault();setDrag([]);setDrop(null);if(drawer())setDrawer(false);else if(previewPath())closePreview();else setSelected(new Set<string>());return}
+  let next=-1
+  if(e.key==='ArrowDown')next=Math.min(paths.length-1,i+1)
+  if(e.key==='ArrowUp')next=Math.max(0,i-1)
+  if(e.key==='Home')next=0
+  if(e.key==='End')next=paths.length-1
+  if(next>=0&&rows()[next]){e.preventDefault();choose(rows()[next],e);focusRow(paths[next]);return}
+  if(!t)return
+  if(e.key==='Enter'||e.key===' '){e.preventDefault();preview(t)}
+  if(e.key==='F2'){e.preventDefault();if(targets().length===1)command('rename',targets())}
+  if(e.key==='Delete'){e.preventDefault();command('delete',targets())}
+  if(e.key==='ContextMenu'||e.shiftKey&&e.key==='F10'){e.preventDefault();const row=Array.from(list.querySelectorAll<HTMLElement>('[data-entry]')).find(n=>n.dataset.entry===t.path);(row?.querySelector('md-icon-button') as HTMLElement)?.click()}
+  // Ctrl+Z belongs only to the explicit file migration undo button, never study undo.
+ }
+ function startDrag(e:DragEvent,t:Entry){
+  if(busy()||!requestDraftLeave()){e.preventDefault();return}
+  const items=normalizeTargets(selected().has(t.path)?targets():[t]);setSelected(new Set(items.map(t=>t.path)));setDrag(items);suppressClick=true
+  e.dataTransfer!.effectAllowed='move';e.dataTransfer!.setData('application/x-ir4anki-paths',JSON.stringify(items.map(x=>x.path)));e.dataTransfer!.setData('text/plain',items.map(x=>x.path).join('\n'))
+ }
+ function over(e:DragEvent,dest:string){
+  if(!drag().length){if(e.dataTransfer?.types.includes('Files')){e.preventDefault();e.stopPropagation();e.dataTransfer.dropEffect='none';setExternalDrop(true)}return}
+  e.preventDefault();e.stopPropagation();setDrop(dest);e.dataTransfer!.dropEffect=moveError(drag(),dest,all())||busy()?'none':'move'
+ }
+ function dropped(e:DragEvent,dest:string){
+  if(e.dataTransfer?.types.includes('Files')){e.preventDefault();setExternalDrop(false);setMessage('这是外部文件，请使用“导入”选择文件并确认当前目录');return}
+  if(!drag().length)return
+  e.preventDefault();e.stopPropagation();const items=drag();setDrag([]);setDrop(null)
+  const error=moveError(items,dest,all());if(error){setMessage(error);return}void relocation('move',items,dest)
+ }
+ function dropClass(path:string){return {'fb-drop-valid':drop()===path&&!!drag().length&&!moveError(drag(),path,all()),'fb-drop-invalid':drop()===path&&!!drag().length&&!!moveError(drag(),path,all())}}
+ function pickImport(folder=false){if(busy()||!requestDraftLeave())return;returnFocus=document.activeElement as HTMLElement;uploadDirectory=currentDir();(folder?folderInput:input).click()}
+ async function importFiles(input:HTMLInputElement){
+  const entries=Array.from(input.files??[]).map(file=>({file,rel:(file as File&{webkitRelativePath?:string}).webkitRelativePath||file.name}));input.value=''
+  if(!entries.length||busy()||!requestDraftLeave())return
+  const {supported,skipped}=partitionImports(entries,true)
+  setSkippedImports(skipped)
+  setMessage(supported.length?'':'没有可导入的文件，请展开跳过清单查看原因')
+  if(supported.length)await importEntries(supported,uploadDirectory,'error')
+ }
+ async function importEntries(entries:ImportEntry[],dir:string,policy:'error'|'overwrite'|'rename'|'skip'='error'){
+  if(!entries.length||busy()||!requestDraftLeave())return
+  setWorking(true)
+  const generic=entries.filter(e=>!(/\.(pdf|ppt|pptx)$/i.test(e.file.name)))
+  const target=(e:ImportEntry)=>({path:[dir,e.rel].filter(Boolean).join('/'),isDir:false})
+  const targets=entries.map(target),units=[...(generic.length?[generic.map(target)]:[]),...entries.filter(e=>/\.(pdf|ppt|pptx)$/i.test(e.file.name)).map(e=>[target(e)])]
+  let genericHalted=false
+  const unknown=(e:unknown)=>!(e instanceof ApiError&&e.status>=400&&e.status<500||e instanceof UploadConflictError||e instanceof Error&&/已存在|冲突|格式|不支持|conflict/i.test(e.message))
+  try{
+   await batch.runUnits('导入',targets,units,async items=>{
+    if(genericHalted)return items.map(t=>({path:t.path,status:'not-started' as const}))
+    const coupled=generic.some(e=>target(e).path===items[0].path)
+    try{
+     if(coupled){const result=await api.filesUpload(generic,dir,policy);if(Object.keys(result.images_renamed??{}).length&&alive)setMessage('图片重名已自动改名并更新引用：'+Object.entries(result.images_renamed).map(([a,b])=>a+' → '+b).join('；'))}
+     else {const entry=entries.find(e=>target(e).path===items[0].path)!;const body=new FormData();body.append('file',entry.file);body.append('path',items[0].path);await lectureRequest('/import','POST',body)}
+     if(alive){for(const t of items)invalidateFileCache(t.path);window.dispatchEvent(new Event('lecture-documents-changed'));setVersion(v=>v+1)}
+     return items.map(t=>({path:t.path,status:'confirmed' as const}))
+    }catch(e){
+     if(e instanceof UploadPartialError){genericHalted=e.remaining.length>0;return items.map(t=>{
+      const entry=generic.find(x=>target(x).path===t.path)!
+      const status=e.saved.some(s=>s.action==='skipped'?s.path===entry.rel:s.path===t.path||(s as {original?:string}).original===entry.rel)?'confirmed':e.failed===entry.rel||e.failed===t.path?'failed':e.remaining.includes(entry.rel)||e.remaining.includes(t.path)?'not-started':'unconfirmed'
+      return {path:t.path,status,message:status==='confirmed'?undefined:e.message}
+     })}
+     if(e instanceof UploadConflictError&&policy==='error'&&alive)setImportConflict({entries:generic,dir,names:e.conflicts})
+     if(unknown(e))throw Object.assign(new Error('导入结果待确认，请刷新核对；不会自动重试。'+(e as Error).message),{uncertain:true})
+     throw e
+    }
+   })
+  }catch(e){if(alive)setMessage('导入状态无法保留，请核对已保存文件：'+(e as Error).message)}finally{if(alive){setWorking(false);await reload()}}
+ }
+ async function undo(){
+  const id=undoId();if(!id||busy()||!requestDraftLeave())return;setWorking(true)
+  try{await operations.run('undo','',id);if(alive)setMessage('已撤销上次单项文件迁移')}
+  catch(e){if(alive)setMessage((e as Error).message)}finally{if(alive){setWorking(false);await reload()}}
+ }
+ const dialogRef=(el:HTMLDialogElement)=>{queueMicrotask(()=>{if(el.isConnected&&!el.open)el.showModal()})}
+ return <section class="fb-workspace" aria-label="文件工作区" onKeyDown={key} onPointerDown={()=>{suppressClick=false}} onDragOver={e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();setExternalDrop(true)}}} onDrop={e=>{if(e.dataTransfer?.types.includes('Files')){e.preventDefault();setExternalDrop(false);setMessage('外部文件请使用导入按钮')}}}>
+  <input ref={input} hidden type="file" multiple accept=".md,.pdf,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.svg,.bmp,.avif" onChange={e=>void importFiles(e.currentTarget)}/>
+  <input ref={el=>{folderInput=el;el.setAttribute('webkitdirectory','')}} hidden type="file" multiple onChange={e=>void importFiles(e.currentTarget)}/>
+  <header class="fb-header"><div><h1>文件</h1><p>管理阅读文件</p></div><div class="fb-import-actions"><md-filled-button disabled={busy()} onClick={()=>pickImport()}>导入文件</md-filled-button><md-outlined-button disabled={busy()} onClick={()=>pickImport(true)}>导入文件夹</md-outlined-button><md-outlined-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-outlined-button><Show when={undoId()}><FilesMenu label="更多文件操作" disabled={busy()} actions={[{label:'撤销上次单项迁移',run:()=>void undo()}]}/></Show></div></header>
+  <Show when={skippedImports().length}><details class="fb-report fb-import-skipped"><summary>已跳过 {skippedImports().length} 个文件（未上传）</summary><div class="fb-report-items"><For each={skippedImports()}>{item=><div><strong>{item.rel}</strong><span>{item.reason}</span></div>}</For></div></details></Show>
+  <div class="fb-layout">
+   <Show when={drawer()}><button class="fb-drawer-scrim" aria-label="关闭目录导航" onClick={()=>setDrawer(false)}/></Show>
+   <aside class="fb-sidebar" classList={{'fb-sidebar--open':drawer()}} aria-label="文件夹导航" onKeyDown={e=>{
+    if(e.key==='Escape'){setDrawer(false);document.querySelector<HTMLElement>('.fb-directory-toggle')?.focus()}
+    if(drawer()&&e.key==='Tab'){const controls=Array.from(e.currentTarget.querySelectorAll<HTMLElement>('button'));const first=controls[0],last=controls.at(-1);if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus()}else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus()}}
+   }}>
+    <div class="fb-sidebar-heading"><strong>文件夹</strong><button class="fb-drawer-close" onClick={()=>setDrawer(false)}>关闭</button></div>
+    <div class="fb-directories"><button class="fb-directory" classList={{'fb-directory--current':!currentDir(),...dropClass('')}} aria-current={!currentDir()?'page':undefined} onClick={()=>navigate('')} onDragOver={e=>over(e,'')} onDrop={e=>dropped(e,'')}><IconFolderOpen size={20}/><span>全部文件</span></button>
+    <For each={dirs().slice().sort((a,b)=>a.localeCompare(b,'zh-Hans-CN'))}>{path=><button class="fb-directory" classList={{'fb-directory--current':currentDir()===path,...dropClass(path)}} style={{'padding-left':`${12+Math.min(path.split('/').length-1,5)*12}px`}} aria-current={currentDir()===path?'page':undefined} title={path} onClick={()=>navigate(path)} onDragOver={e=>over(e,path)} onDrop={e=>dropped(e,path)}><IconFolder size={20}/><span>{basename(path)}</span></button>}</For></div>
+    <p class="fb-sidebar-help">点击目录进入；拖入已选项目可移动。</p>
+   </aside>
+   <main class="fb-main">
+    <nav class="fb-navigation" aria-label="当前文件夹路径"><button class="fb-directory-toggle" onClick={()=>{setDrawer(true);requestAnimationFrame(()=>document.querySelector<HTMLElement>('.fb-sidebar button')?.focus())}}>目录</button><md-icon-button aria-label="后退" disabled={!history().length} onClick={goBack}><md-icon><IconArrowBack/></md-icon></md-icon-button><md-icon-button aria-label="上一级" disabled={!currentDir()} onClick={()=>navigate(parentPath(currentDir()))}><md-icon><span style={{display:'flex',transform:'rotate(90deg)'}}><IconArrowBack/></span></md-icon></md-icon-button><div class="fb-breadcrumb"><button onClick={()=>navigate('')}>全部文件</button><For each={currentDir().split('/').filter(Boolean)}>{(part,index)=><><IconChevronRight size={16}/><button title={currentDir().split('/').slice(0,index()+1).join('/')} onClick={()=>navigate(currentDir().split('/').slice(0,index()+1).join('/'))}>{part}</button></>}</For></div><md-icon-button aria-label="刷新文件列表" onClick={()=>void reload()} disabled={loading()||working()}><md-icon><IconRestartAlt/></md-icon></md-icon-button></nav>
+    <div class="fb-search"><input type="search" aria-label="在全部文件中搜索" placeholder="在全部文件中搜索" value={query()} onInput={e=>setQuery(e.currentTarget.value)}/></div>
+    <Show when={message()||drag().length||externalDrop()}><div role="status" aria-live="polite"><Show when={drag().length}>{drop()===null?'拖到文件夹或根目录；Escape 取消':moveError(drag(),drop()!,all())||`移动到 ${drop()||'根目录'}`}</Show><Show when={externalDrop()}>外部文件请使用导入按钮</Show><span>{message()}</span></div></Show>
+  <Show when={report()?.items.some(i=>i.status!=='confirmed')}><details class="fb-operation-feedback fb-recovery" open role="alert"><summary>{report()!.action}结果 · {report()!.items.filter(i=>i.status==='confirmed').length}/{report()!.items.length} 已确认{unresolved()?' · 有待确认项目，已停止后续操作':''}</summary><div class="fb-report-items"><For each={report()!.items}>{item=><div><strong>{item.path}</strong><span>{({'confirmed':'已确认','failed':'失败','unconfirmed':'结果待确认','not-started':'未开始','running':'处理中'})[item.status]}</span><span>{item.message}</span><Show when={item.status==='unconfirmed'}><small>当前列表：{all().some(t=>t.path===item.path)?'原路径仍可见':'原路径未列出'}。请核对原路径与目标；这不代表原请求已确认。</small></Show></div>}</For></div><Show when={!working()}><md-text-button disabled={(operationVersion(),operations.isBusy())} onClick={()=>{setReport(null);sessionStorage.removeItem(batchKey)}}>{unresolved()?'已核对，结束本批；不重试剩余项目':'关闭结果'}</md-text-button></Show></details></Show>
+    <div class="fb-command-slot" aria-label="文件操作">
+     <Show when={selected().size} fallback={<div class="fb-folder-heading"><strong>{basename(currentDir())||'全部文件'}</strong><span>{rows().length} 项 · 导入到 {currentDir()||'根目录'}</span></div>}>
+      <div class="fb-selection-heading"><strong>已选择 {selected().size} 项</strong><button onClick={()=>setSelected(new Set<string>())}>取消选择</button></div><div class="fb-selection-actions"><md-text-button disabled={busy()||targets().length!==1||targets()[0]?.isDir} onClick={()=>command('preview',targets())}>预览</md-text-button><md-text-button disabled={busy()||targets().length!==1} onClick={()=>command('rename',targets())}>重命名</md-text-button><md-text-button disabled={busy()} onClick={()=>command('delete',targets())}>删除</md-text-button></div>
+     </Show>
     </div>
-  )
+    <div class="fb-list" ref={list} tabIndex={0} role="listbox" aria-label="当前文件夹内容" aria-multiselectable="true" aria-busy={loading()||working()} onDragOver={e=>over(e,currentDir())} onDrop={e=>dropped(e,currentDir())} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node)){setDrop(null);setExternalDrop(false)}}}>
+     <Show when={loading()}><p role="status" class="fb-empty">正在读取文件列表…</p></Show>
+     <Show when={loadError()}><div class="fb-empty" role="alert">{loadError()}<md-text-button onClick={()=>void reload()}>重试</md-text-button></div></Show>
+     <Show when={!loading()&&!loadError()&&!rows().length}><div class="fb-empty"><IconFolderOpen size={40}/><h2>{query()?'没有匹配项目':'这个文件夹还是空的'}</h2><p>{query()?'试试其他文件名或文件夹名。':'可导入 Markdown、PDF / PPT / PPTX 和图片，也可先创建文件夹。'}</p><Show when={!query()}><md-filled-tonal-button disabled={busy()} onClick={()=>pickImport()}>导入到当前文件夹</md-filled-tonal-button><md-text-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-text-button></Show></div></Show>
+     <For each={rows()}>{t=><div class="fb-row" data-entry={t.path} role="option" aria-selected={selected().has(t.path)} tabindex={focused()===t.path?0:-1} title={t.path} classList={{'fb-row--selected':selected().has(t.path),...t.isDir?dropClass(t.path):{}}} draggable={!busy()} onFocus={()=>setFocused(t.path)} onClick={e=>choose(t,e)} onDblClick={e=>{if(!(e.target as Element).closest('button,md-icon-button,.files-menu,input'))preview(t)}} onContextMenu={e=>context(e,t)} onDragStart={e=>startDrag(e,t)} onDragEnd={()=>{setDrag([]);setDrop(null)}} onDragOver={t.isDir?e=>over(e,t.path):undefined} onDrop={t.isDir?e=>dropped(e,t.path):undefined}>
+      <input class="fb-checkbox" type="checkbox" aria-label={`选择 ${basename(t.path)}`} checked={selected().has(t.path)} onClick={e=>{e.stopPropagation();choose(t,{ctrlKey:true,metaKey:false,shiftKey:e.shiftKey} as MouseEvent)}}/>
+      <span class="fb-type-icon">{t.isDir?<IconFolder size={22}/>:<IconDescription size={22}/>}</span>
+      <div class="fb-name"><span class="fb-basename">{t.isDir?basename(t.path):<>{basename(t.path).slice(0,Math.max(0,basename(t.path).lastIndexOf('.')))||basename(t.path)}<span class="fb-extension">{basename(t.path).includes('.')?basename(t.path).slice(basename(t.path).lastIndexOf('.')):''}</span></>}</span><span class="fb-meta">{t.isDir?'文件夹':/\.pdf$/i.test(t.path)?'PDF':/\.ppt$/i.test(t.path)?'PPT':/\.pptx$/i.test(t.path)?'PPTX':'Markdown'}{membership().has(t.path)?' · 阅读清单':''}<Show when={query().trim()}> · {parentPath(t.path)||'根目录'}</Show></span></div>
+      <FilesMenu label={`更多操作：${basename(t.path)}`} disabled={busy()} actions={[
+       ...(!t.isDir?[{label:'预览',run:()=>command('preview',[t])}]:[]),
+       {label:'重命名',run:()=>{const ts=menuTargets(t);if(ts.length===1)command('rename',ts);else setMessage('重命名需要只选择一个项目')}},
+       {label:'复制路径',run:()=>command('copy',menuTargets(t))},
+       {label:'永久删除',run:()=>command('delete',menuTargets(t))}
+      ]}/>
+     </div>}</For>
+    </div>
+    <footer class="fb-footer"><span>{rows().length} 项{selected().size?` · 已选 ${selected().size}`:''}</span><span>{currentDir()||'根目录'}</span></footer>
+   </main>
+   <Show when={previewPath()}><aside class="fb-preview" role="region" aria-label="文件预览"><div class="fb-preview-header"><h2 title={previewPath()!}>{basename(previewPath()!)}</h2><md-text-button onClick={closePreview}>关闭预览</md-text-button></div><div class="fb-preview-body" classList={{'fb-preview-body--lecture':/\.(pdf|ppt|pptx)$/i.test(previewPath()!)}} inert={working()}>
+    <Show when={/\.(pdf|ppt|pptx)$/i.test(previewPath()!)} fallback={<FileViewer path={previewPath()} anchorLine={null} fetchFile={api.filesRaw} revision={files().find(f=>f.path===previewPath())?.revision} reloadToken={version()} class="note-body"/>}><FilesLecturePreview path={previewPath()!}/></Show>
+   </div></aside></Show>
+  </div>
+  <Show when={mkdirPending()}><div class="fb-recovery" role="alert">创建结果待核对：{mkdirPending()!.path}。{mkdirObserved()?'目录现已存在；请确认这是否为预期结果。':'列表尚未确认该目录；请刷新核对。'}<md-text-button disabled={working()||loading()} onClick={()=>{setMkdirPending(null);sessionStorage.removeItem(mkdirKey);setMessage('已结束创建结果核对；不会重发原请求')}}>已核对，结束本次操作</md-text-button></div></Show>
+  <Show when={importConflict()&&!working()&&!unresolved()}><dialog ref={dialogRef} class="fb-dialog" onCancel={e=>{e.preventDefault();setImportConflict(null);restoreFocus()}}><h2>导入文件名冲突</h2><p>重新导入到：{importConflict()!.dir||'根目录'}。以下 Markdown 名称已存在；默认不覆盖。</p><div class="fb-dialog-targets"><For each={importConflict()!.names}>{name=><p>{name}</p>}</For></div><p>选择“覆盖”会替换这些原文；其余选择会跳过冲突或改名保留两份。PDF / PPT / PPTX 的历史版本始终在课件预览中单独导入。</p><div class="fb-conflict-actions"><button onClick={()=>{setImportConflict(null);restoreFocus()}}>取消上传</button><For each={[{policy:'skip' as const,label:'跳过重名'},{policy:'rename' as const,label:'改名保留两者'},{policy:'overwrite' as const,label:'覆盖'}]}>{choice=><button disabled={busy()} onClick={()=>{const c=importConflict()!;setImportConflict(null);void importEntries(c.entries,c.dir,choice.policy)}}>{choice.label}</button>}</For></div></dialog></Show>
+  <Show when={dialog()}><dialog ref={dialogRef} class="fb-dialog" onCancel={e=>{e.preventDefault();closeDialog()}} onClose={()=>{if(dialog()&&!working())closeDialog()}}><form onSubmit={e=>{e.preventDefault();const d=dialog()!;if(d.kind==='mkdir')void mkdir();else if(d.kind==='rename')void relocation(d.kind,d.targets,value().trim())}}>
+   <h2>{({'rename':'重命名','delete':'删除','mkdir':'新建文件夹'})[dialog()!.kind]}</h2>
+   <Show when={dialog()!.kind==='mkdir'}><p>创建在：{currentDir()||'根目录'}</p></Show>
+   <Show when={dialog()!.kind!=='delete'&&dialog()!.targets.length}><div class="fb-dialog-targets"><For each={dialog()!.targets}>{t=><p>{t.path}{t.isDir?'（含全部子项）':''}</p>}</For></div></Show>
+   <Show when={dialog()!.kind==='rename'||dialog()!.kind==='mkdir'}><label>名称<input autofocus aria-label="名称" value={value()} onInput={e=>setValue(e.currentTarget.value)} required maxLength={255}/></label></Show>
+   <Show when={dialog()!.kind==='delete'}><p>{dialog()!.targets.length===1?`确认删除${dialog()!.targets[0].isDir?'文件夹':''}「${basename(dialog()!.targets[0].path)}」？此操作无法撤销。`:`确认删除这 ${dialog()!.targets.length} 项？此操作无法撤销。`}</p></Show>
+   <Show when={dialogError()}><p class="fb-error" role="alert">{dialogError()}</p></Show>
+   <div class="fb-dialog-actions"><button type="button" autofocus={dialog()!.kind==='delete'} disabled={working()} onClick={closeDialog}>取消</button><button type={dialog()!.kind==='delete'?'button':'submit'} disabled={working()||['rename','mkdir'].includes(dialog()!.kind)&&!value().trim()} onClick={()=>{const d=dialog();if(d?.kind==='delete')void remove(d.targets)}}>{dialog()!.kind==='delete'?'删除':'确认'}</button></div>
+  </form></dialog></Show>
+ </section>
 }

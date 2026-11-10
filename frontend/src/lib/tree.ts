@@ -3,6 +3,11 @@
 // flat corpus paths (year/科目/文件.md) into the same TreeNode shape).
 
 export interface TreeFile {
+  kind?: 'pdf'
+  document_id?: string
+  revision_id?: string
+  status?: string
+  page_count?: number
   path: string
   title: string
   revision?: string
@@ -11,6 +16,8 @@ export interface TreeFile {
   /** previously removed with parked progress — picker offers 重新播种
    * (fresh add, whole-file seeding escape hatch 2026-09-24) */
   archived?: boolean
+  /** effective character count of the markdown file */
+  chars?: number
 }
 
 export interface TreeNode {

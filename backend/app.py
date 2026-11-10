@@ -295,8 +295,18 @@ READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db"
 # corpus scan exclusions (editor/tool dirs + the note-image store, never
 # note content). _assets holds reading-mode image uploads (P5, 2026-09-23)
 # and is served by basename at /api/reading/media/<name>.
-NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "_assets"}
+NOTES_SKIP_DIRS = {".obsidian", ".git", ".trash", "node_modules", "_assets", "page-notes"}
 READING_ACTIONS = ("mark_active", "complete", "skip", "next", "promote", "demote")
+
+# Lecture storage is lazy: importing the app does not open a collection or
+# create a lecture store. This directory belongs to state, outside corpus scan.
+from functools import lru_cache
+_lecture_heavy = asyncio.Semaphore(2)
+@lru_cache(maxsize=1)
+def _lectures():
+    from lecture_integration import Lectures
+    return Lectures(STATE_DIR / 'lectures')
+
 
 
 def _capped_study_modes(review_size: int | None = None,
@@ -403,7 +413,14 @@ async def _lifespan(app_instance):
             await anki("createBackup", {"folder": str(BACKUP_DIR)})
             task = asyncio.create_task(_periodic_backup(backup_stop))
         _files_relocator().recover()
-        yield
+        from lecture_routes import jobs as lecture_jobs
+        lecture_task = asyncio.create_task(lecture_jobs(sys.modules[__name__]))
+        try:
+            yield
+        finally:
+            lecture_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await lecture_task
     finally:
         backup_stop.set()
         if _sync_timer is not None:
@@ -1846,7 +1863,14 @@ async def add_card(body: NoteAdd):
     (先看后考, same route as add_cards.py's default). Preview mode off:
     stays in RELEASE_DECK as a regular new card.
     """
-    if not any(html_to_text(v) for v in body.fields.values()):
+    if body.reading_source and body.reading_source.get('kind') == 'pdf':
+        source = body.reading_source
+        from lecture_store import Conflict
+        try:
+            _lectures().effective_source(source)
+        except (ValueError, Conflict) as exc:
+            raise HTTPException(409, str(exc)) from exc
+    if not any(html_to_text(v) or re.search(r'<img\s[^>]*src=[\"\']', v, re.I) for v in body.fields.values()):
         raise HTTPException(status_code=400, detail="卡片内容不能为空")
     model = ADD_CLOZE_MODEL if body.kind == "cloze" else ADD_MODEL
     # 挖空卡 must carry at least one cloze marker — otherwise Anki creates a
@@ -2227,11 +2251,9 @@ def _reanchor_entry(entry: dict, lines: list[str], new_sha: str) -> None:
             s["end_line"] = st + span - 1
             s["first_line"] = lines[st - 1] if st - 1 < n else ""
 
-    for s in sorted(
-        (x for x in segs if x.get("status") == "container"),
-        key=lambda x: x.get("seg_id") or 0,
-        reverse=True,
-    ):  # pass 2: containers bottom-up — own fp, else union of live children
+    for s in segs:  # pass 2: containers — own fp, else union of live children
+        if s.get("status") != "container":
+            continue
         span = s["end_line"] - s["start_line"] + 1
         st = _relocate_span(
             lines, s.get("fingerprint", ""), s.get("first_line", ""), span, s["start_line"]
@@ -2296,6 +2318,23 @@ def _file_view(entry: dict, gated: set | None = None):
     are truly released (out of 预览池 AND unsuspended) — but it does NOT
     block its file; later segments deal normally.
     """
+    if entry.get("kind") == "pdf":
+        ordered_pdf, summary_pdf = _lectures().view(entry, gated)
+        page_counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0, "background": 0}
+        for _, _, seg in ordered_pdf:
+            st = seg.get("status", "todo")
+            pages = max(0, int(seg.get("page_end", 0)) - int(seg.get("page_start", 1)) + 1)
+            page_counts[st if st in page_counts else "todo"] += pages
+        summary_pdf.update(
+            total_pages=sum(page_counts.values()),
+            read_pages=page_counts["done"] + page_counts["skipped"] + page_counts["background"],
+            active_pages=page_counts["active"],
+            todo_pages=page_counts["todo"],
+            done_pages=page_counts["done"],
+            skipped_pages=page_counts["skipped"],
+            background_pages=page_counts["background"],
+        )
+        return ordered_pdf, summary_pdf
     gated = gated or set()
     path = entry.get("path", "")
     text = _read_note_text(path)
@@ -2329,6 +2368,43 @@ def _file_view(entry: dict, gated: set | None = None):
     return ordered, _file_summary(entry, ordered, gated)
 
 
+def _count_effective_chars(text: str) -> int:
+    """Count effective body characters after stripping Markdown syntax and whitespace."""
+    if not text:
+        return 0
+    # Strip fenced code block markers (keep inner code content)
+    s = re.sub(r"^```[^\n]*$", "", text, flags=re.M)
+    # Strip images ![alt](url) -> alt, links [text](url) -> text
+    s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", s)
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)
+    # Strip HTML tags
+    s = re.sub(r"<[^>]+>", "", s)
+    # Strip heading prefixes, blockquote markers, list markers, hr, table pipes
+    s = re.sub(r"^[ \t]*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+\.\s+|---+|_{3,}|\*\*\*+)", "", s, flags=re.M)
+    # Strip inline markdown emphasis/code/math delimiters and table separator characters
+    s = re.sub(r"[*_~`|]", "", s)
+    # Strip all whitespace
+    s = re.sub(r"\s+", "", s)
+    return len(s)
+
+
+def _frontier_preview(text: str, max_len: int = 48) -> str:
+    """Extract a concise single-line preview from a segment's markdown text."""
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("```") or re.match(r"^[|:\-\s]+$", line):
+            continue
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^>\s*", "", line)
+        line = re.sub(r"^[-*+]\s+", "", line)
+        line = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", line)
+        line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)
+        line = re.sub(r"[*_~`]", "", line).strip()
+        if line:
+            return line[:max_len] + ("…" if len(line) > max_len else "")
+    return ""
+
+
 def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     gated = gated or set()
     path = entry.get("path", "")
@@ -2348,6 +2424,13 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
             "done": 0,
             "skipped": 0,
             "background": 0,
+            "total_chars": 0,
+            "read_chars": 0,
+            "active_chars": 0,
+            "todo_chars": 0,
+            "done_chars": 0,
+            "skipped_chars": 0,
+            "background_chars": 0,
             "frontier": None,
             "gated": 0,
             "gated_active": 0,
@@ -2355,6 +2438,7 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
             "cards_created": 0,
         }
     counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0, "background": 0}
+    char_counts = {"todo": 0, "active": 0, "done": 0, "skipped": 0, "background": 0}
     cards = 0
     frontier = None
     gated_count = 0
@@ -2363,7 +2447,10 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
     blocked = base["needs_resync"]  # a flagged file deals nothing
     for ch, key, st in ordered:
         s = st.get("status", "todo")
-        counts[s if s in counts else "todo"] += 1
+        bucket = s if s in counts else "todo"
+        counts[bucket] += 1
+        seg_chars = _count_effective_chars(ch.get("text", ""))
+        char_counts[bucket] += seg_chars
         cards += len(st.get("cards_created") or [])
         # background (un-scheduled context) and done/skipped never deal and
         # never block the frontier — the frontier is the first DEALABLE one
@@ -2384,6 +2471,9 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
                     "status": s,
                     "title": ch.get("title") or Path(path).stem,
                     "line_start": ch["line_start"],
+                    "line_end": ch["line_end"],
+                    "chars": seg_chars,
+                    "preview": _frontier_preview(ch.get("text", "")),
                 }
             continue
         if frontier is not None or blocked:
@@ -2393,13 +2483,25 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
             "status": s,
             "title": ch.get("title") or Path(path).stem,
             "line_start": ch["line_start"],
+            "line_end": ch["line_end"],
+            "chars": seg_chars,
+            "preview": _frontier_preview(ch.get("text", "")),
         }
+    read_chars = char_counts["done"] + char_counts["skipped"] + char_counts["background"]
+    total_chars = sum(char_counts.values())
     return {
         **base,
         "missing": False,
         "edit_revision": entry.get("file_sha", ""),
         "total_chunks": len(ordered),
         **counts,
+        "total_chars": total_chars,
+        "read_chars": read_chars,
+        "active_chars": char_counts["active"],
+        "todo_chars": char_counts["todo"],
+        "done_chars": char_counts["done"],
+        "skipped_chars": char_counts["skipped"],
+        "background_chars": char_counts["background"],
         "frontier": frontier,
         "gated": gated_count,
         "gated_active": gated_active,
@@ -2410,6 +2512,8 @@ def _file_summary(entry: dict, ordered, gated: set | None = None) -> dict:
 
 def _chunk_payload(ch: dict, key: str, st: dict, summary: dict,
                    segs_by_id: dict | None = None) -> dict:
+    if ch.get("kind") == "pdf":
+        return ch
     # ancestor cards (三栏左栏「相关卡片」, 2026-09-21): a split parent
     # KEEPS the cards made against its pre-cut range (provenance rule), so a
     # child segment's "same-content cards" = its own + every ancestor's
@@ -2868,7 +2972,7 @@ def _reading_read(*, preserve_round=False) -> dict:
     if isinstance(rd, dict) and _round_expired(rd) and not preserve_round and not _flow_read():
         rd = None  # half-finished reading round older than 24h
     d["round"] = rd
-    return d
+    return _lectures().merge(d)
 
 
 def _reading_write(d: dict | None):
@@ -2885,8 +2989,9 @@ def _reading_write(d: dict | None):
                 for t in ("rfiles", "segments", "rcards", "rorphans", "rround"):
                     conn.execute(f"DELETE FROM {t}")
                 return
-            listed = d.get("list") or []
-            archive = d.get("archive") or {}
+            _lectures().persist_list(d)
+            listed = [e for e in d.get("list", []) if e.get("kind") != "pdf"]
+            archive = {p:a for p,a in (d.get("archive") or {}).items() if not any(x['path']==p for x in _lectures().docs.list())}
             keep = [e.get("path", "") for e in listed] + list(archive.keys())
             removed = {row[0] for row in conn.execute('SELECT path FROM rfiles')} - set(keep)
             for path in removed:
@@ -3157,6 +3262,9 @@ def _reading_record_card(src: dict | None, note_id: int) -> None:
     Fail-soft by contract (caller wraps in try): reading bookkeeping must
     never break card creation.
     """
+    if src and src.get('kind') == 'pdf':
+        _lectures().record(note_id, src)
+        return
     path = (src or {}).get("path")
     key = (src or {}).get("chunk_key")
     if not path or not key:
@@ -3293,8 +3401,17 @@ async def reading_corpus():
                 "title": Path(p).stem,
                 "in_list": p in listed,
                 "archived": p in archived,
+                "chars": _count_effective_chars(_read_note_text(p) or ""),
             }
             for p in _corpus_files()
+        ] + [
+            dict(path=doc["path"], title=doc["title"], kind="pdf",
+                 document_id=doc["document_id"], revision_id=revision["revision_id"],
+                 status=revision["status"], page_count=revision["page_count"],
+                 in_list=bool(doc.get("listed")), archived=False)
+            for doc, revision in _lecture_metadata()
+            if not doc.get("original_missing") and (NOTES_DIR / doc["path"]).is_file()
+            and revision and revision.get("status") == "ready"
         ]
     }
 
@@ -3325,7 +3442,7 @@ async def files_list():
             dirs.append(str(rel))
     return {
         "files": [{
-            "path": p, "title": Path(p).stem, "revision": _files_revision(NOTES_DIR / p)} for p in _corpus_files()],
+            "path": p, "title": Path(p).stem, "revision": _files_revision(NOTES_DIR / p)} for p in sorted(set(_corpus_files()) | {d["path"] for d in _lectures().docs.list() if (NOTES_DIR/d["path"]).is_file()})],
         "dirs": dirs,
     }
 
@@ -3361,6 +3478,8 @@ async def files_raw(path: str):
 
 @app.middleware('http')
 async def recover_file_relocations(request, call_next):
+    if request.method == 'GET' and request.url.path == '/api/files/membership':
+        return await call_next(request)
     if request.url.path.startswith('/api/'):
         directory = STATE_DIR / 'file-relocations'
         try:
@@ -3379,18 +3498,26 @@ def _files_revision(path: Path) -> str:
     return f"{st.st_ino}:{st.st_size}:{st.st_mtime_ns}"
 
 
+def _lecture_metadata():
+    from lecture_metadata import documents
+    return documents(STATE_DIR / 'lectures')
+
+
 @app.get("/api/files/membership")
 async def files_membership():
-    # No schema initialization, gate checks, corpus reads or state writes.
-    if not READING_DB_FILE.exists():
-        return {"paths": []}
-    conn = sqlite3.connect(READING_DB_FILE.resolve().as_uri() + "?mode=ro", uri=True)
-    try:
-        return {"paths": [r[0] for r in conn.execute("SELECT path FROM rfiles WHERE in_list=1")]}
-    except sqlite3.OperationalError:
-        return {"paths": []}
-    finally:
-        conn.close()
+    # This metadata GET never initializes a store or performs relocation recovery.
+    paths = {doc['path'] for doc, _ in _lecture_metadata()
+             if doc.get('listed') and not doc.get('original_missing')}
+    if READING_DB_FILE.exists():
+        conn = sqlite3.connect(READING_DB_FILE.resolve().as_uri() + "?mode=ro", uri=True)
+        try:
+            paths.update(r[0] for r in conn.execute("SELECT path FROM rfiles WHERE in_list=1"))
+        except sqlite3.OperationalError as exc:
+            if 'no such table' not in str(exc):
+                raise
+        finally:
+            conn.close()
+    return {"paths": sorted(paths)}
 
 
 def _files_relocation_preflight(old, new, is_dir):
@@ -3400,6 +3527,8 @@ def _files_relocation_preflight(old, new, is_dir):
         raise RelocationConflict('源不存在或目标已存在')
     if is_dir and (src == dst or src in dst.parents):
         raise RelocationConflict('不能移动到自己或子目录')
+    if any(d['path']==new or (is_dir and d['path'].startswith(new+'/')) for d in _lectures().docs.list()):
+        raise RelocationConflict('目标存在课件版本记录，不能覆盖')
     _flow_read()  # fail before disk mutation on corrupt coordinator
     conn = _reading_conn()
     try:
@@ -3420,6 +3549,8 @@ def _files_relocation_signature(path, is_dir):
         round_row = conn.execute('SELECT data FROM rround WHERE id=1').fetchone()
         rd = json.loads(round_row[0]) if round_row and round_row[0] else {}
         rows['pending'] = [r for r in rd.get('pending', []) if match(r.get('path', ''))]
+        rows['lecture_documents'] = [d for d in _lectures().docs.list() if match(d['path'])]
+        rows['page_segments'] = [d for d in _lectures().reading.all('page-segments') if match(d['path'])]
         flow = _flow_read()
         rows['flow'] = [[a for a in slot if match(a[0])] for slot in (flow or {}).get('slots', []) if any(match(a[0]) for a in slot)]
         return hashlib.sha256(json.dumps(rows, sort_keys=True).encode()).hexdigest()
@@ -3546,7 +3677,7 @@ def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool, operation_id: st
     """
     old_p = old_rel.rstrip("/") + "/"
     new_p = new_rel.rstrip("/") + "/"
-    mapping: dict[str, str] = {}
+    mapping: dict[str, str] = {d['path']:new_rel+d['path'][len(old_rel):] for d in _lectures().docs.list() if d['path']==old_rel or (is_dir and d['path'].startswith(old_rel+'/'))}
     conn = _reading_conn()
     try:
         conn.execute("PRAGMA synchronous=FULL")
@@ -3621,6 +3752,13 @@ def _reading_relocate(old_rel: str, new_rel: str, is_dir: bool, operation_id: st
             fault('flow')
     finally:
         conn.close()
+    _lectures().docs.relocate(old_rel, new_rel, is_dir)
+    with _lectures().reading.db() as db:
+        for seg in _lectures().reading.all('page-segments',db):
+            path=seg['path']
+            if path==old_rel or (is_dir and path.startswith(old_rel+'/')):
+                seg['path']=new_rel+path[len(old_rel):]
+                _lectures().reading.put('page-segments',seg['segment_id'],seg,db)
     for old in mapping:
         _chunk_cache.pop(old, None)
 
@@ -3669,6 +3807,11 @@ def _reading_purge(rel: str, is_dir: bool) -> None:
                         )
     finally:
         conn.close()
+    with _lectures().docs.db() as db:
+        for doc in _lectures().docs.all('documents',db):
+            if doc['path']==rel or (is_dir and doc['path'].startswith(prefix)):
+                doc.update(listed=False, original_missing=True)
+                _lectures().docs.put('documents',doc['document_id'],doc,db)
     _chunk_cache.pop(rel, None)
 
 
@@ -3689,6 +3832,41 @@ class FilesDeleteBody(BaseModel):
     confirm: str  # must equal the basename (防呆, user ruling)
 
 
+class FilesMkdirBody(BaseModel):
+    dir: str = ""
+    name: str
+
+
+@app.post("/api/files/mkdir")
+async def files_mkdir(body: FilesMkdirBody):
+    async with _state_lock:
+        name = _files_check_name(body.name)
+        if any(ord(c) < 32 or ord(c) == 127 for c in name) or len(name.encode('utf-8')) > 255:
+            raise HTTPException(400, '文件夹名称包含控制字符或过长')
+        # Reject lexical traversal/hidden components before resolve normalizes them.
+        directory = body.dir
+        if directory and (directory.startswith(("/", "\\")) or "\\" in directory or
+                          any(part in ("", ".", "..") or part.startswith(".") or part in NOTES_SKIP_DIRS
+                              for part in directory.split("/"))):
+            raise HTTPException(400, "非法目录路径")
+        parent = _files_resolve(directory) if directory else _files_root()
+        if not directory and not NOTES_DIR.exists():
+            try:
+                NOTES_DIR.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                raise HTTPException(503, '语料根目录创建结果待确认，请刷新核对')
+        if not parent.is_dir():
+            raise HTTPException(404, "父文件夹不存在")
+        target = _files_resolve("/".join(filter(None, (directory, name))))
+        try:
+            target.mkdir()  # Never overwrite, create parents, or write marker content.
+        except FileExistsError:
+            raise HTTPException(409, "目标名称已存在")
+        except OSError:
+            raise HTTPException(503, "创建结果待确认，请刷新目录核对；不要直接重试")
+        return {"ok": True, "path": _files_rel(target)}
+
+
 @app.post("/api/files/rename")
 async def files_rename(body: FilesRenameBody):
     async with _state_lock:
@@ -3702,7 +3880,13 @@ async def files_rename(body: FilesRenameBody):
         name = _files_check_name(body.new_name)
         is_dir = src.is_dir()
         is_md = src.is_file() and src.suffix.lower() == ".md"
-        if src.is_file() and not is_md:
+        is_lecture = src.is_file() and src.suffix.lower() in ('.pdf','.ppt','.pptx') and any(d['path']==body.path for d in _lectures().docs.list())
+        if is_lecture:
+            if not Path(name).suffix:
+                name += src.suffix
+            if Path(name).suffix.lower() != src.suffix.lower():
+                raise HTTPException(400,'课件重命名不能改变格式；请导入新版本')
+        if src.is_file() and not is_md and not is_lecture:
             # v1 limitation (user-approved): note images are referenced by
             # BARE BASENAME from .md files — renaming one silently breaks
             # every reference. Images travel with folder moves instead.
@@ -4108,6 +4292,17 @@ class ReadingReorderBody(BaseModel):
 async def reading_list_add(body: ReadingPathBody):
     async with _state_lock:
         _reading_guard()
+        doc = next((d for d in _lectures().docs.list() if d['path'] == body.path), None)
+        if doc:
+            revision = _lectures().docs.revision(doc['document_id'], doc.get('reading_revision', doc['current_revision']))
+            if revision['status'] != 'ready':
+                raise HTTPException(409, '等待课件转换完成')
+            if body.fresh:
+                raise HTTPException(409, '课件保留历史页范围；新版本请显式加入')
+            _lectures().reading.seed(doc['document_id'], revision['revision_id'], doc['path'], revision['page_count'])
+            doc.update(listed=True, reading_revision=revision['revision_id'], position=len(_reading_read()['list']))
+            _lectures().docs.put('documents',doc['document_id'],doc)
+            return {'ok':True}
         data = _reading_read()
         if _find_entry(data, body.path):
             raise HTTPException(status_code=409, detail="already in the reading list")
@@ -4355,6 +4550,19 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
             return True
         return False
 
+    if entry.get('kind') == 'pdf':
+        from lecture_store import Conflict
+        try:
+            seg = _lectures().reading.act(chunk_key, action)
+        except (ValueError, Conflict) as exc:
+            raise HTTPException(409, str(exc)) from exc
+        complete = False
+        if in_round and action in ('complete','skip','next','demote'):
+            stats_key = {'complete':'done','skip':'skipped','next':'next','demote':'next'}[action]
+            rd.setdefault('stats',{})[stats_key] = rd.get('stats',{}).get(stats_key,0)+1
+            complete = _drop_and_maybe_complete()
+        _reading_write(data)
+        return {'ok':True,'status':seg['status'],'round_complete':complete,'stats':(rd or {}).get('stats',{}),'done':(rd or {}).get('done',0),'total':(rd or {}).get('total',0)}
     segs = entry.setdefault("segments", [])
     seg = next((s for s in segs if str(s.get("seg_id")) == str(chunk_key)), None)
     if seg is None:
@@ -4433,7 +4641,10 @@ async def reading_finish():
 
 
 # ---- persisted whole-round coordinator (independent of both schedulers) ----
-from flow import create as _flow_create, reconcile as _flow_reconcile, replace_slot as _flow_replace_slot, answer_count as _answer_count
+from flow import create as _flow_create, reconcile as _legacy_flow_reconcile, replace_slot as _flow_replace_slot, answer_count as _answer_count
+def _flow_reconcile(flow, *args, **kwargs):
+    _lectures().repair_flow(flow)
+    return _legacy_flow_reconcile(flow, *args, **kwargs)
 FLOW_FILE = STATE_DIR / 'flow.json'
 
 
@@ -5071,29 +5282,9 @@ async def reading_reseed(body: ReadingPathBody):
                     continue
             kept_orphans.append(o)
         entry["orphans"] = kept_orphans
-        # recompute surviving containers bottom-up from live children when
-        # their own fingerprint didn't match directly
-        for s in sorted(
-            (x for x in surviving if x.get("status") == "container"),
-            key=lambda x: x.get("seg_id") or 0,
-            reverse=True,
-        ):
-            if not s.get("stale"):
-                continue
-            kids = [
-                c for c in surviving
-                if c.get("parent_seg_id") == s.get("seg_id") and not c.get("stale")
-            ]
-            if kids:
-                s["start_line"] = min(k["start_line"] for k in kids)
-                s["end_line"] = max(k["end_line"] for k in kids)
-                s["fingerprint"] = _seg_fingerprint(lines, s["start_line"], s["end_line"])
-                s["first_line"] = lines[s["start_line"] - 1] if lines else ""
-                s.pop("stale", None)
         covered: set[int] = set()
         for s in surviving:
-            if s.get("status") != "container" and not s.get("stale"):
-                covered.update(range(s["start_line"], s["end_line"] + 1))
+            covered.update(range(s["start_line"], s["end_line"] + 1))
         entry["segments"] = surviving  # id counter must see survivors
         nid = _next_seg_id(entry)
         fresh = []
@@ -5148,6 +5339,9 @@ async def reading_source(note_id: int):
     then shows 无来源.
     """
     _reading_guard()
+    lecture_source = _lectures().source(note_id)
+    if lecture_source:
+        return lecture_source
     data = _reading_read()
     for entry in list(data.get("list") or []) + [
         {"path": p, **a} for p, a in (data.get("archive") or {}).items()
@@ -5402,6 +5596,9 @@ async def media(name: str):
         raise HTTPException(status_code=404, detail="media not found")
     return FileResponse(p)
 
+
+from lecture_routes import install as _install_lecture_routes
+_install_lecture_routes(sys.modules[__name__])
 
 # ---- serve the new SolidJS review frontend (review-web-v2/dist) -----------
 # SPA fallback: all non-API paths serve index.html

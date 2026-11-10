@@ -1,5 +1,6 @@
+import {SplitDialog} from './SplitDialog'
 import { StudyCardShell, StudyToolbar, StudyActionDock } from './StudyCardShell'
-import { Component, Show, createEffect, createMemo, createSignal, on } from 'solid-js'
+import { Component, Show, createEffect, createMemo, createSignal, on, onCleanup, onMount } from 'solid-js'
 import { renderMarkdown } from '../lib/markdown'
 import { trackChunkSelection } from '../lib/chunk-selection'
 import {
@@ -10,7 +11,7 @@ import {
   type SplitSelection,
 } from '../lib/split-selection'
 import type { ReadingChunk } from '../types'
-import { IconAdd, IconArrowBack, IconClose, IconEdit, IconPassword, IconUndo } from './icons'
+import { IconAdd, IconArrowBack, IconClose, IconContentCut, IconEdit, IconPassword, IconUndo } from './icons'
 
 // Reading card (渐进制卡, user spec 2026-09-19; action redesign round 2;
 // 三栏重构 2026-09-21). One note chunk to read and turn into cards BY HAND.
@@ -34,8 +35,8 @@ import { IconAdd, IconArrowBack, IconClose, IconEdit, IconPassword, IconUndo } f
 // The dot is the affordance, but clicking ANYWHERE on the rendered line
 // picks it (a drag/text-selection is the cloze seed and never picks).
 // Click the first line, click the last line (further clicks re-adjust the
-// far end), the lines highlight and an inline confirm bar appears above
-// the body with the exact cut range + a HEAD and TAIL line preview (the
+// far end), the lines highlight; the permanent toolbar scissors opens a
+// viewport modal with the exact cut range + a HEAD and TAIL line preview (the
 // old head-only snippet couldn't confirm where the cut ended — user spec).
 // 确认分割 → POST /api/reading/split with the whole-line range. No
 // DOM-selection guessing: the lines ARE the backend's line model, so what
@@ -78,7 +79,7 @@ interface Props {
   onCloze: (selText: string, selBlock: string) => void
   /** 分割文段: whole-line range RELATIVE to the chunk text (caller adds
    *  line_start-1 for file lines). Comes from the line-handle picker. */
-  onSplit: (sel: SplitSelection) => void
+  onSplit: (sel: SplitSelection) => void | boolean | Promise<void | boolean>
   /** 编辑片段 (user spec 2026-09-23): open the SegEditDialog for this chunk */
   onEdit?: () => void
   /** mid-round exit: untouched chunks stay todo/active (round only) */
@@ -114,17 +115,41 @@ export const ReadingCard: Component<Props> = (props) => {
   // endpoint of the pending range (so 4→5→3 yields 3–5, not 3–4 — a
   // mis-click or a late "also need the line above" just needs one more
   // click without losing the other end). A single click already forms a
-  // valid 1-line (or 1-block) range — the confirm bar appears immediately.
-  // 取消 clears the pick.
+  // valid 1-line (or 1-block) range — the toolbar scissors becomes available.
+  // Closing confirmation preserves the pick for adjustment or retry.
   const [pick, setPick] = createSignal<SplitSelection | null>(null)
 
-  const clearPick = () => setPick(null)
+  const [splitOpen, setSplitOpen] = createSignal(false)
+  const [splitPending, setSplitPending] = createSignal(false)
+  const [splitError, setSplitError] = createSignal('')
+  const splitAvailable = () => props.chunk.seg_id != null && props.chunk.status !== 'container'
+  const splitDisabled = () => !pick() || props.busy || splitPending() || !splitAvailable()
+  const splitName = () => !splitAvailable() ? '当前片段不可分割' : !pick() ? '请先点选正文行或圆点，选择分割范围' : '分割选中行'
+  let disposed = false
+  let splitEpoch = 0
+  onCleanup(() => { disposed = true; ++splitEpoch })
+  const clearPick = () => { ++splitEpoch; setPick(null); setSplitOpen(false); setSplitPending(false); setSplitError('') }
+
+  const onDocKeyDown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && pick() !== null && !splitOpen() && !props.busy) {
+      if (document.querySelector?.('md-dialog[open], .card-drawer-layer')) return
+      clearPick()
+    }
+  }
+  onMount(() => document.addEventListener('keydown', onDocKeyDown))
+  onCleanup(() => document.removeEventListener('keydown', onDocKeyDown))
 
   const pickHandle = (start: number, end: number) => {
-    if (props.busy) return
+    if (props.busy || splitOpen() || !splitAvailable()) return
     const p = pick()
     if (!p) {
       setPick({ start_line: start, end_line: end })
+      return
+    }
+    // Clicking any already-selected line/dot cancels the current selection
+    // so the user can immediately deselect or start a fresh selection.
+    if (start <= p.end_line && end >= p.start_line) {
+      clearPick()
       return
     }
     const mid = start + (end - start) / 2
@@ -159,7 +184,9 @@ export const ReadingCard: Component<Props> = (props) => {
     const h = (e.target as HTMLElement | null)?.closest?.('.line-handle')
     // preventDefault keeps the click from focusing the button (Space must
     // stay 制卡完成) and from starting a text selection (the cloze seed).
-    if (h) e.preventDefault()
+    // Also prevent quick second-click (double-click) word highlight when a
+    // line selection is already active so clicking again cleanly deselects.
+    if (h || (e.detail > 1 && pick() !== null)) e.preventDefault()
   }
 
   const onBodyClick = (e: MouseEvent) => {
@@ -167,23 +194,37 @@ export const ReadingCard: Component<Props> = (props) => {
     if (!t?.closest) return
     if (t.closest('a')) return // let links navigate, never pick
     const isHandle = !!t.closest('.line-handle')
-    const item = t.closest('.line-handle, .line, .line-anchor') as
+    let item = t.closest('.line-handle, .line, .line-anchor') as
       | HTMLElement
       | null
-    if (!item) return
+    if (!item && bodyRef && typeof document.elementFromPoint === 'function') {
+      item = resolveLineAt(bodyRef, e.clientX, e.clientY)?.el ?? null
+    }
+    if (!item) {
+      const selNow =
+        typeof window !== 'undefined' ? window.getSelection?.() : null
+      if (!selNow || selNow.isCollapsed) clearPick()
+      return
+    }
     if (!isHandle) {
-      // Drag guard for line-BODY clicks: a real text selection (or a moved
+      // Drag guard for line-BODY clicks: a real text selection (dragged
       // mouse between down and up) is a 添加挖空 cloze seed, not a line
       // pick. Handle clicks skip this — their mousedown preventDefaults
       // (selection stays as the cloze seed) and must ALWAYS pick.
-      if (
+      const moved =
         Math.abs(e.clientX - downX) > 4 ||
         Math.abs(e.clientY - downY) > 4
+      const selNow =
+        typeof window !== 'undefined' ? window.getSelection?.() : null
+      if (moved && (!e.detail || e.detail === 1) && selNow && !selNow.isCollapsed) {
+        return
+      }
+      if (
+        Math.abs(e.clientX - downX) > 24 ||
+        Math.abs(e.clientY - downY) > 24
       ) {
         return
       }
-      const selNow = window.getSelection()
-      if (selNow && !selNow.isCollapsed) return
     }
     const s = parseInt(item.dataset.lineStart || '0', 10)
     const en = parseInt(item.dataset.lineEnd || item.dataset.lineStart || '0', 10)
@@ -251,11 +292,21 @@ export const ReadingCard: Component<Props> = (props) => {
     applySelClasses()
   })
 
-  const confirmSplit = () => {
+  const confirmSplit = async () => {
     const p = pick()
-    if (!p || props.busy) return
-    clearPick()
-    props.onSplit(p)
+    if (!splitOpen() || !p || splitDisabled()) return
+    setSplitPending(true)
+    setSplitError('')
+    const epoch = splitEpoch
+    const current = () => !disposed && epoch === splitEpoch
+    try {
+      const result = await props.onSplit(p)
+      if (current() && result === false) setSplitError('分割未完成，请核对错误提示后重试')
+    } catch (e) {
+      if (current()) setSplitError((e as Error).message || '分割失败，请重试')
+    } finally {
+      if (current()) setSplitPending(false)
+    }
   }
 
   const crumb = () => {
@@ -293,6 +344,12 @@ export const ReadingCard: Component<Props> = (props) => {
               >
                 <md-icon><IconPassword /></md-icon>
               </md-icon-button>
+              <span class="split-action-hint" title={splitName()}>
+                <md-icon-button data-split-action aria-label={splitName()} title={splitName()}
+                  disabled={splitDisabled()} onClick={() => { if (!splitDisabled()) { setSplitError(''); setSplitOpen(true) } }}>
+                  <md-icon><IconContentCut /></md-icon>
+                </md-icon-button>
+              </span>
               {/* 编辑片段 (user spec 2026-09-23): CM6 弹窗改 .md 原文；
                   container 只读（历史锚，后端也会 409），trace 卡片无 seg 时可编辑 */}
               <Show when={props.onEdit}>
@@ -324,48 +381,20 @@ export const ReadingCard: Component<Props> = (props) => {
         </StudyActionDock>
       </Show>
     }>
-          {/* 分割确认条 (line-handle picker, 2026-10-01): appears once a
-              line handle is clicked; shows the EXACT whole-line cut range
-              plus a head AND tail preview of the source lines (user spec:
-              the head-only snippet couldn't confirm where the cut ended).
-              取消 clears the pick; 确认分割 fires onSplit. */}
-          <Show when={pick()}>
-            {(p) => {
-              const n = () => p().end_line - p().start_line + 1
+          <Show when={splitOpen() && pick()}>
+            {(selected) => {
+              const p = selected
               const pv = () => previewHeadTail(props.chunk.text, p())
-              return (
-                <div class="split-confirm md-typescale-label-small" aria-live="polite">
-                  <div class="split-confirm__info">
-                    <span class="split-confirm__range">
-                      将切出第 {p().start_line}–{p().end_line} 行（{n()} 行）
-                    </span>
-                    <span class="split-confirm__preview" title={pv().headFull}>
-                      头：{pv().head || '（空行）'}
-                    </span>
-                    <Show when={n() > 1}>
-                      <span class="split-confirm__preview" title={pv().tailFull}>
-                        尾：{pv().tail || '（空行）'}
-                      </span>
-                    </Show>
-                  </div>
-                  <div class="split-confirm__actions">
-                    <md-text-button
-                      class="split-confirm__cancel"
-                      disabled={props.busy}
-                      onClick={clearPick}
-                    >
-                      取消
-                    </md-text-button>
-                    <md-filled-tonal-button
-                      class="split-confirm__ok"
-                      disabled={props.busy}
-                      onClick={confirmSplit}
-                    >
-                      确认分割
-                    </md-filled-tonal-button>
-                  </div>
+              return <SplitDialog title="确认分割文段" busy={props.busy || splitPending()}
+                disabled={!splitAvailable()} confirmLabel="确认分割"
+                onCancel={() => setSplitOpen(false)} onConfirm={() => void confirmSplit()}>
+                <p>将切出第 {p().start_line}–{p().end_line} 行（{p().end_line - p().start_line + 1} 行）</p>
+                <div class="split-line-previews">
+                  <p title={pv().headFull}>头：{pv().head || '（空行）'}</p>
+                  <p title={pv().tailFull}>尾：{pv().tail || '（空行）'}</p>
                 </div>
-              )
+                <Show when={splitError()}><p class="lecture-error" role="alert">{splitError()}</p></Show>
+              </SplitDialog>
             }}
           </Show>
 

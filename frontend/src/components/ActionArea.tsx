@@ -12,6 +12,8 @@ interface Props {
   answering: boolean
   onReveal: () => void
   onAnswer: (ease: number) => void
+  onExit?: () => void
+  exitDisabled?: boolean
 }
 
 const Keycap = (k: string) => <span class="keycap" aria-hidden="true">{k}</span>
@@ -44,6 +46,7 @@ export const ActionArea: Component<Props> = (props) => {
           </md-filled-tonal-button>
         </>
       )}
+      {props.onExit && <md-text-button disabled={props.exitDisabled} onClick={props.onExit}>退出本轮</md-text-button>}
     </StudyActionDock>
   )
 }

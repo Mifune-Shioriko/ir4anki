@@ -33,6 +33,7 @@ const P_Edit = ['M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 1
 // Official Material Symbols outlined paths (@material-symbols/svg-400).
 const P_MenuBook = ['M560-574v-48q33-14 67.5-21t72.5-7q26 0 51 4t49 10v44q-24-9-48.5-13.5T700-610q-38 0-73 9.5T560-574Zm0 220v-49q33-13.5 67.5-20.25T700-430q26 0 51 4t49 10v44q-24-9-48.5-13.5T700-390q-38 0-73 9t-67 27Zm0-110v-48q33-14 67.5-21t72.5-7q26 0 51 4t49 10v44q-24-9-48.5-13.5T700-500q-38 0-73 9.5T560-464ZM248-300q53.57 0 104.28 12.5Q403-275 452-250v-427q-45-30-97.62-46.5Q301.76-740 248-740q-38 0-74.5 9.5T100-707v434q31-14 70.5-20.5T248-300Zm264 50q50-25 98-37.5T712-300q38 0 78.5 6t69.5 16v-429q-34-17-71.82-25-37.82-8-76.18-8-54 0-104.5 16.5T512-677v427Zm-30 90q-51-38-111-58.5T248-239q-36.54 0-71.77 9T106-208q-23.1 11-44.55-3Q40-225 40-251v-463q0-15 7-27.5T68-761q42-20 87.39-29.5 45.4-9.5 92.61-9.5 63 0 122.5 17T482-731q51-35 109.5-52T712-800q46.87 0 91.93 9.5Q849-781 891-761q14 7 21.5 19.5T920-714v463q0 27.89-22.5 42.45Q875-194 853-208q-34-14-69.23-22.5Q748.54-239 712-239q-63 0-121 21t-109 58ZM276-489Z']
 const P_ArrowUpward = ['M450-160v-526L202-438l-42-42 320-320 320 320-42 42-248-248v526h-60Z']
+const P_ArrowDownward = ['M450-800v526L202-522l-42 42 320 320 320-320-42-42-248 248v-526h-60Z']
 const P_VerticalAlignTop = ['M160-780v-60h640v60H160Zm290 660v-484L329-483l-43-43 194-194 190 190-43 43-117-117v484h-60Z']
 const P_SkipNext = ['M680-240v-480h60v480h-60Zm-460 0v-480l346 240-346 240Zm60-240Zm0 125 181-125-181-125v250Z']
 const P_Close = ['m249-207-42-42 231-231-231-231 42-42 231 231 231-231 42 42-231 231 231 231-42 42-231-231-231 231Z']
@@ -95,6 +96,7 @@ export const IconUndo = (props: IconProps) => <Svg paths={P_Undo} {...props} />
 export const IconEdit = (props: IconProps) => <Svg paths={P_Edit} {...props} />
 export const IconMenuBook = (props: IconProps) => <Svg paths={P_MenuBook} {...props} />
 export const IconArrowUpward = (props: IconProps) => <Svg paths={P_ArrowUpward} {...props} />
+export const IconArrowDownward = (props: IconProps) => <Svg paths={P_ArrowDownward} {...props} />
 export const IconVerticalAlignTop = (props: IconProps) => <Svg paths={P_VerticalAlignTop} {...props} />
 export const IconSkipNext = (props: IconProps) => <Svg paths={P_SkipNext} {...props} />
 export const IconClose = (props: IconProps) => <Svg paths={P_Close} {...props} />

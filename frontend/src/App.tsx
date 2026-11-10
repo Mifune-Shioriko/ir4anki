@@ -1,3 +1,7 @@
+import {requestDraftLeave} from './lib/draft-leave'
+import {LectureReadingCard} from './components/LectureReadingCard'
+import {lectureRequest,pageRequestPath,type PageSource,type PageLocator} from './lib/lecture-api'
+import {sourcePage} from './lib/lecture-session'
 import { createStateGeneration } from './lib/state-generation'
 import { Component, Show, createEffect, createSignal, onMount, onCleanup } from 'solid-js'
 import { api } from './api'
@@ -80,7 +84,7 @@ export const App: Component = () => {
     } catch { /* badges are decorative */ }
   }
   const navigate = (s: Section) => {
-    if (s === section()) return
+    if (s === section() || !requestDraftLeave()) return
     setSection(s)
     // returning to the study section re-reads server state (list edits in
     // the 阅读清单 section can change the funnel, e.g. adding files)
@@ -206,7 +210,7 @@ export const App: Component = () => {
   // snackbar that's easy to miss. Cleared when a new round begins.
   const [roundSummary, setRoundSummary] = createSignal<RoundSummary | null>(null)
   // which chunk the add dialog is open FOR (provenance link); null = plain add
-  const [addSource, setAddSource] = createSignal<{ path: string; chunk_key: string } | null>(null)
+  const [addSource, setAddSource] = createSignal<({ path: string; chunk_key: string } & Partial<PageLocator>) | null>(null)
   const rdCurrent = () => rdChunks()[0] ?? null
   // 挖空卡 dialog (user spec 2026-09-19 round 2): clozeInitial is the
   // textarea seed — the chunk-body selection wrapped in {{c1::}} when the
@@ -226,6 +230,7 @@ export const App: Component = () => {
   const [traceSource, setTraceSource] = createSignal<ReadingSource | null>(null)
   const [traceOpen, setTraceOpen] = createSignal(false)
   const [traceChunk, setTraceChunk] = createSignal<ReadingChunk | null>(null)
+  const [traceRefreshing,setTraceRefreshing]=createSignal(false)
   // bump to force the left 相关卡片 panel to refetch (after adds/splits)
   const [relatedToken, setRelatedToken] = createSignal(0)
   // bump to force the RIGHT 原文上下文 FileViewer to re-fetch the .md after
@@ -258,6 +263,7 @@ export const App: Component = () => {
   onCleanup(() => { window.removeEventListener('files-relocated', relocateSources); window.removeEventListener('files-deleted', deleteSources) })
 
   const sourceToChunk = (s: ReadingSource): ReadingChunk => {
+    if(s.kind==='pdf')return {...((s as unknown as {effective_chunk?:PageSource}).effective_chunk??s),page:s.page} as unknown as ReadingChunk
     const own = (s.cards_created || []).filter(id => id > 0)
     const anc: number[] = []
     for (const b of s.breadcrumb) {
@@ -288,16 +294,35 @@ export const App: Component = () => {
     }
   }
 
+  let reviewScroll:HTMLDivElement|null=null
+  let traceGeneration=0
+  let traceRefreshGeneration=0
+  let lectureReturn:{cardId:number;revealed:boolean;scroll:number}|null=null
   const openTrace = () => {
     const s = traceSource()
-    if (!s || traceOpen()) return
+    if (!s || traceOpen() || (s.kind==='pdf'&&!revealed())) return
+    ++traceGeneration
+    if(s.kind==='pdf'&&screenCard())lectureReturn={cardId:screenCard()!.cardId,revealed:revealed(),scroll:reviewScroll?.scrollTop??0}
     setTraceChunk(sourceToChunk(s))
     setTraceOpen(true)
   }
+  const [lectureReferenceOpen,setLectureReferenceOpen]=createSignal(false)
   const closeTrace = () => {
+    if (traceOpen() && !requestDraftLeave()) return
+    ++traceRefreshGeneration;setTraceRefreshing(false)
+    const saved=lectureReturn, generation=traceGeneration;lectureReturn=null
     setTraceOpen(false)
     setTraceChunk(null)
-    void resync()
+    if(!saved){void resync();return}
+    void resync().then(()=>{
+      if(traceGeneration!==generation||traceOpen()||phase()!=='review'||screenCard()?.cardId!==saved.cardId)return
+      setRevealedFor(saved.revealed?saved.cardId:null)
+      // The review shell is recreated after the trace. Wait for reveal/layout,
+      // and never restore into another card or a reference-pane scroll owner.
+      requestAnimationFrame(()=>requestAnimationFrame(()=>{
+        if(traceGeneration===generation&&!traceOpen()&&phase()==='review'&&screenCard()?.cardId===saved.cardId&&revealed()===saved.revealed&&reviewScroll?.isConnected)reviewScroll.scrollTo({top:saved.scroll,behavior:'instant'})
+      }))
+    })
   }
 
   // the chunk the add/cloze/split actions target: the trace detour's chunk
@@ -320,6 +345,7 @@ export const App: Component = () => {
     chunk: ReadingChunk,
     children: { seg_id: number; start_line: number; end_line: number; status: string; tail?: boolean }[],
   ): Promise<ReadingChunk[]> => {
+    if(chunk.kind==='pdf')return []
     // bookmark 的未读尾段不进屏（child_chunks 已排除它）——fallback 同样排除
     const todos = children.filter(c => c.status === 'todo' && !c.tail)
     if (todos.length === 0) return []
@@ -352,7 +378,7 @@ export const App: Component = () => {
   }
 
   const doSplit = async (chunk: ReadingChunk, sel: SplitSelection) => {
-    if (chunk.seg_id == null || rdBusy()) return
+    if (chunk.seg_id == null || rdBusy()) return false
     const base = chunk.line_start - 1
     const selections = [{ start_line: base + sel.start_line, end_line: base + sel.end_line }]
     const wasTrace = traceOpen()
@@ -372,7 +398,7 @@ export const App: Component = () => {
       if (!stateGeneration.mutationCurrent(ticket)) return
       if (kids.length === 0) {
         showSnack('分割失败：没有产生新片段')
-        return
+        return false
       }
       stateGeneration.applyMutation(ticket, () => {})
       if (wasTrace) {
@@ -408,6 +434,7 @@ export const App: Component = () => {
             : `已分割出 ${kids.length} 个新片段（未选中部分转入背景，可在阅读清单提升）`,
         )
       }
+      return true
     } catch (e) {
       if (!stateGeneration.mutationCurrent(ticket)) return
       const msg = (e as Error).message || ''
@@ -430,6 +457,7 @@ export const App: Component = () => {
       } else {
         showSnack('分割失败：' + msg)
       }
+      return false
     } finally {
       setRdBusy(false)
     }
@@ -670,6 +698,10 @@ export const App: Component = () => {
     // 相关卡片 list and participates in the preview-pool gate like any
     // segment-born card. Orphan card / no source → plain add.
     const s = traceSource()
+    if(s?.kind==='pdf'){
+      if(!revealed()){showSnack('显示背面后可从课件添加问答');return}
+      openTrace();queueMicrotask(()=>window.dispatchEvent(new CustomEvent('lecture-author',{detail:'qa'})));return
+    }
     setAddSource(s ? { path: s.path, chunk_key: String(s.seg_id) } : null)
     setAddOpen(true)
   }
@@ -679,6 +711,7 @@ export const App: Component = () => {
   // segment), else the reading round's current chunk.
   const openReadingAdd = () => {
     const chunk = activeChunk()
+    if(chunk?.kind==='pdf'){window.dispatchEvent(new CustomEvent('lecture-author',{detail:'qa'}));return}
     setAddSource(chunk ? { path: chunk.path, chunk_key: chunk.chunk_key } : null)
     setAddOpen(true)
   }
@@ -695,6 +728,7 @@ export const App: Component = () => {
   const openReadingCloze = (selText: string, selBlock?: string) => {
     const chunk = activeChunk()
     if (!chunk) return
+    if(chunk.kind==='pdf'){window.dispatchEvent(new CustomEvent('lecture-author',{detail:'occlusion'}));return}
     const base = chunk.text
     let seed = base
     if (selText) {
@@ -706,6 +740,14 @@ export const App: Component = () => {
     setClozeOpen(true)
   }
 
+  const openCardEdit=()=>{
+    const source=traceSource()
+    if(source?.kind==='pdf'&&source.authoring_id){
+      if(!revealed()){showSnack('显示背面后可编辑图片遮罩');return}
+      openTrace();queueMicrotask(()=>window.dispatchEvent(new CustomEvent('lecture-author',{detail:'occlusion'})));return
+    }
+    setEditOpen(true)
+  }
   const onCardAdded = (noteId?: number) => {
     // the new card lands suspended in the preview pool (auto-released
     // tomorrow) — reflect in the pool chip
@@ -856,8 +898,10 @@ export const App: Component = () => {
   }
   const handleKeyDown = (e: KeyboardEvent) => {
     if (section() !== 'study') return
+    if (document.querySelector('[data-split-dialog]')) return
     if (e.composedPath().some(t => isTypingTarget(t) || (t instanceof HTMLElement &&
       (t.matches('md-dialog, [role="dialog"], md-outlined-text-field, md-menu') || !!t.closest('[role="dialog"]'))))) return
+    if (e.composedPath().some(t=>t instanceof HTMLElement&&!!t.closest('.occlusion-editor,.lecture-inline-qa,.page-annotation'))) return
     // Non-modal drawers leave the reader usable, but must not advance its round.
     if (document.querySelector('.card-drawer') || editOpen() || addOpen() || deleteTarget() || segEditOpen()) return
     // 溯源 detour (2026-09-21): the underlying round is SUSPENDED — its
@@ -978,7 +1022,7 @@ export const App: Component = () => {
       // a transient failure shouldn't permanently disable 溯源
     })
   })
-  const traceAvailable = () => traceSource() !== null
+  const traceAvailable = () => traceSource() !== null && (traceSource()?.kind!=='pdf'||revealed())
 
   // safety net: the detour only makes sense while its host card is on
   // screen. If the round ends or the section changes underneath (resync,
@@ -1002,10 +1046,56 @@ export const App: Component = () => {
     (phase() === 'review' && !!currentCard())
   // left column feeds on a CHUNK when a chunk is the thing on screen
   // (reading round, or the 溯源 detour); otherwise it resolves by note id
+  const [lecturePage,setLecturePage]=createSignal<PageLocator|null>(null)
+  const beginPageSplit=()=>{
+    const ticket=stateGeneration.mutate();setRdBusy(true)
+    return {current:()=>stateGeneration.mutationCurrent(ticket),finish:()=>{
+      if(stateGeneration.mutationCurrent(ticket))setRdBusy(false)
+    }}
+  }
+  const adoptPageSplit=(parent:PageSource,children:PageSource[])=>{
+    const match=(c:ReadingChunk|null)=>c?.kind==='pdf'&&c.segment_id===parent.segment_id&&c.revision_id===parent.revision_id&&c.document_id===parent.document_id&&c.version===parent.version
+    if(traceOpen()){
+      if(!match(traceChunk()))return
+      setTraceChunk(children[0] as unknown as ReadingChunk)
+      // Preserve original citation while refreshing the effective leaf/version.
+      setTraceSource(s=>s?{...s,effective_chunk:children[0],effective_source:{...children[0],page:children[0].page_start}} as ReadingSource:s)
+    }else{
+      setRdChunks(prev=>prev.flatMap(c=>match(c)?children as unknown as ReadingChunk[]:[c]))
+    }
+    for(const [id,source] of srcCache)if(source?.kind==='pdf'&&source.document_id===parent.document_id&&source.revision_id===parent.revision_id)srcCache.delete(id)
+    setSourceGeneration(n=>n+1)
+    setLecturePage({...children[0],page:children[0].page_start})
+  }
+  const refreshTraceAfterPublication = async () => {
+    const original=traceChunk(),card=screenCard(),generation=traceGeneration,ticket=++traceRefreshGeneration
+    if(!traceOpen()||original?.kind!=='pdf'||!card)return
+    setTraceRefreshing(true)
+    const atStart=lecturePage()
+    const selectedPage=atStart?.document_id===original.document_id&&atStart.revision_id===original.revision_id&&atStart.segment_id===original.segment_id?atStart.page:sourcePage(original)
+    for(const [id,source] of srcCache)if(source?.kind==='pdf'&&source.document_id===original.document_id&&source.revision_id===original.revision_id)srcCache.delete(id)
+    setSourceGeneration(n=>n+1);setRelatedToken(n=>n+1)
+    try{
+      const [fresh,leaf]=await Promise.all([api.readingSource(card.noteId),lectureRequest<PageSource>(pageRequestPath(original,selectedPage)+'/reading-source?segment_id='+encodeURIComponent(original.segment_id))])
+      if(ticket!==traceRefreshGeneration||generation!==traceGeneration||!traceOpen()||screenCard()?.cardId!==card.cardId)return
+      await resync()
+      // A late publication refresh may not reopen a trace or follow another
+      // review card, segment, document or revision. Same-leaf paging is kept.
+      const current=traceChunk()
+      if(ticket!==traceRefreshGeneration||generation!==traceGeneration||!traceOpen()||screenCard()?.cardId!==card.cardId||current?.kind!=='pdf'||current.document_id!==original.document_id||current.revision_id!==original.revision_id||current.segment_id!==original.segment_id)return
+      if(fresh?.kind!=='pdf'||leaf.kind!=='pdf'||leaf.segment_id!==original.segment_id||leaf.document_id!==original.document_id||leaf.revision_id!==original.revision_id)return
+      const selected=lecturePage()
+      const page=selected?.document_id===current.document_id&&selected.revision_id===current.revision_id&&selected.segment_id===current.segment_id?selected.page:sourcePage(current)
+      if(leaf.version<current.version||page<leaf.page_start||page>leaf.page_end)return
+      srcCache.set(card.noteId,fresh);setTraceSource(fresh)
+      setTraceChunk({...leaf,page} as unknown as ReadingChunk)
+    }catch{ /* preserved trace; a failed refresh never adopts guessed ownership */ }
+    finally{if(ticket===traceRefreshGeneration)setTraceRefreshing(false)}
+  }
   const leftChunk = () => (traceOpen() ? traceChunk() : (phase() === 'reading' ? rdCurrent() : null))
 
   return (
-    <div class="app-shell">
+    <div class="app-shell" classList={{'app-shell--files':section()==='files','app-shell--study': section() === 'study' && centerOccupied()}}>
       <NavRail onManualSync={() => { if (!answering() && !rdBusy() && !undoBusy()) setSyncOpen(true) }}
         section={section()}
         onNavigate={navigate}
@@ -1017,7 +1107,7 @@ export const App: Component = () => {
         {/* ---- 文件 section: read-only corpus browser (tree + viewer) ---- */}
         <Show when={section() === 'files'}>
           <div class="files-page">
-            <FilesScreen listedPaths={listedPaths} />
+            <FilesScreen onListChange={rdRefreshCounts} listedPaths={listedPaths} />
           </div>
         </Show>
 
@@ -1042,9 +1132,11 @@ export const App: Component = () => {
         class="columns"
         classList={{
           'columns--solo': !centerOccupied(),
+          'columns--reference': lectureReferenceOpen(),
         }}
       >
       <div class="content">
+        <Show when={centerOccupied()}><md-text-button class="lecture-reference-toggle" onClick={()=>setLectureReferenceOpen(true)}>查看全文参考 / 相关卡片</md-text-button></Show>
         <Show when={phase() === 'loading'}>
           <Loading
             text={loadText()}
@@ -1054,7 +1146,7 @@ export const App: Component = () => {
         </Show>
 
         <Show when={phase() === 'reading' && rdCurrent() && !traceOpen()}>
-          <ReadingCard
+          <Show when={rdCurrent()!.kind==='pdf'} fallback={<ReadingCard
             chunk={rdCurrent()!}
             busy={rdBusy()}
             onComplete={() => rdAct('complete')}
@@ -1070,14 +1162,14 @@ export const App: Component = () => {
             undoBusy={undoBusy()}
             onExitRound={exitFlow}
             exitDisabled={answering() || rdBusy() || undoBusy()}
-          />
+          />}><LectureReadingCard onSplitBegin={beginPageSplit} onPage={setLecturePage} onSplit={adoptPageSplit} source={rdCurrent()! as unknown as PageSource} busy={rdBusy()} onComplete={()=>rdAct('complete')} onNext={()=>rdAct('next')} onSkip={()=>rdAct('skip')} onExit={rdFinish} onUndo={undo} undoEnabled={canUndo()} onExitRound={exitFlow} onTextCloze={(source,text)=>{setAddSource({...source,path:rdCurrent()!.path,chunk_key:source.segment_id});setClozeInitial('{{c1::'+text+'}}');setClozeOpen(true)}} onChanged={()=>{void resync();setRelatedToken(t=>t+1)}}/></Show>
         </Show>
 
         {/* 溯源 detour (2026-09-21): a review/preview card's source segment
             as a temporary reading session. Replaces the suspended card in
             the center column; the round itself is untouched underneath. */}
         <Show when={traceOpen() && traceChunk()}>
-          <ReadingCard
+          <Show when={traceChunk()!.kind==='pdf'} fallback={<ReadingCard
             chunk={traceChunk()!}
             variant="trace"
             busy={rdBusy()}
@@ -1090,7 +1182,7 @@ export const App: Component = () => {
             onEdit={() => openSegEdit(traceChunk()!)}
             onExit={closeTrace}
             onBack={closeTrace}
-          />
+          />}><LectureReadingCard onSplitBegin={beginPageSplit} onPage={setLecturePage} onSplit={adoptPageSplit} source={traceChunk()! as unknown as PageSource} authoringId={traceSource()?.authoring_id} onPublished={()=>{void refreshTraceAfterPublication()}} busy={rdBusy()||traceRefreshing()} onComplete={()=>{}} onNext={()=>{}} onSkip={()=>{}} onExit={closeTrace} onBack={closeTrace} onTextCloze={(source,text)=>{setAddSource({...source,path:traceChunk()!.path,chunk_key:source.segment_id});setClozeInitial('{{c1::'+text+'}}');setClozeOpen(true)}} onChanged={()=>{setRelatedToken(t=>t+1);void resync()}}/></Show>
         </Show>
 
         <Show when={phase() === 'start'}>
@@ -1111,12 +1203,13 @@ export const App: Component = () => {
 
         <Show when={phase() === 'review' && currentCard() && !traceOpen()}>
           <Flashcard
+            onScrollElement={element=>{reviewScroll=element}}
             nativeEngine={nativeEngine()}
             card={currentCard()!}
             revealed={revealed()}
             traceAvailable={traceAvailable()}
             onTrace={openTrace}
-            onEdit={() => setEditOpen(true)}
+            onEdit={openCardEdit}
             onUndo={undo}
             undoEnabled={canUndo()}
             undoBusy={undoBusy()}
@@ -1129,12 +1222,14 @@ export const App: Component = () => {
                 answering={answering()}
                 onReveal={() => setRevealedFor(currentCard()?.cardId ?? null)}
                 onAnswer={answer}
+                onExit={exitFlow}
+                exitDisabled={answering() || rdBusy() || undoBusy()}
               />
             }
           />
 
         </Show>
-        <Show when={!traceOpen() && (phase() === 'review' || (phase() === 'start' && canUndo()))}>
+        <Show when={!traceOpen() && phase() === 'start' && canUndo()}>
           <div class="flow-actions">
             <Show when={phase() !== 'review' && canUndo()}>
               <md-text-button disabled={undoBusy() || rdBusy()} onClick={undo}>撤销上次评分</md-text-button>
@@ -1155,10 +1250,13 @@ export const App: Component = () => {
       {/* Gated on centerOccupied() (user request 2026-09-22): start/done/
           empty screens stay single-column — the idle 笔记来源 placeholder
           box used to render here and clutter the 开始学习 page. */}
-      <Show when={isWide() && centerOccupied()}>
+      <Show when={centerOccupied()}>
         <div class="note-column">
+          <md-text-button class="lecture-reference-close" onClick={()=>setLectureReferenceOpen(false)}>返回学习 / 编辑草稿</md-text-button>
           <SidePanelTabs
+            active={isWide() || lectureReferenceOpen()}
             chunk={leftChunk()}
+            pageSource={lecturePage()}
             noteId={noteCard()?.noteId ?? null}
             cardKey={noteCard()?.cardId ?? null}
             blocked={noteBlocked()}

@@ -29,6 +29,7 @@ import { IconAdd, IconDelete, IconEdit, IconFindInPage, IconUndo } from './icons
 // 溯源: jump to the card's source segment as a temporary reading detour
 // (disabled for orphan cards — 404 on /api/reading/source).
 interface Props {
+  onScrollElement?: (element:HTMLDivElement|null)=>void
   dock?: JSX.Element
   nativeEngine?: boolean
   card: Card
@@ -119,7 +120,7 @@ export const Flashcard: Component<Props> = (props) => {
   const questionHtml = () => markdownHtml('q') ?? cleanStudyHtml(props.card.question)
 
   return (
-    <StudyCardShell stage="review" source={props.card.deckName} badge={props.card.isNew} dock={props.dock} toolbar={
+    <StudyCardShell onScrollElement={props.onScrollElement} stage="review" source={props.card.deckName} badge={props.card.isNew} dock={props.dock} toolbar={
       <StudyToolbar label="复习操作">
               <md-icon-button
                 aria-label="撤销上次作答" title="撤销上次作答"

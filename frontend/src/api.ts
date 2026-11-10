@@ -1,3 +1,4 @@
+import type {PageLocator} from './lib/lecture-api'
 import type {
   AnswerResponse,
   MoreResponse,
@@ -146,7 +147,7 @@ export const api = {
   addCard: (
     fields: Record<string, string>,
     tags: string[],
-    readingSource?: { path: string; chunk_key: string } | null,
+    readingSource?: ({ path: string; chunk_key: string } & Partial<PageLocator>) | null,
     kind?: 'qa' | 'cloze',
   ) =>
     post<{ noteId: number; cardIds: number[]; pool: number | null }>('/api/card/add', {
@@ -204,6 +205,7 @@ export const api = {
       return parse<FilesUploadResponse>(r)
     })
   },
+  filesMkdir: (dir: string, name: string) => post<{ok:boolean;path:string}>('/api/files/mkdir', {dir,name}),
   filesRename: (path: string, newName: string, requestId?: string) =>
     post<FileOperationResult>('/api/files/rename', { path, new_name: newName, requestId }),
   filesMove: (path: string, newDir: string, requestId?: string) =>
