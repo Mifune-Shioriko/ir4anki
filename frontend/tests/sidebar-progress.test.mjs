@@ -13,8 +13,8 @@ test('progress footer stays in left rail flow, stacked and bottom aligned',()=>{
  assert.ok(footer.indexOf('kind="reading"')<footer.indexOf('kind="review"'))
  assert.equal((nav.match(/<ProgressRing /g)||[]).length,2)
 })
-test('sidebar reading label retains dynamic count and navigation key',()=>{
- assert.match(nav,/key: 'readingList', label: '阅读'/)
+test('sidebar files label retains dynamic count and navigation key',()=>{
+ assert.match(nav,/key: 'files', label: '文件'/)
  assert.match(nav,/` \(\$\{props.readingListSize\}\)`/)
  assert.match(nav,/onClick=\{\(\) => props.onNavigate\(item.key\)\}/)
 })

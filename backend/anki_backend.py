@@ -19,7 +19,7 @@ class BackendError(RuntimeError):
 
 class PylibClient:
     def __init__(self, collection_path, *, sync_endpoint=None, sync_username=None,
-                 sync_password=None, sync_hkey=None):
+                 sync_password=None, sync_hkey=None, sync_io_timeout=None):
         self.path = Path(collection_path).expanduser().resolve()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='anki-owner')
         self._col = None
@@ -30,6 +30,7 @@ class PylibClient:
         self._sync_username = sync_username
         self._sync_password = sync_password
         self._sync_hkey = sync_hkey
+        self._sync_io_timeout = sync_io_timeout or int(os.getenv("ANKI_SYNC_IO_TIMEOUT", "300"))
         self._auth = None
         self._journal = None
         self._last_sync_error = None
@@ -467,10 +468,16 @@ class PylibClient:
                 raise BackendError('Anki sync is not configured; explicit endpoint and credentials required')
             if self._auth is None:
                 if self._sync_hkey:
-                    self._auth = SyncAuth(hkey=self._sync_hkey, endpoint=self._sync_endpoint)
+                    self._auth = SyncAuth(
+                        hkey=self._sync_hkey,
+                        endpoint=self._sync_endpoint,
+                        io_timeout_secs=self._sync_io_timeout,
+                    )
                 else:
                     operation = 'sync_login'
                     self._auth = col.sync_login(self._sync_username, self._sync_password, self._sync_endpoint)
+                    if self._auth is not None and self._sync_io_timeout:
+                        self._auth.io_timeout_secs = self._sync_io_timeout
             operation = 'sync_collection'
             out = col.sync_collection(self._auth, sync_media=False)
             self._diagnose(col, 'sync:after_collection')
@@ -491,6 +498,7 @@ class PylibClient:
         except Exception as exc:
             self._diagnose(col, 'sync:failure', exc=exc, operation=operation)
             self._auth = None
+            logging.getLogger('ir4anki').warning('sync failed during %s: %s (%s)', operation, exc, type(exc).__name__)
             message = str(exc) if isinstance(exc, BackendError) else 'Anki sync failed; verify credentials and server availability'
             self._last_sync_error = message
             self._save_sync_status(stage='failed', failed_stage=self._sync_meta['stage'], error=message)

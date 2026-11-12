@@ -4,11 +4,11 @@ import test from 'node:test'
 
 const source = path => readFile(new URL(path, import.meta.url), 'utf8')
 
-test('navigation exposes only study, files and reading list', async () => {
+test('navigation exposes only study and files', async () => {
   const nav = await source('../src/components/NavRail.tsx')
   assert.deepEqual([...nav.matchAll(/key: '([^']+)', label:/g)].map(m => m[1]),
-    ['study', 'files', 'readingList'])
-  assert.match(nav, /export type Section = 'study' \| 'files' \| 'readingList'\s*\n/)
+    ['study', 'files'])
+  assert.match(nav, /export type Section = 'study' \| 'files'/)
   assert.doesNotMatch(nav, /engine|引擎管理|settings|设置/i)
 })
 

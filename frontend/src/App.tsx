@@ -23,7 +23,6 @@ import { ClozeDialog } from './components/ClozeDialog'
 import { ConfirmDialog } from './components/ConfirmDialog'
 import { Loading } from './components/Loading'
 import { ReadingCard } from './components/ReadingCard'
-import { ReadingListScreen } from './components/ReadingListScreen'
 import { SidePanelTabs } from './components/SidePanelTabs'
 import { SegEditDialog } from './components/SegEditDialog'
 import { invalidateFileCache } from './components/FileViewer'
@@ -84,12 +83,13 @@ export const App: Component = () => {
     } catch { /* badges are decorative */ }
   }
   const navigate = (s: Section) => {
-    if (s === section() || !requestDraftLeave()) return
-    setSection(s)
+    const target = s === 'readingList' ? 'files' : s
+    if (target === section() || !requestDraftLeave()) return
+    setSection(target)
     // returning to the study section re-reads server state (list edits in
-    // the 阅读清单 section can change the funnel, e.g. adding files)
-    if (s === 'study') resync()
-    if (s === 'files') refreshListedPaths()
+    // the files/reading section can change the funnel, e.g. adding files)
+    if (target === 'study') resync()
+    if (target === 'files') refreshListedPaths()
   }
 
   // ---- wide-screen detection (note panel gate) ----
@@ -1104,17 +1104,10 @@ export const App: Component = () => {
       />
 
       <div class="app">
-        {/* ---- 文件 section: read-only corpus browser (tree + viewer) ---- */}
-        <Show when={section() === 'files'}>
+        {/* ---- 文件 section: corpus browser + reading workbench ---- */}
+        <Show when={section() === 'files' || section() === 'readingList'}>
           <div class="files-page">
             <FilesScreen onListChange={rdRefreshCounts} listedPaths={listedPaths} />
-          </div>
-        </Show>
-
-        {/* ---- 阅读清单 section: the list manager (was a phase) ---- */}
-        <Show when={section() === 'readingList'}>
-          <div class="content reading-list-page">
-            <ReadingListScreen busy={false} onListChange={rdRefreshCounts} />
           </div>
         </Show>
 

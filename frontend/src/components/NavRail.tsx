@@ -1,5 +1,5 @@
 import { Component, Show } from 'solid-js'
-import { IconSchool, IconFolder, IconMenuBook, IconSync } from './icons'
+import { IconSchool, IconFolder, IconSync } from './icons'
 import type { IconProps } from './icons'
 import { ProgressRing } from './ProgressRing'
 
@@ -21,7 +21,7 @@ interface Props {
   onManualSync?: () => void
   section: Section
   onNavigate: (s: Section) => void
-  /** badge count on the 阅读清单 destination (files in the list) */
+  /** badge count on the 文件 destination (files in the reading list) */
   readingListSize?: number
   /** active round progress (null = no round on screen → ring hidden) */
   ring?: { reading: {done:number;total:number}; review: {done:number;total:number} } | null
@@ -30,7 +30,6 @@ interface Props {
 const ITEMS: { key: Section; label: string; icon: Component<IconProps> }[] = [
   { key: 'study', label: '学习', icon: IconSchool },
   { key: 'files', label: '文件', icon: IconFolder },
-  { key: 'readingList', label: '阅读', icon: IconMenuBook },
 ]
 
 export const NavRail: Component<Props> = (props) => {
@@ -52,7 +51,7 @@ export const NavRail: Component<Props> = (props) => {
             </span>
             <span class="nav-rail__label md-typescale-label-small">
               {item.label}
-              {item.key === 'readingList' && props.readingListSize
+              {item.key === 'files' && props.readingListSize
                 ? ` (${props.readingListSize})`
                 : ''}
             </span>

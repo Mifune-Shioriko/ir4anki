@@ -107,6 +107,7 @@ if ANKI_BACKEND == "pylib":
         sync_username=os.getenv("ANKI_SYNC_USERNAME"),
         sync_password=os.getenv("ANKI_SYNC_PASSWORD"),
         sync_hkey=os.getenv("ANKI_SYNC_HKEY"),
+        sync_io_timeout=int(os.getenv("ANKI_SYNC_IO_TIMEOUT", "300")),
     )
 
 # Anki collection.media directory (served back at /media/<name>)

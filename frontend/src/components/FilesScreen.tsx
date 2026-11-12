@@ -6,10 +6,11 @@ import {remapPath} from '../lib/files-state'
 import {fileIntentId,basename,parentPath,normalizeTargets,visibleEntries,moveError,SerialBatch,editingEvent,type Entry,type BatchReport} from '../lib/files-browser'
 import {requestDraftLeave} from '../lib/draft-leave'
 import {partitionImports,type SkippedImport} from '../lib/file-import'
+import type {ReadingFileSummary,ReadingCorpusFile} from '../types'
 import {FileViewer,invalidateFileCache} from './FileViewer'
 import {FilesLecturePreview} from './FilesLecturePreview'
 import {FilesMenu} from './FilesMenu'
-import {IconFolder,IconFolderOpen,IconDescription,IconArrowBack,IconChevronRight,IconRestartAlt} from './icons'
+import {IconFolder,IconFolderOpen,IconDescription,IconArrowBack,IconChevronRight,IconRestartAlt,IconArrowDownward,IconArrowUpward,IconVerticalAlignTop,IconClose,IconMenuBook} from './icons'
 import '../files.css'
 interface Props{listedPaths?:()=>Set<string>;onListChange?:()=>void}
 type ImportEntry={file:File;rel:string}
@@ -17,6 +18,7 @@ type ImportConflict={entries:ImportEntry[];dir:string;names:string[]}
 type DialogState={kind:'rename'|'delete'|'mkdir';targets:Entry[]}
 const batchKey='files-batch-report-v1',mkdirKey='files-mkdir-pending-v1'
 const read=<T,>(key:string,fallback:T):T=>{try{return JSON.parse(sessionStorage.getItem(key)??'null')??fallback}catch{return fallback}}
+const FRONTIER_LABEL:Record<string,string>={todo:'未读',active:'正在制卡',done:'制卡完成',skipped:'已跳过',held:'等卡片过预览池'}
 export const FilesScreen:Component<Props>=(props)=>{
  const [files,setFiles]=createSignal<{path:string;title:string;revision?:string}[]>([]),[dirs,setDirs]=createSignal<string[]>([]),[membership,setMembership]=createSignal(new Set<string>())
  const [currentDir,setCurrentDir]=createSignal(read('files-directory','')),[selected,setSelected]=createSignal(new Set<string>()),[focused,setFocused]=createSignal(''),[query,setQuery]=createSignal('')
@@ -25,6 +27,13 @@ export const FilesScreen:Component<Props>=(props)=>{
  const [skippedImports,setSkippedImports]=createSignal<SkippedImport[]>([])
  const [working,setWorking]=createSignal(false),[version,setVersion]=createSignal(0),[operationVersion,setOperationVersion]=createSignal(0)
  const [undoId,setUndoId]=createSignal<string|null>(read('files-undo-operation',null)),[dialog,setDialog]=createSignal<DialogState|null>(null),[value,setValue]=createSignal(''),[dialogError,setDialogError]=createSignal('')
+ const [readingList,setReadingList]=createSignal<ReadingFileSummary[]>([])
+ const [corpus,setCorpus]=createSignal<ReadingCorpusFile[]>([])
+ const [readingLoading,setReadingLoading]=createSignal(true)
+ const [readingActionBusy,setReadingActionBusy]=createSignal(false)
+ const [readingError,setReadingError]=createSignal('')
+ const [readingMessage,setReadingMessage]=createSignal('')
+ const [removeTarget,setRemoveTarget]=createSignal<ReadingFileSummary|null>(null)
  const savedReport=read<BatchReport|null>(batchKey,null)
  const restored=savedReport&&Array.isArray(savedReport.items)?savedReport:null
  if(restored)restored.items=restored.items.map(i=>({...i,status:i.status==='running'?'unconfirmed':i.status}))
@@ -34,6 +43,18 @@ export const FilesScreen:Component<Props>=(props)=>{
  const owner={}
  let alive=true,generation=0,anchor='',list!:HTMLDivElement,input!:HTMLInputElement,folderInput!:HTMLInputElement,uploadDirectory='',suppressClick=false,returnFocus:HTMLElement|null=null
  const all=createMemo<Entry[]>(()=>[...dirs().map(path=>({path,isDir:true})),...files().map(f=>({path:f.path,isDir:false,revision:f.revision}))])
+ const summaryMap=createMemo(()=>{const m=new Map<string,ReadingFileSummary>();for(const s of readingList())m.set(s.path,s);return m})
+ const corpusMap=createMemo(()=>{const m=new Map<string,ReadingCorpusFile>();for(const c of corpus())m.set(c.path,c);return m})
+ const isPdf=(s:ReadingFileSummary)=>s.kind==='pdf'
+ const unitName=(s:ReadingFileSummary)=>(isPdf(s)?'页':'字')
+ const totalUnits=(s:ReadingFileSummary)=>isPdf(s)?(s.total_pages??s.total_chunks):(s.total_chars??0)
+ const readUnits=(s:ReadingFileSummary)=>isPdf(s)?(s.read_pages??(s.done+s.skipped+(s.background??0))):(s.read_chars??0)
+ const activeUnits=(s:ReadingFileSummary)=>isPdf(s)?(s.active_pages??s.active):(s.active_chars??0)
+ const readRatio=(s:ReadingFileSummary)=>{const tot=totalUnits(s);if(tot>0)return Math.min(1,readUnits(s)/tot);return s.total_chunks>0?(s.done+s.skipped+(s.background??0))/s.total_chunks:0}
+ const activeRatio=(s:ReadingFileSummary)=>{const tot=totalUnits(s);if(tot>0)return Math.min(1-readRatio(s),activeUnits(s)/tot);return 0}
+ const calcPercent=(part:number,total:number):number=>total>0?Math.min(100,Math.round((part/total)*100)):0
+ const fmtNum=(n:number|undefined):string=>(n??0).toLocaleString('zh-CN')
+ const frontierText=(s:ReadingFileSummary,f:NonNullable<ReadingFileSummary['frontier']>):string=>{const lineTag=(f.line_start??0)>1?`L${f.line_start} · `:'';const snippet=f.preview&&f.preview!==s.title?f.preview:f.title;return `${lineTag}${snippet}`}
  const rows=createMemo(()=>visibleEntries(all(),currentDir(),query(),'all'))
  const targets=()=>normalizeTargets(all().filter(t=>selected().has(t.path)))
  const unresolved=()=>report()?.items.some(i=>i.status==='running'||i.status==='unconfirmed')??false
@@ -46,6 +67,7 @@ export const FilesScreen:Component<Props>=(props)=>{
   setSelected(s=>new Set([...s].map(p=>remapPath(p,old,next))));setFocused(p=>remapPath(p,old,next));setCurrentDir(p=>remapPath(p,old,next));if(previewPath()&&remapPath(previewPath(),old,next)!==previewPath()){if(requestDraftLeave())setPreviewPath(p=>remapPath(p,old,next));else setMessage('文件迁移已确认；当前页笔记无法保留草稿，原编辑器仍保留。请先复制或保存，再关闭预览。')}
   setHistory(h=>h.map(p=>remapPath(p,old,next)));setMembership(s=>new Set([...s].map(p=>remapPath(p,old,next))))
   setFiles(fs=>fs.map(f=>({...f,path:remapPath(f.path,old,next)})));setDirs(ds=>ds.map(p=>remapPath(p,old,next)))
+  if(typeof setReadingList==='function')setReadingList(ls=>ls.map(item=>({...item,path:remapPath(item.path,old,next)})))
   window.dispatchEvent(new CustomEvent('files-relocated',{detail:{oldPath:old,newPath:next,owner}}));setVersion(v=>v+1)
  }
  const operations=new FileOperations(api,sessionStorage,(result,old,request)=>{
@@ -53,6 +75,46 @@ export const FilesScreen:Component<Props>=(props)=>{
   if(!alive)return
   setUndoId(request.action==='undo'?null:result.operationId??undoId());remember('files-undo-operation',undoId())
  },()=>{if(alive)setOperationVersion(v=>v+1)})
+ async function reloadReading(){
+  if(!alive)return
+  setReadingLoading(true)
+  try{
+   const [status,corp]=await Promise.all([
+    api.readingStatus().catch(()=>({list:[] as ReadingFileSummary[]})),
+    api.readingCorpus().catch(()=>({files:[] as ReadingCorpusFile[]}))
+   ])
+   if(!alive)return
+   setReadingList(status.list);setCorpus(corp.files);setMembership(new Set(status.list.map(s=>s.path)))
+  }finally{if(alive)setReadingLoading(false)}
+ }
+ const mutateReading=async(fn:()=>Promise<unknown>)=>{
+  if(readingActionBusy()||working())return
+  setReadingActionBusy(true);setReadingError('');setReadingMessage('')
+  try{
+   await fn();await reloadReading();props.onListChange?.();setReadingMessage('阅读清单已更新')
+  }catch(e){setReadingError('操作失败：'+(e as Error).message)}finally{if(alive)setReadingActionBusy(false)}
+ }
+ const moveUp=(s:ReadingFileSummary)=>mutateReading(()=>api.readingListReorder({path:s.path}))
+ const moveTop=(s:ReadingFileSummary)=>mutateReading(()=>api.readingListReorder({path:s.path,top:true}))
+ const moveDown=(idx:number)=>{
+  const items=readingList()
+  if(idx<0||idx>=items.length-1)return
+  const order=items.map(x=>x.path)
+  const tmp=order[idx];order[idx]=order[idx+1];order[idx+1]=tmp
+  mutateReading(()=>api.readingListReorder({order}))
+ }
+ const addFile=(f:{path:string;kind?:'pdf'|'markdown';document_id?:string;revision_id?:string},fresh=false)=>{
+  const isPdf=f.kind==='pdf'||/\.pdf$/i.test(f.path)
+  const corp=corpusMap().get(f.path)
+  const docId=f.document_id||corp?.document_id,revId=f.revision_id||corp?.revision_id
+  return mutateReading(()=>isPdf&&docId&&revId
+   ?lectureRequest(`/${docId}/revisions/${revId}/read`,'POST')
+   :api.readingListAdd(f.path,fresh))
+ }
+ const confirmRemove=()=>{
+  const t=removeTarget();if(!t)return
+  mutateReading(async()=>{await api.readingListRemove(t.path);setRemoveTarget(null)})
+ }
  async function reload(){
   if(!alive)return
   const token=++generation;setLoading(true);setLoadError('')
@@ -61,6 +123,15 @@ export const FilesScreen:Component<Props>=(props)=>{
    const [d,m]=await Promise.all([api.filesList(),api.filesMembership()])
    if(!alive||token!==generation)return
    setFiles(d.files);setDirs(d.dirs??[]);setMembership(new Set(m.paths))
+   if(typeof api.readingStatus==='function'&&typeof api.readingCorpus==='function'){
+    try{
+     const [status,corp]=await Promise.all([
+      api.readingStatus().catch(()=>({list:[] as ReadingFileSummary[]})),
+      api.readingCorpus().catch(()=>({files:[] as ReadingCorpusFile[]}))
+     ])
+     if(alive&&token===generation){setReadingList(status.list);setCorpus(corp.files);setReadingLoading(false)}
+    }catch{}
+   }
    if(mkdirPending())setMkdirObserved((d.dirs??[]).includes(mkdirPending()!.path))
    // Preserve unsafe editor/source even when server list no longer has its path.
    if(currentDir()&&!(d.dirs??[]).includes(currentDir())&&requestDraftLeave()){setCurrentDir('');remember('files-directory','')}
@@ -254,31 +325,214 @@ export const FilesScreen:Component<Props>=(props)=>{
   <Show when={report()?.items.some(i=>i.status!=='confirmed')}><details class="fb-operation-feedback fb-recovery" open role="alert"><summary>{report()!.action}结果 · {report()!.items.filter(i=>i.status==='confirmed').length}/{report()!.items.length} 已确认{unresolved()?' · 有待确认项目，已停止后续操作':''}</summary><div class="fb-report-items"><For each={report()!.items}>{item=><div><strong>{item.path}</strong><span>{({'confirmed':'已确认','failed':'失败','unconfirmed':'结果待确认','not-started':'未开始','running':'处理中'})[item.status]}</span><span>{item.message}</span><Show when={item.status==='unconfirmed'}><small>当前列表：{all().some(t=>t.path===item.path)?'原路径仍可见':'原路径未列出'}。请核对原路径与目标；这不代表原请求已确认。</small></Show></div>}</For></div><Show when={!working()}><md-text-button disabled={(operationVersion(),operations.isBusy())} onClick={()=>{setReport(null);sessionStorage.removeItem(batchKey)}}>{unresolved()?'已核对，结束本批；不重试剩余项目':'关闭结果'}</md-text-button></Show></details></Show>
     <div class="fb-command-slot" aria-label="文件操作">
      <Show when={selected().size} fallback={<div class="fb-folder-heading"><strong>{basename(currentDir())||'全部文件'}</strong><span>{rows().length} 项 · 导入到 {currentDir()||'根目录'}</span></div>}>
-      <div class="fb-selection-heading"><strong>已选择 {selected().size} 项</strong><button onClick={()=>setSelected(new Set<string>())}>取消选择</button></div><div class="fb-selection-actions"><md-text-button disabled={busy()||targets().length!==1||targets()[0]?.isDir} onClick={()=>command('preview',targets())}>预览</md-text-button><md-text-button disabled={busy()||targets().length!==1} onClick={()=>command('rename',targets())}>重命名</md-text-button><md-text-button disabled={busy()} onClick={()=>command('delete',targets())}>删除</md-text-button></div>
+      <div class="fb-selection-heading"><strong>已选择 {selected().size} 项</strong><button onClick={()=>setSelected(new Set<string>())}>取消选择</button></div><div class="fb-selection-actions"><md-text-button disabled={busy()||targets().length!==1||targets()[0]?.isDir} onClick={()=>command('preview',targets())}>预览与阅读</md-text-button><md-text-button disabled={busy()||targets().length!==1} onClick={()=>command('rename',targets())}>重命名</md-text-button><md-text-button disabled={busy()} onClick={()=>command('delete',targets())}>删除</md-text-button></div>
      </Show>
     </div>
     <div class="fb-list" ref={list} tabIndex={0} role="listbox" aria-label="当前文件夹内容" aria-multiselectable="true" aria-busy={loading()||working()} onDragOver={e=>over(e,currentDir())} onDrop={e=>dropped(e,currentDir())} onDragLeave={e=>{if(!e.currentTarget.contains(e.relatedTarget as Node)){setDrop(null);setExternalDrop(false)}}}>
      <Show when={loading()}><p role="status" class="fb-empty">正在读取文件列表…</p></Show>
      <Show when={loadError()}><div class="fb-empty" role="alert">{loadError()}<md-text-button onClick={()=>void reload()}>重试</md-text-button></div></Show>
      <Show when={!loading()&&!loadError()&&!rows().length}><div class="fb-empty"><IconFolderOpen size={40}/><h2>{query()?'没有匹配项目':'这个文件夹还是空的'}</h2><p>{query()?'试试其他文件名或文件夹名。':'可导入 Markdown、PDF / PPT / PPTX 和图片，也可先创建文件夹。'}</p><Show when={!query()}><md-filled-tonal-button disabled={busy()} onClick={()=>pickImport()}>导入到当前文件夹</md-filled-tonal-button><md-text-button disabled={busy()} onClick={()=>open('mkdir',[])}>新建文件夹</md-text-button></Show></div></Show>
-     <For each={rows()}>{t=><div class="fb-row" data-entry={t.path} role="option" aria-selected={selected().has(t.path)} tabindex={focused()===t.path?0:-1} title={t.path} classList={{'fb-row--selected':selected().has(t.path),...t.isDir?dropClass(t.path):{}}} draggable={!busy()} onFocus={()=>setFocused(t.path)} onClick={e=>choose(t,e)} onDblClick={e=>{if(!(e.target as Element).closest('button,md-icon-button,.files-menu,input'))preview(t)}} onContextMenu={e=>context(e,t)} onDragStart={e=>startDrag(e,t)} onDragEnd={()=>{setDrag([]);setDrop(null)}} onDragOver={t.isDir?e=>over(e,t.path):undefined} onDrop={t.isDir?e=>dropped(e,t.path):undefined}>
-      <input class="fb-checkbox" type="checkbox" aria-label={`选择 ${basename(t.path)}`} checked={selected().has(t.path)} onClick={e=>{e.stopPropagation();choose(t,{ctrlKey:true,metaKey:false,shiftKey:e.shiftKey} as MouseEvent)}}/>
-      <span class="fb-type-icon">{t.isDir?<IconFolder size={22}/>:<IconDescription size={22}/>}</span>
-      <div class="fb-name"><span class="fb-basename">{t.isDir?basename(t.path):<>{basename(t.path).slice(0,Math.max(0,basename(t.path).lastIndexOf('.')))||basename(t.path)}<span class="fb-extension">{basename(t.path).includes('.')?basename(t.path).slice(basename(t.path).lastIndexOf('.')):''}</span></>}</span><span class="fb-meta">{t.isDir?'文件夹':/\.pdf$/i.test(t.path)?'PDF':/\.ppt$/i.test(t.path)?'PPT':/\.pptx$/i.test(t.path)?'PPTX':'Markdown'}{membership().has(t.path)?' · 阅读清单':''}<Show when={query().trim()}> · {parentPath(t.path)||'根目录'}</Show></span></div>
-      <FilesMenu label={`更多操作：${basename(t.path)}`} disabled={busy()} actions={[
-       ...(!t.isDir?[{label:'预览',run:()=>command('preview',[t])}]:[]),
-       {label:'重命名',run:()=>{const ts=menuTargets(t);if(ts.length===1)command('rename',ts);else setMessage('重命名需要只选择一个项目')}},
-       {label:'复制路径',run:()=>command('copy',menuTargets(t))},
-       {label:'永久删除',run:()=>command('delete',menuTargets(t))}
-      ]}/>
-     </div>}</For>
+     <For each={rows()}>{t=>{
+      const s=summaryMap().get(t.path)
+      const rank=()=>readingList().findIndex(item=>item.path===t.path)+1
+      const pct=()=>s?calcPercent(readUnits(s),totalUnits(s)):0
+      const isDone=()=>s&&s.total_chunks>0&&s.todo===0&&s.active===0
+      const isArchived=()=>!s&&!!corpusMap().get(t.path)?.archived
+      return <div class="fb-row" data-entry={t.path} role="option" aria-selected={selected().has(t.path)} tabindex={focused()===t.path?0:-1} title={t.path} classList={{'fb-row--selected':selected().has(t.path),...t.isDir?dropClass(t.path):{}}} draggable={!busy()} onFocus={()=>setFocused(t.path)} onClick={e=>choose(t,e)} onDblClick={e=>{if(!(e.target as Element).closest('button,md-icon-button,.files-menu,input'))preview(t)}} onContextMenu={e=>context(e,t)} onDragStart={e=>startDrag(e,t)} onDragEnd={()=>{setDrag([]);setDrop(null)}} onDragOver={t.isDir?e=>over(e,t.path):undefined} onDrop={t.isDir?e=>dropped(e,t.path):undefined}>
+       <input class="fb-checkbox" type="checkbox" aria-label={`选择 ${basename(t.path)}`} checked={selected().has(t.path)} onClick={e=>{e.stopPropagation();choose(t,{ctrlKey:true,metaKey:false,shiftKey:e.shiftKey} as MouseEvent)}}/>
+       <span class="fb-type-icon">{t.isDir?<IconFolder size={22}/>:<IconDescription size={22}/>}</span>
+       <div class="fb-name">
+        <span class="fb-basename">
+         {t.isDir?basename(t.path):<>{basename(t.path).slice(0,Math.max(0,basename(t.path).lastIndexOf('.')))||basename(t.path)}<span class="fb-extension">{basename(t.path).includes('.')?basename(t.path).slice(basename(t.path).lastIndexOf('.')):''}</span></>}
+         <Show when={!t.isDir}>
+          <Show when={s}><span class="fb-reading-pill fb-reading-pill--in-list" title={`阅读清单 #${rank()} · 已读 ${pct()}%`}>#{rank()} · {pct()}%</span></Show>
+          <Show when={!s && isDone()}><span class="fb-reading-pill fb-reading-pill--done" title="已全部读完">已读完 ✓</span></Show>
+          <Show when={!s && isArchived()}><span class="fb-reading-pill fb-reading-pill--archived" title="有历史阅读进度">已存档</span></Show>
+         </Show>
+        </span>
+        <span class="fb-meta">
+         {t.isDir?'文件夹':/\.pdf$/i.test(t.path)?'PDF':/\.ppt$/i.test(t.path)?'PPT':/\.pptx$/i.test(t.path)?'PPTX':'Markdown'}
+         {s ? ` · 阅读中 (${fmtNum(readUnits(s))}/${fmtNum(totalUnits(s))}${unitName(s)})` : membership().has(t.path)?' · 阅读清单':''}
+         <Show when={query().trim()}> · {parentPath(t.path)||'根目录'}</Show>
+        </span>
+       </div>
+       <Show when={!t.isDir && s}>
+        <div class="fb-row-progress" aria-hidden="true">
+         <div class="fb-row-progress__read" style={{ width: `${readRatio(s) * 100}%` }} />
+         <div class="fb-row-progress__active" style={{ width: `${activeRatio(s) * 100}%` }} />
+        </div>
+       </Show>
+       <FilesMenu label={`更多操作：${basename(t.path)}`} disabled={busy()||readingActionBusy()} actions={[
+        ...(!t.isDir?[{label:'预览与阅读',run:()=>command('preview',[t])}]:[]),
+        ...(!t.isDir&&s?[{label:'设为置顶',run:()=>moveTop(s)},{label:'移出阅读清单',run:()=>setRemoveTarget(s)}]:[]),
+        ...(!t.isDir&&!s?[{label:isArchived()?'恢复阅读进度':'加入阅读清单',run:()=>void addFile(corpusMap().get(t.path)??{path:t.path})}]:[]),
+        {label:'重命名',run:()=>{const ts=menuTargets(t);if(ts.length===1)command('rename',ts);else setMessage('重命名需要只选择一个项目')}},
+        {label:'复制路径',run:()=>command('copy',menuTargets(t))},
+        {label:'永久删除',run:()=>command('delete',menuTargets(t))}
+       ]}/>
+      </div>
+     }}</For>
     </div>
     <footer class="fb-footer"><span>{rows().length} 项{selected().size?` · 已选 ${selected().size}`:''}</span><span>{currentDir()||'根目录'}</span></footer>
    </main>
-   <Show when={previewPath()}><aside class="fb-preview" role="region" aria-label="文件预览"><div class="fb-preview-header"><h2 title={previewPath()!}>{basename(previewPath()!)}</h2><md-text-button onClick={closePreview}>关闭预览</md-text-button></div><div class="fb-preview-body" classList={{'fb-preview-body--lecture':/\.(pdf|ppt|pptx)$/i.test(previewPath()!)}} inert={working()}>
-    <Show when={/\.(pdf|ppt|pptx)$/i.test(previewPath()!)} fallback={<FileViewer path={previewPath()} anchorLine={null} fetchFile={api.filesRaw} revision={files().find(f=>f.path===previewPath())?.revision} reloadToken={version()} class="note-body"/>}><FilesLecturePreview path={previewPath()!}/></Show>
-   </div></aside></Show>
+   <section class="fb-workbench" classList={{'fb-workbench--detail':!!previewPath()}} role="region" aria-label="阅读工作台">
+    <Show when={previewPath()} fallback={
+     <div class="fb-queue-pane">
+      <div class="reading-queue-inner">
+       <div class="reading-queue-head">
+        <div class="reading-queue-head__title-row">
+         <h2 class="reading-queue-title md-typescale-title-small">阅读清单</h2>
+         <span class="reading-queue-count md-typescale-label-small">{readingList().length} 篇</span>
+         <md-icon-button aria-label="刷新清单" onClick={reloadReading} disabled={busy()||readingActionBusy()}>
+          <md-icon><IconRestartAlt size={18} /></md-icon>
+         </md-icon-button>
+        </div>
+       </div>
+       <div class="reading-queue-body" aria-busy={readingLoading()||readingActionBusy()}>
+        <Show when={readingError()}><p role="alert" class="lecture-error">{readingError()}</p></Show>
+        <Show when={readingMessage()}><p role="status" class="reading-status-banner md-typescale-label-medium">{readingMessage()}</p></Show>
+        <Show when={readingLoading()}><div class="reading-list-loading"><md-circular-progress indeterminate style="--md-circular-progress-size:32px" /></div></Show>
+        <Show when={!readingLoading()&&readingList().length===0}>
+         <div class="reading-list-empty md-typescale-body-medium">
+          <md-icon class="reading-list-empty-icon"><IconMenuBook /></md-icon>
+          <div>清单还是空的——从左侧文件列表点击「加入清单」把要读的笔记加进来。</div>
+         </div>
+        </Show>
+        <div class="reading-list">
+         <For each={readingList()}>{(s,i)=>{
+          const pct=()=>calcPercent(readUnits(s),totalUnits(s))
+          const unit=()=>unitName(s)
+          const doneSegs=()=>s.done+s.skipped+(s.background??0)
+          const dirPath=()=>{const stripped=s.path.replace(/^\d{4}\//,'');const slash=stripped.lastIndexOf('/');return slash>0?stripped.slice(0,slash):stripped}
+          return <div class="reading-list-item fb-queue-item-clickable" classList={{'reading-list-item--missing':!!s.missing,'reading-list-item--top':i()===0}}>
+           <div class="reading-list-item__rank" title={`优先级 #${i()+1}`}>#{i()+1}</div>
+           <div class="reading-list-item__main">
+            <div class="reading-list-item__header">
+             <div class="reading-list-item__title md-typescale-title-small" title="点击打开此文件并查看阅读详情" onClick={()=>{if(requestDraftLeave())setPreviewPath(s.path)}}>
+              {s.title}<span class="reading-list-item__path md-typescale-label-small">{dirPath()}</span>
+              <Show when={s.missing}><span class="reading-badge reading-badge--warn">文件已不在语料中</span></Show>
+              <Show when={!s.missing&&(s as any).orphans>0}><span class="reading-badge reading-badge--warn">文件已变更 · {(s as any).orphans} 段状态待确认</span></Show>
+             </div>
+             <div class="reading-list-item__actions">
+              <md-icon-button aria-label="打开预览" title="打开此文件预览与进度" onClick={()=>{if(requestDraftLeave())setPreviewPath(s.path)}}><md-icon><IconDescription /></md-icon></md-icon-button>
+              <md-icon-button aria-label="置顶" title="置顶" disabled={busy()||readingActionBusy()||i()===0} onClick={()=>moveTop(s)}><md-icon><IconVerticalAlignTop /></md-icon></md-icon-button>
+              <md-icon-button aria-label="上移" title="上移一位" disabled={busy()||readingActionBusy()||i()===0} onClick={()=>moveUp(s)}><md-icon><IconArrowUpward /></md-icon></md-icon-button>
+              <md-icon-button aria-label="下移" title="下移一位" disabled={busy()||readingActionBusy()||i()===readingList().length-1} onClick={()=>moveDown(i())}><md-icon><IconArrowDownward /></md-icon></md-icon-button>
+              <md-icon-button aria-label="移出清单" title="移出清单（保留进度）" disabled={busy()||readingActionBusy()} onClick={()=>setRemoveTarget(s)}><md-icon><IconClose /></md-icon></md-icon-button>
+             </div>
+            </div>
+            <Show when={!s.missing}>
+             <div class="reading-list-item__progress-row">
+              <div class="reading-char-bar reading-list-item__bar" role="progressbar" aria-valuemin={0} aria-valuemax={totalUnits(s)} aria-valuenow={readUnits(s)}>
+               <div class="reading-char-bar__read" style={{width:`${readRatio(s)*100}%`}} />
+               <div class="reading-char-bar__active" style={{width:`${activeRatio(s)*100}%`}} />
+              </div>
+              <span class="reading-list-item__pct md-typescale-label-medium">{pct()}%</span>
+             </div>
+             <div class="reading-list-item__meta md-typescale-label-small">
+              <div class="reading-list-item__stats">
+               <span class="reading-stat-Highlight">已读 {fmtNum(readUnits(s))} / {fmtNum(totalUnits(s))} {unit()}</span>
+               <Show when={activeUnits(s)>0}><span class="reading-stat-active">· 正在制卡 {fmtNum(activeUnits(s))} {unit()} ({s.active} 段)</span></Show>
+               <Show when={(s as any).cards_created>0}><span>· 已制卡 {(s as any).cards_created} 张</span></Show>
+               <span class="reading-stat-chunks">· 片段 {doneSegs()} / {s.total_chunks}</span>
+              </div>
+              <div class="reading-list-item__frontier">
+               <Show when={s.frontier}><span class="reading-frontier-text" title={s.frontier!.preview||s.frontier!.title}>下一段：{frontierText(s,s.frontier!)}</span><span class={`reading-status-chip reading-status-${s.frontier!.status}`}>{FRONTIER_LABEL[s.frontier!.status]??s.frontier!.status}</span></Show>
+               <Show when={!s.frontier&&s.gated_frontier}><span class="reading-frontier-text" title={s.gated_frontier!.preview||s.gated_frontier!.title}>下一段：{frontierText(s,s.gated_frontier!)}</span><span class="reading-status-chip reading-status-held">等卡片过预览池</span></Show>
+               <Show when={!s.frontier&&!s.gated_frontier&&!s.missing}><span class="reading-frontier-done">全部读完 ✓</span></Show>
+              </div>
+             </div>
+            </Show>
+           </div>
+          </div>
+         }}</For>
+        </div>
+       </div>
+      </div>
+     </div>
+    }>
+     <div class="fb-detail-pane">
+      <div class="fb-detail-head">
+       <div class="fb-detail-title-group">
+        <span class="fb-detail-path md-typescale-label-small">{parentPath(previewPath()!)||'根目录'}</span>
+        <h2 class="fb-detail-title md-typescale-title-small" title={previewPath()!}>{basename(previewPath()!)}</h2>
+       </div>
+       <div class="fb-detail-actions">
+        <md-text-button onClick={closePreview}>
+         <md-icon slot="icon"><IconArrowBack size={18} /></md-icon>
+         返回阅读清单
+        </md-text-button>
+       </div>
+      </div>
+      <div class="fb-file-reading-card">
+       {(()=>{
+        const s=summaryMap().get(previewPath()!)
+        const c=corpusMap().get(previewPath()!)
+        const rank=()=>readingList().findIndex(item=>item.path===previewPath()!)+1
+        return <Show when={s} fallback={
+         <div class="fb-file-reading-card__not-in-list">
+          <div><Show when={c?.archived} fallback={<span>该文件尚未加入阅读清单。加入后将在「学习」tab 阶段发牌推进。</span>}><span>该文件有存档进度{c?.chars?` (${fmtNum(c.chars)} 字)`:c?.page_count?` (${c.page_count} 页)`:''}。</span></Show></div>
+          <div class="fb-file-reading-card__actions">
+           <Show when={c?.archived} fallback={<md-filled-button disabled={busy()||readingActionBusy()} onClick={()=>addFile(c??{path:previewPath()!})}>加入阅读清单</md-filled-button>}>
+            <md-filled-tonal-button disabled={busy()||readingActionBusy()} onClick={()=>addFile(c!,false)}>恢复阅读进度</md-filled-tonal-button>
+            <md-text-button disabled={busy()||readingActionBusy()} onClick={()=>addFile(c!,true)}>重新播种</md-text-button>
+           </Show>
+          </div>
+         </div>
+        }>{item=>{
+         const pct=()=>calcPercent(readUnits(item()),totalUnits(item()))
+         const unit=()=>unitName(item())
+         const doneSegs=()=>item().done+item().skipped+(item().background??0)
+         return <>
+          <div class="fb-file-reading-card__top">
+           <div class="fb-file-reading-card__badge-row">
+            <span class="fb-reading-pill fb-reading-pill--in-list">阅读清单 #{rank()}</span>
+            <span class="md-typescale-label-medium">{pct()}%</span>
+           </div>
+           <div class="fb-file-reading-card__actions">
+            <Show when={rank()>1}><md-text-button disabled={busy()||readingActionBusy()} onClick={()=>moveTop(item())}>设为置顶</md-text-button></Show>
+            <md-text-button disabled={busy()||readingActionBusy()} onClick={()=>setRemoveTarget(item())}>移出清单</md-text-button>
+           </div>
+          </div>
+          <div class="fb-file-reading-card__progress-row">
+           <div class="reading-char-bar" role="progressbar" aria-valuemin={0} aria-valuemax={totalUnits(item())} aria-valuenow={readUnits(item())}>
+            <div class="reading-char-bar__read" style={{width:`${readRatio(item())*100}%`}} />
+            <div class="reading-char-bar__active" style={{width:`${activeRatio(item())*100}%`}} />
+           </div>
+          </div>
+          <div class="fb-file-reading-card__stats">
+           <span class="reading-stat-Highlight">已读 {fmtNum(readUnits(item()))} / {fmtNum(totalUnits(item()))} {unit()}</span>
+           <Show when={activeUnits(item())>0}><span class="reading-stat-active">· 正在制卡 {fmtNum(activeUnits(item()))} {unit()} ({item().active} 段)</span></Show>
+           <Show when={(item() as any).cards_created>0}><span>· 已制卡 {(item() as any).cards_created} 张</span></Show>
+           <span>· 片段 {doneSegs()} / {item().total_chunks}</span>
+          </div>
+          <Show when={item().frontier||item().gated_frontier}>
+           <div class="fb-file-reading-card__frontier">
+            <span class="fb-file-reading-card__frontier-text" title={item().frontier?.preview||item().frontier?.title}>下一段：{item().frontier?frontierText(item(),item().frontier!):frontierText(item(),item().gated_frontier!)}</span>
+            <span class={`reading-status-chip reading-status-${item().frontier?item().frontier!.status:'held'}`}>{item().frontier?(FRONTIER_LABEL[item().frontier!.status]??item().frontier!.status):'等卡片过预览池'}</span>
+           </div>
+          </Show>
+         </>
+        }}</Show>
+       })()}
+      </div>
+      <div class="fb-preview-body" classList={{'fb-preview-body--lecture':/\.(pdf|ppt|pptx)$/i.test(previewPath()!)}} inert={working()}>
+       <Show when={/\.(pdf|ppt|pptx)$/i.test(previewPath()!)} fallback={<FileViewer path={previewPath()} anchorLine={summaryMap().get(previewPath()!)?.frontier?.line_start??null} anchorEndLine={summaryMap().get(previewPath()!)?.frontier?.line_end??null} fetchFile={api.filesRaw} revision={files().find(f=>f.path===previewPath())?.revision} reloadToken={version()} class="note-body"/>}><FilesLecturePreview path={previewPath()!}/></Show>
+      </div>
+     </div>
+    </Show>
+   </section>
   </div>
+  <Show when={removeTarget()!==null}>
+   <dialog ref={dialogRef} class="fb-dialog" onCancel={e=>{e.preventDefault();setRemoveTarget(null);restoreFocus()}}>
+    <h2>移出阅读清单？</h2>
+    <p>「{removeTarget()!.title}」将从清单移出。已读进度会保留，重新添加即恢复。</p>
+    <div class="fb-dialog-actions">
+     <button type="button" disabled={readingActionBusy()} onClick={()=>setRemoveTarget(null)}>取消</button>
+     <button type="button" style={{color:'var(--md-sys-color-error)'}} disabled={readingActionBusy()} onClick={confirmRemove}>移出</button>
+    </div>
+   </dialog>
+  </Show>
   <Show when={mkdirPending()}><div class="fb-recovery" role="alert">创建结果待核对：{mkdirPending()!.path}。{mkdirObserved()?'目录现已存在；请确认这是否为预期结果。':'列表尚未确认该目录；请刷新核对。'}<md-text-button disabled={working()||loading()} onClick={()=>{setMkdirPending(null);sessionStorage.removeItem(mkdirKey);setMessage('已结束创建结果核对；不会重发原请求')}}>已核对，结束本次操作</md-text-button></div></Show>
   <Show when={importConflict()&&!working()&&!unresolved()}><dialog ref={dialogRef} class="fb-dialog" onCancel={e=>{e.preventDefault();setImportConflict(null);restoreFocus()}}><h2>导入文件名冲突</h2><p>重新导入到：{importConflict()!.dir||'根目录'}。以下 Markdown 名称已存在；默认不覆盖。</p><div class="fb-dialog-targets"><For each={importConflict()!.names}>{name=><p>{name}</p>}</For></div><p>选择“覆盖”会替换这些原文；其余选择会跳过冲突或改名保留两份。PDF / PPT / PPTX 的历史版本始终在课件预览中单独导入。</p><div class="fb-conflict-actions"><button onClick={()=>{setImportConflict(null);restoreFocus()}}>取消上传</button><For each={[{policy:'skip' as const,label:'跳过重名'},{policy:'rename' as const,label:'改名保留两者'},{policy:'overwrite' as const,label:'覆盖'}]}>{choice=><button disabled={busy()} onClick={()=>{const c=importConflict()!;setImportConflict(null);void importEntries(c.entries,c.dir,choice.policy)}}>{choice.label}</button>}</For></div></dialog></Show>
   <Show when={dialog()}><dialog ref={dialogRef} class="fb-dialog" onCancel={e=>{e.preventDefault();closeDialog()}} onClose={()=>{if(dialog()&&!working())closeDialog()}}><form onSubmit={e=>{e.preventDefault();const d=dialog()!;if(d.kind==='mkdir')void mkdir();else if(d.kind==='rename')void relocation(d.kind,d.targets,value().trim())}}>
