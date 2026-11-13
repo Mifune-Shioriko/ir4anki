@@ -293,6 +293,7 @@ READING_MODE = os.getenv("ANKI_READING_MODE", "").lower() in ("1", "true", "yes"
 NOTES_DIR = Path(os.getenv("ANKI_NOTES_DIR", str(Path.home() / "anki-notes")))
 READING_FILE = STATE_DIR / "reading.json"  # legacy; migration source only
 READING_DB_FILE = Path(os.getenv("ANKI_READING_DB", str(STATE_DIR / "reading.db")))
+DAILY_READING_FILE = STATE_DIR / "daily_reading.json"
 # corpus scan exclusions (editor/tool dirs + the note-image store, never
 # note content). _assets holds reading-mode image uploads (P5, 2026-09-23)
 # and is served by basename at /api/reading/media/<name>.
@@ -536,6 +537,7 @@ ANKI_SLOW_MS = int(os.getenv("ANKI_SLOW_MS", "2000"))
 # (old every-fire behaviour, still coalesced). Explicit do_sync() calls
 # (session finish, release) are NEVER throttled.
 SYNC_MIN_INTERVAL = float(os.getenv("ANKI_SYNC_MIN_INTERVAL", "120"))
+ANKI_SYNC_TIMEOUT = max(int(os.getenv("ANKI_SYNC_MEDIA_TIMEOUT", "600")), int(os.getenv("ANKI_SYNC_IO_TIMEOUT", "300")), 600)
 
 
 async def anki(action: str, params: dict | None = None, timeout: float = 30):
@@ -584,7 +586,7 @@ async def do_sync() -> bool:
     try:
         async with _sync_lock:
             t0 = time.monotonic()
-            result = await anki("sync", timeout=300)
+            result = await anki("sync", timeout=ANKI_SYNC_TIMEOUT)
             if isinstance(result, dict) and result.get("deferred"):
                 return False
         log.info("sync done in %.1fs", time.monotonic() - t0)
@@ -1215,7 +1217,7 @@ async def engine_sync(request: Request, body: EngineSyncBody):
     _engine_authorize(request)
     async with _state_lock:
         async with _sync_lock:
-            result = await anki("sync", {"commit_undo":body.commit_undo}, timeout=300)
+            result = await anki("sync", {"commit_undo":body.commit_undo}, timeout=ANKI_SYNC_TIMEOUT)
         return result if isinstance(result, dict) else {"synced":True,"deferred":False}
 
 
@@ -1278,7 +1280,7 @@ async def local_sync(request: Request, body: LocalSyncBody):
     _local_sync_authorize(request)
     async with _state_lock:
         async with _sync_lock:
-            result = await anki("sync", {"commit_undo": body.commit_undo}, timeout=300)
+            result = await anki("sync", {"commit_undo": body.commit_undo}, timeout=ANKI_SYNC_TIMEOUT)
         return result if isinstance(result, dict) else {"synced": True, "deferred": False}
 
 
@@ -3172,6 +3174,200 @@ def _deal_reading(data: dict, gated: set | None = None) -> list[dict]:
     return payloads
 
 
+def _daily_reading_read() -> dict:
+    try:
+        if not DAILY_READING_FILE.exists():
+            return {}
+        d = json.loads(DAILY_READING_FILE.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _daily_reading_write(d: dict | None) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if d is None:
+        DAILY_READING_FILE.unlink(missing_ok=True)
+        return
+    tmp = DAILY_READING_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False))
+    tmp.replace(DAILY_READING_FILE)
+
+
+def _daily_reading_mark_completed(path: str, chunk_key: str) -> None:
+    day = _anki_day()
+    ledger = _daily_reading_read()
+    if ledger.get("day") == day and "completed" in ledger:
+        comp = ledger.setdefault("completed", [])
+        pair = [path, str(chunk_key)]
+        if pair not in comp:
+            comp.append(pair)
+            _daily_reading_write(ledger)
+
+
+def _deal_daily_reading(data: dict, gated: set | None = None,
+                        extra_reading: bool = False,
+                        snapshot: bool = False) -> list[dict]:
+    """Deal reading segments with daily plan snapshot and idempotency."""
+    gated = gated or set()
+    day = _anki_day()
+    ledger = _daily_reading_read()
+
+    if extra_reading:
+        payloads = _deal_reading(data, gated)
+        if snapshot and ledger.get("day") == day:
+            ledger["extra_rounds"] = ledger.get("extra_rounds", 0) + 1
+            _daily_reading_write(ledger)
+        return payloads
+
+    list_paths = {e.get("path") for e in data.get("list", [])}
+    planned = ledger.get("planned", [])
+    has_valid_plan = (
+        ledger.get("day") == day
+        and "planned" in ledger
+        and bool(planned)
+        and any(p.get("path") in list_paths for p in planned)
+    )
+
+    if not has_valid_plan:
+        payloads = _deal_reading(data, gated)
+        if snapshot:
+            planned = [{"path": p["path"], "chunk_key": str(p["chunk_key"])} for p in payloads]
+            _daily_reading_write({
+                "day": day,
+                "snapshot_at": datetime.now().isoformat(timespec="seconds"),
+                "planned": planned,
+                "initial_count": len(planned),
+                "completed": [],
+                "extra_rounds": 0,
+            })
+        return payloads
+
+    def _is_tail_segment(entry, st, parent_seg=None):
+        if entry.get("kind") == "pdf":
+            return bool(st.get("tail"))
+        if parent_seg:
+            return st.get("end_line") == parent_seg.get("end_line") and st.get("start_line", 0) > parent_seg.get("start_line", 0)
+        return False
+
+    completed_keys = {
+        (k[0], str(k[1]))
+        for k in ledger.get("completed", [])
+        if isinstance(k, (list, tuple)) and len(k) >= 2
+    }
+    data_by_path = {e.get("path"): e for e in data.get("list", [])}
+    payloads = []
+    seen: set[tuple[str, str]] = set()
+
+    for item in planned:
+        path = item.get("path", "")
+        p_key = str(item.get("chunk_key", ""))
+        entry = data_by_path.get(path)
+        if not entry:
+            continue
+        ordered, summary = _file_view(entry, gated)
+        if not ordered:
+            continue
+        segs_by_id = {str(s.get("seg_id")): s for s in entry.get("segments") or []}
+        ordered_by_key = {str(key): (ch, key, st) for ch, key, st in ordered}
+
+        if (path, p_key) in completed_keys:
+            continue
+
+        if p_key in ordered_by_key:
+            ch, key, st = ordered_by_key[p_key]
+            if st.get("status", "todo") in ("todo", "active") and (path, key) not in gated:
+                pair = (path, str(key))
+                if pair not in seen:
+                    seen.add(pair)
+                    payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
+            continue
+
+        # Split parent / container: resolve to replacement non-tail child
+        parent_seg = segs_by_id.get(p_key)
+        descendants = []
+        for ch, key, st in ordered:
+            pid = st.get("parent_seg_id") or st.get("parent_segment_id")
+            visited = set()
+            is_desc = False
+            while pid and pid not in visited:
+                visited.add(str(pid))
+                if str(pid) == p_key:
+                    is_desc = True
+                    break
+                p_s = segs_by_id.get(str(pid))
+                if not p_s and entry.get("kind") == "pdf" and hasattr(_lectures(), "reading"):
+                    p_s = _lectures().reading.get("page-segments", pid)
+                pid = p_s.get("parent_seg_id") or p_s.get("parent_segment_id") if p_s else None
+            if is_desc:
+                descendants.append((ch, str(key), st))
+
+        non_tail_desc = [d for d in descendants if not _is_tail_segment(entry, d[2], parent_seg)]
+        any_done = any(
+            (path, d[1]) in completed_keys or d[2].get("status") in ("done", "skipped")
+            for d in non_tail_desc
+        )
+        if any_done or not non_tail_desc:
+            continue
+
+        active_cand = next((d for d in non_tail_desc if d[2].get("status") == "active"), None)
+        todo_cand = next((d for d in non_tail_desc if d[2].get("status") == "todo"), None)
+        cand = active_cand or todo_cand
+        if cand:
+            ch, key, st = cand
+            if (path, key) not in gated:
+                pair = (path, str(key))
+                if pair not in seen:
+                    seen.add(pair)
+                    payloads.append(_chunk_payload(ch, key, st, summary, segs_by_id))
+
+    return payloads
+
+
+def _daily_reading_status(data: dict, gated: set | None = None) -> dict:
+    day = _anki_day()
+    ledger = _daily_reading_read()
+    gated = gated or set()
+    list_paths = {e.get("path") for e in data.get("list", [])}
+    planned = ledger.get("planned", [])
+    has_valid_plan = (
+        ledger.get("day") == day
+        and "planned" in ledger
+        and bool(planned)
+        and any(p.get("path") in list_paths for p in planned)
+    )
+
+    if not has_valid_plan:
+        preview_payloads = _deal_reading(data, gated)
+        return {
+            "has_plan": False,
+            "daily_done": False,
+            "planned_count": len(preview_payloads),
+            "remaining_count": len(preview_payloads),
+            "completed_count": 0,
+            "extra_rounds": 0,
+            "dealable_extra": len(preview_payloads),
+        }
+
+    planned = ledger.get("planned", [])
+    remaining_payloads = _deal_daily_reading(data, gated, extra_reading=False, snapshot=False)
+    remaining_count = len(remaining_payloads)
+    initial_count = ledger.get("initial_count", len(planned))
+    completed_count = max(0, initial_count - remaining_count)
+    daily_done = (remaining_count == 0)
+    extra_payloads = _deal_reading(data, gated) if daily_done else []
+
+    return {
+        "has_plan": True,
+        "daily_done": daily_done,
+        "planned_count": initial_count,
+        "remaining_count": remaining_count,
+        "completed_count": completed_count,
+        "extra_rounds": ledger.get("extra_rounds", 0),
+        "dealable_extra": len(extra_payloads),
+    }
+
+
 def _reading_current_round():
     """Rehydrate only pending reading slots and durably reconcile their drift."""
     if not READING_MODE:
@@ -3336,9 +3532,16 @@ async def _reading_extras() -> dict:
                 and (entry.get("path", ""), key) not in gated
             )
             dealable_segs += min(2, n)
+        d_status = _daily_reading_status(data, gated)
+        out["reading_daily_done"] = d_status["daily_done"]
+        out["reading_daily_planned"] = d_status["planned_count"]
+        out["reading_daily_remaining"] = d_status["remaining_count"]
+        out["reading_daily_completed"] = d_status["completed_count"]
+        out["reading_extra_rounds"] = d_status["extra_rounds"]
+        out["reading_dealable_extra"] = d_status["dealable_extra"]
         out["reading_list_size"] = len(data.get("list", []))
         out["reading_available"] = sum(1 for s in summaries if s.get("frontier"))
-        out["reading_dealable"] = dealable_segs
+        out["reading_dealable"] = 0 if d_status["daily_done"] else d_status["remaining_count"]
         # funnel signal: only NOT-held 正在制卡 chunks resurface next round
         # (a gated active chunk waits for its cards to clear the preview
         # pipeline — counting it here would pull the user into a reading
@@ -4429,16 +4632,16 @@ async def reading_state():
 
 
 @app.post("/api/reading/start")
-async def reading_start(mode: str | None = None):
+async def reading_start(mode: str | None = None, extra_reading: bool = False):
     """Deal one reading round: up to two segments per 阅读清单 file."""
     async with _state_lock:
         _reading_guard()
         if _flow_read():
             raise HTTPException(status_code=409, detail="use the whole-round flow endpoint")
-        return await _reading_start_impl(study_mode(mode))
+        return await _reading_start_impl(study_mode(mode), extra_reading=extra_reading, use_daily_plan=False)
 
 
-async def _reading_start_impl(mode: str = DEFAULT_MODE):
+async def _reading_start_impl(mode: str = DEFAULT_MODE, extra_reading: bool = False, use_daily_plan: bool = True):
     if PREVIEW_MODE:
         # entry point for the daily chain (2026-09-27): run the auto-release
         # BEFORE computing the gates, so a page left open across the 4 AM
@@ -4453,7 +4656,10 @@ async def _reading_start_impl(mode: str = DEFAULT_MODE):
     # so a round is only empty when nothing is dealable.
     data = _reading_read()
     gated = await _reading_gates(data)
-    payloads = _deal_reading(data, gated)
+    if use_daily_plan:
+        payloads = _deal_daily_reading(data, gated, extra_reading=extra_reading, snapshot=True)
+    else:
+        payloads = _deal_reading(data, gated)
     if not payloads:
         _reading_write(data)  # persist migrations even on an empty deal
         return {
@@ -4561,6 +4767,8 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
         if in_round and action in ('complete','skip','next','demote'):
             stats_key = {'complete':'done','skip':'skipped','next':'next','demote':'next'}[action]
             rd.setdefault('stats',{})[stats_key] = rd.get('stats',{}).get(stats_key,0)+1
+            if action in ('complete', 'skip'):
+                _daily_reading_mark_completed(path, chunk_key)
             complete = _drop_and_maybe_complete()
         _reading_write(data)
         return {'ok':True,'status':seg['status'],'round_complete':complete,'stats':(rd or {}).get('stats',{}),'done':(rd or {}).get('done',0),'total':(rd or {}).get('total',0)}
@@ -4612,6 +4820,8 @@ def _reading_act_impl(path: str, chunk_key: str, action: str):
         stats_key = {"complete": "done", "skip": "skipped", "next": "next"}[action]
         stats = rd.setdefault("stats", {})
         stats[stats_key] = stats.get(stats_key, 0) + 1
+        if action in ("complete", "skip"):
+            _daily_reading_mark_completed(path, chunk_key)
         round_complete = _drop_and_maybe_complete()
     if demote_completed_round:
         round_complete = True
@@ -4680,21 +4890,22 @@ def _flow_write(flow):
     finally: os.close(fd)
 
 
-async def _flow_initialize(mode, legacy=False):
+async def _flow_initialize(mode, legacy=False, extra_reading=False):
     """Write intent before dealing; recover an interrupted deal from its queue."""
     f = _flow_read()
     if not f or f.get('status') == 'complete':
-        f = {'status':'initializing', 'mode':mode, 'legacy':legacy}
+        f = {'status':'initializing', 'mode':mode, 'legacy':legacy, 'extra_reading':extra_reading}
         _flow_write(f)
     if f.get('status') != 'initializing':
         return
+    is_extra = bool(extra_reading or f.get('extra_reading', False))
     if READING_MODE and not f.get('reading_ready'):
         data = _reading_read()
         if f.get('fresh') and data.get('round') == f.get('previous_reading'):
             data['round'] = None
             _reading_write(data)
         if not isinstance(data.get('round'), dict):
-            await _reading_start_impl(mode)
+            await _reading_start_impl(mode, extra_reading=is_extra)
         f['reading_ready'] = True
         _flow_write(f)
     if not f.get('cards_ready'):
@@ -4720,7 +4931,7 @@ async def _flow_state_impl(adopt=True, *, current_only=False):
         await _flow_exit_impl()
         f = None
     if f and f.get('status') == 'initializing':
-        await _flow_initialize(study_mode(f.get('mode')), f.get('legacy',False))
+        await _flow_initialize(study_mode(f.get('mode')), f.get('legacy',False), extra_reading=f.get('extra_reading',False))
         f = _flow_read()
     if not f and adopt:
         r = (_reading_read(preserve_round=True).get('round') or {}) if READING_MODE else {}
@@ -4764,7 +4975,7 @@ async def flow_state():
 
 
 @app.post('/api/flow/start')
-async def flow_start(mode: str | None = None):
+async def flow_start(mode: str | None = None, extra_reading: bool = False):
     async with _state_lock:
         f = _flow_read()
         if f and f.get('status') in ('initializing', 'exiting'):
@@ -4784,8 +4995,9 @@ async def flow_start(mode: str | None = None):
             # A retry distinguishes "not dealt yet" from "deal committed".
             # Completed legacy tombstones also need a fresh deal.
             _flow_write({'status':'initializing','mode':study_mode(mode),'legacy':False,
-                         'fresh':True,'previous_reading':r,'previous_cards':c})
-        await _flow_initialize(study_mode(mode), legacy)
+                         'fresh':True,'previous_reading':r,'previous_cards':c,
+                         'extra_reading':extra_reading})
+        await _flow_initialize(study_mode(mode), legacy, extra_reading=extra_reading)
         return await _flow_state_impl()
 
 
@@ -5616,7 +5828,7 @@ if REVIEW_WEB_V2_DIST.is_dir():
         # SPA fallback
         index = REVIEW_WEB_V2_DIST / "index.html"
         if index.is_file():
-            return FileResponse(index)
+            return FileResponse(index, headers={"Cache-Control": "no-cache, must-revalidate"})
         raise HTTPException(status_code=404, detail="not found")
 
 

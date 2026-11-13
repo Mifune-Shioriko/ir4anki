@@ -122,7 +122,13 @@ export const api = {
     return r.blob()
   },
   flowState: () => get<SessionStateResponse>('/api/flow/state'),
-  flowStart: (mode?: string) => post<SessionStateResponse>('/api/flow/start' + (mode ? '?mode=' + encodeURIComponent(mode) : '')),
+  flowStart: (mode?: string, extraReading?: boolean) => {
+    const params = new URLSearchParams()
+    if (mode) params.set('mode', mode)
+    if (extraReading) params.set('extra_reading', 'true')
+    const qs = params.toString()
+    return post<SessionStateResponse>('/api/flow/start' + (qs ? '?' + qs : ''))
+  },
   flowEndReading: () => post<SessionStateResponse>('/api/flow/end-reading'),
   flowExit: () => post<{ ok: boolean }>('/api/flow/exit'),
   sessionState: () => get<SessionStateResponse>('/api/session/state'),

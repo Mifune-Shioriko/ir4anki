@@ -6,7 +6,7 @@ interface Props {
   due: number | null
   newTotal: number | null
   busy: boolean
-  onBegin: () => void
+  onBegin: (extraReading?: boolean) => void
   /** resolved single-tier pacing table (2026-09-24) — today's plan comes from
    * the wire, never hardcoded. `mode` selects the row (only "daily" now). */
   studyModes?: StudyModes | null
@@ -23,6 +23,8 @@ interface Props {
    * segments (reading_dealable on the wire), so this count IS the round
    * size (all card-making quotas retired) */
   readingAvailable?: number
+  readingDailyDone?: boolean
+  readingDealableExtra?: number
   /** what the round that just ended accomplished (hero summary strip,
    * 2026-09-27 round 2); null until a round completes this session */
   roundSummary?: RoundSummary | null
@@ -107,17 +109,25 @@ export const StartScreen: Component<Props> = (props) => {
 
           <Show when={isEmpty() && props.due != null}>
             <div class="screen-empty md-typescale-body-medium">
-              牌组里暂时没有可学的东西。可以先：在桌面 Anki 里建牌组导入卡片，或在「阅读清单」里加入 markdown 笔记开始制卡。
+              <Show when={props.readingDailyDone} fallback="牌组里暂时没有可学的东西。可以先：在桌面 Anki 里建牌组导入卡片，或在「阅读清单」里加入 markdown 笔记开始制卡。">
+                今日阅读与复习计划已完成！若想继续阅读，可点击下方「追加阅读」。
+              </Show>
             </div>
           </Show>
 
           <Show when={sizes()}>
             <div class="screen-stats md-typescale-body-medium">
               <div class="plan-head md-typescale-label-large">今日每轮计划</div>
-              <Show when={(props.readingAvailable ?? 0) > 0}>
+              <Show when={props.readingDailyDone}>
                 <div class="stat-row">
-                  <span>阅读（每篇最多两段）</span>
-                  <span class="stat-value">{props.readingAvailable} 段</span>
+                  <span>阅读（今日固定池）</span>
+                  <span class="stat-value" style="color: var(--md-sys-color-primary, #388e3c); font-weight: 500;">已完成</span>
+                </div>
+              </Show>
+              <Show when={!props.readingDailyDone && (props.readingAvailable ?? 0) > 0}>
+                <div class="stat-row">
+                  <span>阅读（今日计划）</span>
+                  <span class="stat-value">{props.readingAvailable} 段待读</span>
                 </div>
               </Show>
               <div class="stat-row">
@@ -151,9 +161,26 @@ export const StartScreen: Component<Props> = (props) => {
             </Show>
           </div>
 
-          <md-filled-button class="screen-start-button" onClick={() => props.onBegin()} disabled={props.busy}>
-            开始
-          </md-filled-button>
+          <Show when={props.readingDailyDone && ((props.due ?? 0) > 0 || (props.newTotal ?? 0) > 0)}>
+            <div class="screen-button-row" style="display: flex; gap: 12px; width: 100%;">
+              <md-filled-button class="screen-start-button" style="flex: 1;" onClick={() => props.onBegin(false)} disabled={props.busy}>
+                继续复习
+              </md-filled-button>
+              <md-outlined-button class="screen-start-button" style="flex: 1; --md-outlined-button-container-height: 56px; --md-outlined-button-container-shape: var(--md-sys-shape-corner-large, 16px); --md-outlined-button-label-text-size: 1rem;" onClick={() => props.onBegin(true)} disabled={props.busy}>
+                追加阅读
+              </md-outlined-button>
+            </div>
+          </Show>
+          <Show when={props.readingDailyDone && (props.due ?? 0) === 0 && (props.newTotal ?? 0) === 0}>
+            <md-filled-button class="screen-start-button" onClick={() => props.onBegin(true)} disabled={props.busy}>
+              追加阅读
+            </md-filled-button>
+          </Show>
+          <Show when={!props.readingDailyDone}>
+            <md-filled-button class="screen-start-button" onClick={() => props.onBegin(false)} disabled={props.busy}>
+              开始
+            </md-filled-button>
+          </Show>
         </div>
       </md-elevated-card>
     </div>

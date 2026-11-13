@@ -397,6 +397,12 @@ export interface ReadingExtras {
   /** exact next-round size under two-slot dealing (2026-10-09): sum over
    * files of min(2, non-gated dealable segments) — what the plan row shows */
   reading_dealable?: number
+  reading_daily_done?: boolean
+  reading_daily_planned?: number
+  reading_daily_remaining?: number
+  reading_daily_completed?: number
+  reading_extra_rounds?: number
+  reading_dealable_extra?: number
   reading_active?: number
   /** chunks held by the preview-pool gate (B·二段重推, round 3) */
   reading_gated?: number

@@ -196,8 +196,9 @@ export const App: Component = () => {
   // dialog to the current chunk (provenance → cards_created).
   const [readingMode, setReadingMode] = createSignal(false)
   const [readingListSize, setReadingListSize] = createSignal(0)
-  const [, setReadingAvailable] = createSignal(0)
   const [readingDealable, setReadingDealable] = createSignal(0)
+  const [readingDailyDone, setReadingDailyDone] = createSignal(false)
+  const [readingDealableExtra, setReadingDealableExtra] = createSignal(0)
   const [, setReadingActive] = createSignal(0)
   const [, setReadingGated] = createSignal(0)
   const [rdChunks, setRdChunks] = createSignal<ReadingChunk[]>([])
@@ -573,8 +574,9 @@ export const App: Component = () => {
     setReadingMode(!!d.reading_mode)
     if (d.reading_mode && 'reading_list_size' in d) {
       setReadingListSize(d.reading_list_size ?? 0)
-      setReadingAvailable(d.reading_available ?? 0)
       setReadingDealable(d.reading_dealable ?? d.reading_available ?? 0)
+      setReadingDailyDone(d.reading_daily_done ?? false)
+      setReadingDealableExtra(d.reading_dealable_extra ?? 0)
       setReadingActive(d.reading_active ?? 0)
       setReadingGated(d.reading_gated ?? 0)
     }
@@ -624,13 +626,13 @@ export const App: Component = () => {
   createEffect(() => { resync() })
 
   // Both queues are dealt once; every transition and reload uses the server cursor.
-  const beginFlow = async () => {
+  const beginFlow = async (extraReading: boolean = false) => {
     setPhase('loading')
     setLoadError(false)
     const ticket = stateGeneration.mutate()
-    setLoadText('正在加载今日阅读和卡片…')
+    setLoadText(extraReading ? '正在加载追加阅读和卡片…' : '正在加载今日阅读和卡片…')
     try {
-      await api.flowStart(selectedMode())
+      await api.flowStart(selectedMode(), extraReading)
       if (stateGeneration.mutationCurrent(ticket)) await resync()
     } catch (e) {
       stateGeneration.applyMutation(ticket, () => {
@@ -1188,6 +1190,8 @@ export const App: Component = () => {
             pendingRelease={previewMode() ? pendingRelease() : null}
             previewMode={previewMode()}
             readingAvailable={readingMode() ? readingDealable() : 0}
+            readingDailyDone={readingMode() ? readingDailyDone() : false}
+            readingDealableExtra={readingMode() ? readingDealableExtra() : 0}
             studyModes={studyModes()}
             mode={selectedMode()}
             roundSummary={roundSummary()}

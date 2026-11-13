@@ -19,7 +19,7 @@ class BackendError(RuntimeError):
 
 class PylibClient:
     def __init__(self, collection_path, *, sync_endpoint=None, sync_username=None,
-                 sync_password=None, sync_hkey=None, sync_io_timeout=None):
+                 sync_password=None, sync_hkey=None, sync_io_timeout=None, sync_media_timeout=None):
         self.path = Path(collection_path).expanduser().resolve()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix='anki-owner')
         self._col = None
@@ -31,6 +31,12 @@ class PylibClient:
         self._sync_password = sync_password
         self._sync_hkey = sync_hkey
         self._sync_io_timeout = sync_io_timeout or int(os.getenv("ANKI_SYNC_IO_TIMEOUT", "300"))
+        env_media_timeout = os.getenv("ANKI_SYNC_MEDIA_TIMEOUT")
+        self._sync_media_timeout = (
+            sync_media_timeout
+            or (int(env_media_timeout) if env_media_timeout else None)
+            or max(self._sync_io_timeout, 600)
+        )
         self._auth = None
         self._journal = None
         self._last_sync_error = None
@@ -486,14 +492,28 @@ class PylibClient:
             self._save_sync_status(collection_at=now(), stage='media')
             operation = 'sync_media'
             col.sync_media(self._auth)
-            deadline = time.monotonic() + 300
+            timeout = max(self._sync_media_timeout, 60)
+            deadline = time.monotonic() + timeout
+            last_progress = None
             operation = 'media_sync_status'
-            while col.media_sync_status().active:
+            while True:
+                status = col.media_sync_status()
+                if not status.active:
+                    break
+                progress_key = (status.progress.checked, status.progress.added, status.progress.removed)
+                if progress_key != last_progress:
+                    if last_progress is not None:
+                        logging.getLogger('ir4anki').info(
+                            'media sync progress: checked=%s added=%s removed=%s',
+                            status.progress.checked, status.progress.added, status.progress.removed,
+                        )
+                    last_progress = progress_key
+                    deadline = time.monotonic() + timeout
                 if time.monotonic() >= deadline:
                     operation = 'abort_media_sync'
                     col.abort_media_sync()
                     raise BackendError('Anki media sync timed out')
-                time.sleep(0.05)
+                time.sleep(0.1)
             self._diagnose(col, 'sync:after_media')
         except Exception as exc:
             self._diagnose(col, 'sync:failure', exc=exc, operation=operation)
